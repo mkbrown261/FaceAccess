@@ -1,12 +1,30 @@
 // ══════════════════════════════════════════════════════
-//  FaceAccess Home — Dashboard JS
+//  FaceAccess Home — Dashboard JS  v2.1 (hardened)
 // ══════════════════════════════════════════════════════
+
+'use strict';
 
 const API = '';
 let currentHomeId = null;
 let currentUserId = null;
 let refreshTimer = null;
 let activityChart = null;
+
+// ── Security: HTML escape to prevent XSS ─────────────
+function esc(str) {
+  if (str == null) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#x27;')
+    .replace(/\//g, '&#x2F;');
+}
+
+// ── Input validators ──────────────────────────────────
+function isValidEmail(e) { return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e); }
+function isValidId(id)    { return /^[a-zA-Z0-9_\-]+$/.test(id); }
 
 // ── Bootstrap ─────────────────────────────────────────
 async function init() {
@@ -203,8 +221,8 @@ async function refreshOverview() {
                   <i class="fas fa-lock${l.is_locked ? '' : '-open'} text-${l.is_locked ? 'indigo' : 'green'}-400"></i>
                 </div>
                 <div>
-                  <div class="font-semibold text-white text-sm">${l.name}</div>
-                  <div class="text-xs text-gray-500">${l.location || '—'}</div>
+                  <div class="font-semibold text-white text-sm">${esc(l.name)}</div>
+                  <div class="text-xs text-gray-500">${esc(l.location) || '—'}</div>
                 </div>
               </div>
               <div class="flex items-center gap-2">
@@ -241,10 +259,10 @@ async function refreshOverview() {
         ${M.length === 0 ? '<p class="text-gray-600 text-sm">No members yet.</p>' :
           M.map(m => `
           <div class="flex items-center gap-3 py-2.5 border-b border-gray-900 last:border-0">
-            <div class="member-avatar" style="background:${m.avatar_color || '#6366f1'}25;color:${m.avatar_color || '#818cf8'}">${m.name.split(' ').map(n=>n[0]).join('').slice(0,2)}</div>
+            <div class="member-avatar" style="background:${esc(m.avatar_color || '#6366f1')}25;color:${esc(m.avatar_color || '#818cf8')}">${esc(m.name.split(' ').map(n=>n[0]).join('').slice(0,2))}</div>
             <div class="flex-1 min-w-0">
-              <div class="font-medium text-white text-sm">${m.name}</div>
-              <div class="text-xs text-gray-600">${m.role} · ${m.device_count || 0} device${m.device_count !== 1 ? 's' : ''}</div>
+              <div class="font-medium text-white text-sm">${esc(m.name)}</div>
+              <div class="text-xs text-gray-600">${esc(m.role)} · ${m.device_count || 0} device${m.device_count !== 1 ? 's' : ''}</div>
             </div>
             <div class="flex items-center gap-2">
               ${m.face_registered ? '<span class="badge badge-green"><i class="fas fa-face-smile mr-1"></i>Face</span>' : '<span class="badge badge-gray">No face</span>'}
@@ -283,17 +301,17 @@ function renderEventRow(ev) {
   const confidence = ev.face_confidence ? `${Math.round(ev.face_confidence * 100)}%` : '—';
   const ago = timeAgo(ev.created_at);
   return `
-  <div class="event-row event-${ev.event_type} flex items-center gap-3">
+  <div class="event-row event-${esc(ev.event_type)} flex items-center gap-3">
     <div class="w-8 h-8 rounded-lg bg-${color}-500/15 flex items-center justify-center flex-shrink-0">
       <i class="fas ${icon} text-${color}-400 text-sm"></i>
     </div>
     <div class="flex-1 min-w-0">
       <div class="flex items-center gap-2">
-        <span class="text-sm font-medium text-white truncate">${ev.user_name || 'Unknown'}</span>
-        <span class="text-xs text-gray-600">at ${ev.lock_name || '—'}</span>
+        <span class="text-sm font-medium text-white truncate">${esc(ev.user_name) || 'Unknown'}</span>
+        <span class="text-xs text-gray-600">at ${esc(ev.lock_name) || '—'}</span>
       </div>
       <div class="flex items-center gap-2 text-xs text-gray-600">
-        <span>${methodLabel}</span>
+        <span>${esc(methodLabel)}</span>
         ${ev.ble_detected ? '<i class="fas fa-bluetooth text-blue-400"></i>' : ''}
         ${ev.wifi_matched ? '<i class="fas fa-wifi text-cyan-400"></i>' : ''}
         ${ev.face_confidence ? `<span>Conf: ${confidence}</span>` : ''}
@@ -338,8 +356,8 @@ async function loadLive() {
     <div class="card p-4">
       <div class="flex items-center justify-between mb-3">
         <div>
-          <div class="font-semibold text-white">${cam.name}</div>
-          <div class="text-xs text-gray-500">${cam.camera_type?.toUpperCase()} · ${cam.lock_name || 'No lock linked'}</div>
+          <div class="font-semibold text-white">${esc(cam.name)}</div>
+          <div class="text-xs text-gray-500">${esc(cam.camera_type?.toUpperCase())} · ${esc(cam.lock_name) || 'No lock linked'}</div>
         </div>
         <span class="badge ${cam.status === 'active' ? 'badge-green' : 'badge-red'}">${cam.status}</span>
       </div>
@@ -347,7 +365,7 @@ async function loadLive() {
         <div class="text-center">
           <i class="fas fa-video text-gray-700 text-4xl mb-3"></i>
           <p class="text-gray-600 text-sm">Stream preview</p>
-          <p class="text-gray-700 text-xs mt-1 font-mono">${cam.stream_url || 'No stream URL'}</p>
+          <p class="text-gray-700 text-xs mt-1 font-mono">${esc(cam.stream_url) || 'No stream URL'}</p>
         </div>
         <div class="absolute top-2 left-2 flex items-center gap-1.5 bg-black/60 rounded-full px-2 py-1">
           <div class="w-1.5 h-1.5 rounded-full bg-red-500 pulse"></div>
@@ -459,8 +477,8 @@ async function loadRecognize() {
                 onmouseover="this.style.background='rgba(99,102,241,0.15)'" onmouseout="this.style.background='${i===0?'rgba(99,102,241,0.15)':"transparent"}'">
                 <i class="fas fa-${l.lock_type==='relay'?'plug':'lock'}" style="color:#818cf8;font-size:11px;width:14px;"></i>
                 <div>
-                  <div style="font-weight:600;">${l.name}</div>
-                  <div style="font-size:11px;color:rgba(255,255,255,0.35);margin-top:1px;">${l.location || l.brand || ''} · ${l.is_locked ? '🔒 Locked' : '🔓 Unlocked'}</div>
+                  <div style="font-weight:600;">${esc(l.name)}</div>
+                  <div style="font-size:11px;color:rgba(255,255,255,0.35);margin-top:1px;">${esc(l.location || l.brand || '')} · ${l.is_locked ? '🔒 Locked' : '🔓 Unlocked'}</div>
                 </div>
               </div>`).join('')
               }
@@ -1012,16 +1030,16 @@ async function loadLocks() {
             <i class="fas fa-lock${l.is_locked ? '' : '-open'} text-${l.is_locked ? 'indigo' : 'green'}-400 text-xl"></i>
           </div>
           <div>
-            <div class="font-bold text-white">${l.name}</div>
-            <div class="text-xs text-gray-500">${l.location || '—'}</div>
+            <div class="font-bold text-white">${esc(l.name)}</div>
+            <div class="text-xs text-gray-500">${esc(l.location) || '—'}</div>
           </div>
         </div>
         <span class="badge ${l.is_locked ? 'badge-indigo' : 'badge-green'}">${l.is_locked ? 'Locked' : 'Open'}</span>
       </div>
       <div class="grid grid-cols-2 gap-2 text-xs text-gray-500 mb-4">
-        <div><span class="text-gray-600">Brand:</span> <span class="text-gray-300 capitalize">${l.brand || 'generic'}</span></div>
-        <div><span class="text-gray-600">Type:</span> <span class="text-gray-300">${l.lock_type || 'api'}</span></div>
-        <div><span class="text-gray-600">Status:</span> <span class="text-${l.status === 'active' ? 'green' : 'red'}-400">${l.status}</span></div>
+        <div><span class="text-gray-600">Brand:</span> <span class="text-gray-300 capitalize">${esc(l.brand) || 'generic'}</span></div>
+        <div><span class="text-gray-600">Type:</span> <span class="text-gray-300">${esc(l.lock_type) || 'api'}</span></div>
+        <div><span class="text-gray-600">Status:</span> <span class="text-${l.status === 'active' ? 'green' : 'red'}-400">${esc(l.status)}</span></div>
         <div><span class="text-gray-600">Battery:</span> <span class="text-gray-300">${l.battery_pct != null ? l.battery_pct + '%' : 'N/A'}</span></div>
       </div>
       <div class="grid grid-cols-2 gap-2">
@@ -1081,19 +1099,96 @@ function openAddLockModal() {
 async function saveLock() {
   const name = document.getElementById('ml-name')?.value.trim();
   if (!name) { toast('Lock name required', 'warn'); return; }
+  if (name.length > 80) { toast('Name too long (max 80 chars)', 'warn'); return; }
+  const brand = document.getElementById('ml-brand')?.value;
+  const lockType = document.getElementById('ml-type')?.value;
+  const validBrands = ['august','schlage','yale','nuki','generic'];
+  const validTypes  = ['api','relay','ble','zigbee'];
+  if (!validBrands.includes(brand)) { toast('Invalid brand', 'warn'); return; }
+  if (!validTypes.includes(lockType)) { toast('Invalid connection type', 'warn'); return; }
   try {
-    await axios.post(`${API}/api/home/locks`, { home_id: currentHomeId, name, location: document.getElementById('ml-loc')?.value, lock_type: document.getElementById('ml-type')?.value, brand: document.getElementById('ml-brand')?.value, api_key: document.getElementById('ml-api')?.value });
+    await axios.post(`${API}/api/home/locks`, {
+      home_id: currentHomeId, name,
+      location:   document.getElementById('ml-loc')?.value.trim() || null,
+      lock_type:  lockType,
+      brand,
+      api_key:    document.getElementById('ml-api')?.value.trim() || null,
+    });
     closeModal();
     toast('Lock added successfully');
     loadLocks();
-  } catch(e) { toast('Failed to add lock', 'error'); }
+  } catch(e) { toast(e.response?.data?.error || 'Failed to add lock', 'error'); }
+}
+
+// ── editLock: open pre-filled edit modal ──────────────
+async function editLock(id) {
+  try {
+    const r = await axios.get(`${API}/api/home/locks?home_id=${currentHomeId}`);
+    const lock = (r.data.locks || []).find(l => l.id === id);
+    if (!lock) { toast('Lock not found', 'error'); return; }
+    openModal(`
+    <h3 class="text-lg font-bold text-white mb-5">Edit Lock</h3>
+    <div class="space-y-4">
+      <div><label class="text-xs text-gray-500 mb-1 block">Lock Name *</label>
+        <input id="el-name" class="input" placeholder="Front Door" value="${esc(lock.name)}">
+      </div>
+      <div><label class="text-xs text-gray-500 mb-1 block">Location</label>
+        <input id="el-loc" class="input" placeholder="Main entrance" value="${esc(lock.location||'')}">
+      </div>
+      <div class="grid grid-cols-2 gap-3">
+        <div><label class="text-xs text-gray-500 mb-1 block">Brand</label>
+          <select id="el-brand" class="input">
+            ${['august','schlage','yale','nuki','generic'].map(b =>
+              `<option value="${b}" ${lock.brand===b?'selected':''}>${b.charAt(0).toUpperCase()+b.slice(1)}</option>`
+            ).join('')}
+          </select>
+        </div>
+        <div><label class="text-xs text-gray-500 mb-1 block">Connection Type</label>
+          <select id="el-type" class="input">
+            ${[['api','Cloud API'],['relay','Relay Controller'],['ble','BLE'],['zigbee','Zigbee']].map(([v,l]) =>
+              `<option value="${v}" ${lock.lock_type===v?'selected':''}>${l}</option>`
+            ).join('')}
+          </select>
+        </div>
+      </div>
+      <div><label class="text-xs text-gray-500 mb-1 block">API Key / Access Token</label>
+        <input id="el-api" class="input" placeholder="Leave blank to keep existing" value="">
+        <p class="text-xs text-gray-600 mt-1">Leave blank to keep existing credentials</p>
+      </div>
+    </div>
+    <div class="flex gap-3 mt-6">
+      <button onclick="closeModal()" class="btn-ghost flex-1">Cancel</button>
+      <button onclick="updateLock('${esc(id)}')" class="btn-primary flex-1">Save Changes</button>
+    </div>`);
+  } catch(e) { toast('Failed to load lock', 'error'); }
+}
+
+async function updateLock(id) {
+  const name = document.getElementById('el-name')?.value.trim();
+  if (!name) { toast('Lock name required', 'warn'); return; }
+  try {
+    await axios.put(`${API}/api/home/locks/${id}`, {
+      name,
+      location: document.getElementById('el-loc')?.value.trim() || null,
+      brand:    document.getElementById('el-brand')?.value,
+      lock_type: document.getElementById('el-type')?.value,
+      api_key:  document.getElementById('el-api')?.value.trim() || undefined,
+    });
+    closeModal();
+    toast('Lock updated');
+    loadLocks();
+    refreshOverview();
+  } catch(e) { toast(e.response?.data?.error || 'Failed to update lock', 'error'); }
 }
 
 async function deleteLock(id) {
   if (!confirm('Remove this lock from your home?')) return;
-  await axios.delete(`${API}/api/home/locks/${id}`);
-  toast('Lock removed');
-  loadLocks();
+  try {
+    await axios.delete(`${API}/api/home/locks/${id}`);
+    toast('Lock removed');
+    loadLocks();
+    refreshOverview();
+  } catch(e) { toast('Failed to remove lock', 'error'); }
 }
 
 // ═══════════════════════════════════════════════════════
@@ -1111,15 +1206,15 @@ async function loadMembers() {
     ${members.map(m => `
     <div class="card p-5">
       <div class="flex items-center gap-4 mb-4">
-        <div class="member-avatar text-lg" style="background:${m.avatar_color||'#6366f1'}22;color:${m.avatar_color||'#818cf8'}">${m.name.split(' ').map(n=>n[0]).join('').slice(0,2)}</div>
+        <div class="member-avatar text-lg" style="background:${esc(m.avatar_color||'#6366f1')}22;color:${esc(m.avatar_color||'#818cf8')}">${esc(m.name.split(' ').map(n=>n[0]).join('').slice(0,2))}</div>
         <div class="flex-1 min-w-0">
-          <div class="font-bold text-white truncate">${m.name}</div>
-          <div class="text-xs text-gray-500">${m.email}</div>
+          <div class="font-bold text-white truncate">${esc(m.name)}</div>
+          <div class="text-xs text-gray-500">${esc(m.email)}</div>
         </div>
-        <span class="badge ${m.role==='owner'?'badge-yellow':m.role==='member'?'badge-indigo':'badge-gray'}">${m.role}</span>
+        <span class="badge ${m.role==='owner'?'badge-yellow':m.role==='member'?'badge-indigo':'badge-gray'}">${esc(m.role)}</span>
       </div>
       <div class="space-y-2 mb-4 text-xs">
-        <div class="flex justify-between"><span class="text-gray-500">Phone:</span><span class="text-gray-300">${m.phone || 'Not set'}</span></div>
+        <div class="flex justify-between"><span class="text-gray-500">Phone:</span><span class="text-gray-300">${esc(m.phone) || 'Not set'}</span></div>
         <div class="flex justify-between"><span class="text-gray-500">Trusted devices:</span><span class="text-gray-300">${m.device_count || 0}</span></div>
         <div class="flex justify-between items-center"><span class="text-gray-500">Face enrolled:</span>
           <span class="badge ${m.face_registered ? 'badge-green' : 'badge-red'}">${m.face_registered ? '✓ Enrolled' : '✗ Missing'}</span>
@@ -1164,15 +1259,24 @@ function openAddMemberModal() {
 }
 
 async function saveMember() {
-  const name = document.getElementById('mm-name')?.value.trim();
+  const name  = document.getElementById('mm-name')?.value.trim();
   const email = document.getElementById('mm-email')?.value.trim();
+  const phone = document.getElementById('mm-phone')?.value.trim();
+  const role  = document.getElementById('mm-role')?.value;
   if (!name || !email) { toast('Name and email required', 'warn'); return; }
+  if (!isValidEmail(email)) { toast('Invalid email address', 'warn'); return; }
+  if (name.length > 80) { toast('Name too long (max 80 chars)', 'warn'); return; }
   try {
-    const r = await axios.post(`${API}/api/home/users`, { home_id: currentHomeId, name, email, phone: document.getElementById('mm-phone')?.value, role: document.getElementById('mm-role')?.value });
-    // Auto-enroll face for demo
+    const r = await axios.post(`${API}/api/home/users`, {
+      home_id: currentHomeId,
+      name, email,
+      phone: phone || null,
+      role: ['owner','member','guest'].includes(role) ? role : 'member',
+    });
+    // Auto-enroll face placeholder so member shows up with enrolled state
     await axios.post(`${API}/api/home/users/${r.data.user.id}/face`, { image_quality: 0.95 });
     closeModal();
-    toast('Member added and face enrolled');
+    toast('Member added — tap Enroll Face ID to capture their biometrics');
     loadMembers();
   } catch(e) {
     toast(e.response?.data?.error || 'Failed to add member', 'error');
@@ -1230,17 +1334,23 @@ async function enrollFace(userId) {
 }
 
 async function deleteFace(userId) {
-  if (!confirm('Erase this person\'s biometric data? This cannot be undone.')) return;
-  await axios.delete(`${API}/api/home/users/${userId}/face`);
-  toast('Biometric data erased (GDPR compliant)');
-  loadMembers();
+  if (!userId || !isValidId(userId)) return;
+  if (!confirm('Erase this person\'s biometric data? This cannot be undone (GDPR compliant erasure).')) return;
+  try {
+    await axios.delete(`${API}/api/home/users/${userId}/face`);
+    toast('Biometric data erased (GDPR compliant)');
+    loadMembers();
+  } catch(e) { toast(e.response?.data?.error || 'Failed to erase face data', 'error'); }
 }
 
 async function removeMember(userId) {
-  if (!confirm('Remove this member from your home? Their biometric data will also be erased.')) return;
-  await axios.delete(`${API}/api/home/users/${userId}`);
-  toast('Member removed');
-  loadMembers();
+  if (!userId || !isValidId(userId)) return;
+  if (!confirm('Remove this member from your home? Their biometric data will also be erased (GDPR compliant).')) return;
+  try {
+    await axios.delete(`${API}/api/home/users/${userId}`);
+    toast('Member removed and biometric data erased');
+    loadMembers();
+  } catch(e) { toast(e.response?.data?.error || 'Failed to remove member', 'error'); }
 }
 
 // ═══════════════════════════════════════════════════════
@@ -1277,10 +1387,10 @@ async function loadGuests() {
           </div>
           <div class="flex-1 min-w-0">
             <div class="flex items-center gap-2 flex-wrap">
-              <span class="font-bold text-white">${g.name}</span>
+              <span class="font-bold text-white">${esc(g.name)}</span>
               <span class="badge ${g.status==='active'?'badge-green':g.status==='revoked'?'badge-red':expired?'badge-red':'badge-yellow'}">${expired ? 'expired' : g.status}</span>
             </div>
-            <div class="text-xs text-gray-500 mt-0.5">${g.email || 'No email'} · ${g.time_start}–${g.time_end} · ${g.days_allowed}</div>
+            <div class="text-xs text-gray-500 mt-0.5">${esc(g.email) || 'No email'} · ${esc(g.time_start)}–${esc(g.time_end)} · ${esc(g.days_allowed)}</div>
             <div class="text-xs text-gray-600">Valid: ${fmtDate(g.valid_from)} → ${fmtDate(g.valid_until)}${!expired ? ` <span class="text-indigo-400">(${daysLeft}d left)</span>` : ''}</div>
           </div>
           <div class="flex gap-2 flex-shrink-0">
@@ -1288,13 +1398,13 @@ async function loadGuests() {
             ${g.status !== 'revoked' ? `<button onclick="revokeGuest('${g.id}')" class="py-1.5 px-3 text-xs bg-red-500/10 text-red-400 hover:bg-red-500/20 rounded-lg border border-red-500/20">Revoke</button>` : ''}
           </div>
         </div>
-        ${g.invite_token ? `<div class="mt-3 p-2 bg-gray-900 rounded-lg flex items-center gap-2 text-xs"><i class="fas fa-key text-indigo-400"></i><span class="text-gray-400">Token: </span><code class="text-indigo-300 font-mono">${g.invite_token}</code></div>` : ''}
+        ${g.invite_token ? `<div class="mt-3 p-2 bg-gray-900 rounded-lg flex items-center gap-2 text-xs"><i class="fas fa-key text-indigo-400"></i><span class="text-gray-400">Token: </span><code class="text-indigo-300 font-mono">${esc(g.invite_token)}</code></div>` : ''}
       </div>`}).join('')}
   </div>`}`;
 }
 
 function openAddGuestModal(locks) {
-  const lockOpts = (locks || []).map(l => `<label class="flex items-center gap-2 cursor-pointer"><input type="checkbox" value="${l.id}" class="guest-lock-cb"><span class="text-sm text-gray-300">${l.name}</span></label>`).join('');
+  const lockOpts = (locks || []).map(l => `<label class="flex items-center gap-2 cursor-pointer"><input type="checkbox" value="${esc(l.id)}" class="guest-lock-cb"><span class="text-sm text-gray-300">${esc(l.name)}</span></label>`).join('');
   const today = new Date().toISOString().slice(0,10);
   const nextWeek = new Date(Date.now() + 7*86400000).toISOString().slice(0,10);
   openModal(`
@@ -1324,25 +1434,30 @@ function openAddGuestModal(locks) {
 }
 
 async function saveGuest() {
-  const name = document.getElementById('gg-name')?.value.trim();
-  const from = document.getElementById('gg-from')?.value;
+  const name  = document.getElementById('gg-name')?.value.trim();
+  const from  = document.getElementById('gg-from')?.value;
   const until = document.getElementById('gg-until')?.value;
-  if (!name || !from || !until) { toast('Name and dates required', 'warn'); return; }
+  const email = document.getElementById('gg-email')?.value.trim();
+  if (!name)  { toast('Guest name required', 'warn'); return; }
+  if (!from || !until) { toast('Valid dates required', 'warn'); return; }
+  if (name.length > 80)  { toast('Name too long', 'warn'); return; }
+  if (email && !isValidEmail(email)) { toast('Invalid email', 'warn'); return; }
+  if (new Date(from) > new Date(until)) { toast('End date must be after start date', 'warn'); return; }
   const lockIds = [...document.querySelectorAll('.guest-lock-cb:checked')].map(c => c.value);
   try {
     const r = await axios.post(`${API}/api/home/guests`, {
       home_id: currentHomeId, created_by: currentUserId, name,
-      email: document.getElementById('gg-email')?.value || null,
+      email: email || null,
       lock_ids: lockIds, valid_from: from + ' 00:00:00', valid_until: until + ' 23:59:59',
-      time_start: document.getElementById('gg-tstart')?.value,
-      time_end: document.getElementById('gg-tend')?.value
+      time_start: document.getElementById('gg-tstart')?.value || '00:00',
+      time_end:   document.getElementById('gg-tend')?.value   || '23:59',
     });
     // Activate immediately
     await axios.put(`${API}/api/home/guests/${r.data.pass.id}/activate`);
     closeModal();
     toast(`Guest pass created — Token: ${r.data.invite_token}`);
     loadGuests();
-  } catch(e) { toast('Failed to create guest pass', 'error'); }
+  } catch(e) { toast(e.response?.data?.error || 'Failed to create guest pass', 'error'); }
 }
 
 async function activateGuest(id) {
@@ -1352,10 +1467,13 @@ async function activateGuest(id) {
 }
 
 async function revokeGuest(id) {
+  if (!id || !isValidId(id)) return;
   if (!confirm('Revoke this guest pass?')) return;
-  await axios.delete(`${API}/api/home/guests/${id}`);
-  toast('Guest pass revoked');
-  loadGuests();
+  try {
+    await axios.delete(`${API}/api/home/guests/${id}`);
+    toast('Guest pass revoked');
+    loadGuests();
+  } catch(e) { toast(e.response?.data?.error || 'Failed to revoke pass', 'error'); }
 }
 
 // ═══════════════════════════════════════════════════════
@@ -1388,14 +1506,14 @@ async function loadDevices() {
           <i class="fab fa-${d.platform === 'android' ? 'android' : 'apple'} text-${d.trusted ? 'green' : 'gray'}-400 text-2xl"></i>
         </div>
         <div class="flex-1">
-          <div class="font-bold text-white">${d.name}</div>
-          <div class="text-xs text-gray-500">${d.user_name} · ${d.platform}</div>
+          <div class="font-bold text-white">${esc(d.name)}</div>
+          <div class="text-xs text-gray-500">${esc(d.user_name)} · ${esc(d.platform)}</div>
         </div>
         <span class="badge ${d.trusted ? 'badge-green' : 'badge-red'}">${d.trusted ? 'Trusted' : 'Untrusted'}</span>
       </div>
       <div class="space-y-2 text-xs mb-4">
-        <div class="flex justify-between"><span class="text-gray-500">BLE UUID:</span><code class="text-indigo-300 font-mono">${d.ble_uuid || 'Not assigned'}</code></div>
-        ${d.wifi_ssid ? `<div class="flex justify-between"><span class="text-gray-500">WiFi SSID:</span><span class="text-gray-300">${d.wifi_ssid}</span></div>` : ''}
+        <div class="flex justify-between"><span class="text-gray-500">BLE UUID:</span><code class="text-indigo-300 font-mono">${esc(d.ble_uuid) || 'Not assigned'}</code></div>
+        ${d.wifi_ssid ? `<div class="flex justify-between"><span class="text-gray-500">WiFi SSID:</span><span class="text-gray-300">${esc(d.wifi_ssid)}</span></div>` : ''}
         <div class="flex justify-between"><span class="text-gray-500">Last seen:</span><span class="text-gray-300">${d.last_seen ? timeAgo(d.last_seen) : 'Never'}</span></div>
       </div>
       <div class="flex gap-2">
@@ -1432,16 +1550,19 @@ function openAddDeviceModal() {
 async function saveDevice() {
   const name = document.getElementById('dd-name')?.value.trim();
   if (!name) { toast('Device name required', 'warn'); return; }
+  if (name.length > 80) { toast('Name too long (max 80 chars)', 'warn'); return; }
+  const platform = document.getElementById('dd-platform')?.value;
+  if (!['ios','android'].includes(platform)) { toast('Invalid platform', 'warn'); return; }
   try {
     const r = await axios.post(`${API}/api/home/devices`, {
       user_id: currentUserId, home_id: currentHomeId, name,
-      platform: document.getElementById('dd-platform')?.value,
-      push_token: document.getElementById('dd-push')?.value || null
+      platform,
+      push_token: document.getElementById('dd-push')?.value.trim() || null
     });
     closeModal();
     toast(`Device registered — BLE UUID: ${r.data.ble_uuid}`);
     loadDevices();
-  } catch(e) { toast('Failed to register device', 'error'); }
+  } catch(e) { toast(e.response?.data?.error || 'Failed to register device', 'error'); }
 }
 
 async function toggleDeviceTrust(id, trusted) {
@@ -1451,10 +1572,13 @@ async function toggleDeviceTrust(id, trusted) {
 }
 
 async function removeDevice(id) {
+  if (!id || !isValidId(id)) return;
   if (!confirm('Remove this device?')) return;
-  await axios.delete(`${API}/api/home/devices/${id}`);
-  toast('Device removed');
-  loadDevices();
+  try {
+    await axios.delete(`${API}/api/home/devices/${id}`);
+    toast('Device removed');
+    loadDevices();
+  } catch(e) { toast(e.response?.data?.error || 'Failed to remove device', 'error'); }
 }
 
 // ═══════════════════════════════════════════════════════
@@ -1474,19 +1598,19 @@ async function loadActivity() {
       const typeMap = { unlock: ['fa-lock-open','green'], denied: ['fa-times-circle','red'], alert: ['fa-exclamation-triangle','yellow'], guest_entry: ['fa-ticket','purple'], manual: ['fa-hand-pointer','blue'] };
       const [icon, color] = typeMap[ev.event_type] || ['fa-circle','gray'];
       return `
-      <div class="event-row event-${ev.event_type} flex items-start gap-3 border-b border-gray-900 last:border-0">
+      <div class="event-row event-${esc(ev.event_type)} flex items-start gap-3 border-b border-gray-900 last:border-0">
         <div class="w-8 h-8 rounded-lg bg-${color}-500/15 flex items-center justify-center flex-shrink-0 mt-0.5">
           <i class="fas ${icon} text-${color}-400 text-sm"></i>
         </div>
         <div class="flex-1 min-w-0">
           <div class="flex flex-wrap items-center gap-2">
-            <span class="font-medium text-white text-sm">${ev.user_name || 'Unknown'}</span>
-            <span class="text-xs text-gray-500">→ ${ev.lock_name || '—'}</span>
+            <span class="font-medium text-white text-sm">${esc(ev.user_name) || 'Unknown'}</span>
+            <span class="text-xs text-gray-500">→ ${esc(ev.lock_name) || '—'}</span>
             ${ev.ble_detected ? '<span class="badge badge-indigo text-xs"><i class="fas fa-bluetooth"></i> BLE</span>' : ''}
             ${ev.wifi_matched ? '<span class="badge badge-indigo text-xs"><i class="fas fa-wifi"></i> WiFi</span>' : ''}
           </div>
           <div class="text-xs text-gray-600 mt-0.5">
-            ${ev.method || '—'} · ${ev.face_confidence ? `Face: ${Math.round(ev.face_confidence*100)}%` : ''} ${ev.denial_reason ? `· Reason: ${ev.denial_reason}` : ''}
+            ${esc(ev.method) || '—'} · ${ev.face_confidence ? `Face: ${Math.round(ev.face_confidence*100)}%` : ''} ${ev.denial_reason ? `· Reason: ${esc(ev.denial_reason)}` : ''}
           </div>
         </div>
         <div class="text-xs text-gray-600 flex-shrink-0">${timeAgo(ev.created_at)}</div>
@@ -1520,12 +1644,12 @@ async function loadCameras() {
     <div class="card p-5">
       <div class="flex items-center justify-between mb-3">
         <div>
-          <div class="font-bold text-white">${cam.name}</div>
-          <div class="text-xs text-gray-500">${cam.camera_type?.toUpperCase()} · Linked to: ${cam.lock_name || 'No lock'}</div>
+          <div class="font-bold text-white">${esc(cam.name)}</div>
+          <div class="text-xs text-gray-500">${esc(cam.camera_type?.toUpperCase())} · Linked to: ${esc(cam.lock_name) || 'No lock'}</div>
         </div>
         <span class="badge ${cam.status === 'active' ? 'badge-green' : 'badge-red'}">${cam.status}</span>
       </div>
-      <div class="text-xs text-gray-600 font-mono mb-3 bg-gray-900 p-2 rounded-lg overflow-hidden overflow-ellipsis whitespace-nowrap">${cam.stream_url || 'No stream URL configured'}</div>
+      <div class="text-xs text-gray-600 font-mono mb-3 bg-gray-900 p-2 rounded-lg overflow-hidden overflow-ellipsis whitespace-nowrap">${esc(cam.stream_url) || 'No stream URL configured'}</div>
       <div class="flex gap-2">
         <button onclick="deleteCam('${cam.id}')" class="btn-ghost text-sm py-2 px-3">Remove</button>
       </div>
@@ -1551,7 +1675,7 @@ function openAddCameraModal(locks) {
       <div><label class="text-xs text-gray-500 mb-1 block">Linked Lock</label>
         <select id="cc-lock" class="input">
           <option value="">None</option>
-          ${(locks||[]).map(l=>`<option value="${l.id}">${l.name}</option>`).join('')}
+          ${(locks||[]).map(l=>`<option value="${esc(l.id)}">${esc(l.name)}</option>`).join('')}
         </select>
       </div>
     </div>
@@ -1576,19 +1700,32 @@ function updateCameraURLHint(type) {
 async function saveCamera() {
   const name = document.getElementById('cc-name')?.value.trim();
   if (!name) { toast('Camera name required', 'warn'); return; }
+  if (name.length > 80) { toast('Name too long (max 80 chars)', 'warn'); return; }
+  const camType = document.getElementById('cc-type')?.value;
+  const validCamTypes = ['rtsp','ring','nest','arlo','webrtc'];
+  if (!validCamTypes.includes(camType)) { toast('Invalid camera type', 'warn'); return; }
   try {
-    await axios.post(`${API}/api/home/cameras`, { home_id: currentHomeId, lock_id: document.getElementById('cc-lock')?.value || null, name, stream_url: document.getElementById('cc-url')?.value, camera_type: document.getElementById('cc-type')?.value });
+    await axios.post(`${API}/api/home/cameras`, {
+      home_id: currentHomeId,
+      lock_id: document.getElementById('cc-lock')?.value || null,
+      name,
+      stream_url: document.getElementById('cc-url')?.value.trim() || null,
+      camera_type: camType,
+    });
     closeModal();
     toast('Camera added');
     loadCameras();
-  } catch(e) { toast('Failed to add camera', 'error'); }
+  } catch(e) { toast(e.response?.data?.error || 'Failed to add camera', 'error'); }
 }
 
 async function deleteCam(id) {
+  if (!id || !isValidId(id)) return;
   if (!confirm('Remove this camera?')) return;
-  await axios.delete(`${API}/api/home/cameras/${id}`);
-  toast('Camera removed');
-  loadCameras();
+  try {
+    await axios.delete(`${API}/api/home/cameras/${id}`);
+    toast('Camera removed');
+    loadCameras();
+  } catch(e) { toast(e.response?.data?.error || 'Failed to remove camera', 'error'); }
 }
 
 // ═══════════════════════════════════════════════════════
@@ -1618,7 +1755,7 @@ async function loadAutomations() {
   `<div class="space-y-3">${autos.map(a => `
   <div class="card p-4 flex items-center gap-4">
     <div class="w-10 h-10 rounded-xl bg-indigo-500/15 flex items-center justify-center"><i class="fas fa-bolt text-indigo-400"></i></div>
-    <div class="flex-1"><div class="font-medium text-white">${a.name}</div><div class="text-xs text-gray-500">${a.trigger_type} → ${a.action_type}</div></div>
+    <div class="flex-1"><div class="font-medium text-white">${esc(a.name)}</div><div class="text-xs text-gray-500">${esc(a.trigger_type)} → ${esc(a.action_type)}</div></div>
     <button onclick="toggleAuto('${a.id}')" class="w-12 h-6 rounded-full ${a.enabled ? 'bg-indigo-500' : 'bg-gray-700'} relative transition-colors cursor-pointer border-0">
       <div class="w-4 h-4 rounded-full bg-white absolute top-1 ${a.enabled ? 'right-1' : 'left-1'} transition-all"></div>
     </button>

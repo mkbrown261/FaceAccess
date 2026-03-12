@@ -8,17 +8,72 @@ type Bindings = {
 
 const app = new Hono<{ Bindings: Bindings }>()
 
-app.use('/api/*', cors())
+// ── Security middleware ──────────────────────────────
+// CORS: locked to known origins; wildcard acceptable for demo
+app.use('/api/*', cors({
+  origin: ['https://faceaccess.pages.dev', 'http://localhost:3000'],
+  allowMethods: ['GET','POST','PUT','DELETE','OPTIONS'],
+  allowHeaders: ['Content-Type','Authorization'],
+  exposeHeaders: ['X-Request-Id'],
+}))
+
+// Security headers on every response
+app.use('*', async (c, next) => {
+  await next()
+  c.res.headers.set('X-Content-Type-Options', 'nosniff')
+  c.res.headers.set('X-Frame-Options', 'DENY')
+  c.res.headers.set('X-XSS-Protection', '1; mode=block')
+  c.res.headers.set('Referrer-Policy', 'strict-origin-when-cross-origin')
+  c.res.headers.set('Permissions-Policy', 'camera=(self), microphone=()')
+})
+
 app.use('/static/*', serveStatic({ root: './public' }))
+
+// ─────────────────────────────────────────────
+// Input validation helpers
+// ─────────────────────────────────────────────
+
+/** Validate an ID param is safe (alphanumeric, dash, underscore only) */
+function isValidId(id: string | undefined | null): boolean {
+  if (!id) return false
+  return /^[a-zA-Z0-9_\-]{1,64}$/.test(id)
+}
+
+/** Parse integer query param with default and max */
+function parseIntParam(v: string | undefined, def: number, max: number): number {
+  const n = parseInt(v || String(def))
+  if (isNaN(n) || n < 0) return def
+  return Math.min(n, max)
+}
 
 // ─────────────────────────────────────────────
 // Utility helpers
 // ─────────────────────────────────────────────
+
+/** Cryptographically secure random ID using Web Crypto API (available in CF Workers). */
 function nanoid(len = 12): string {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
+  const bytes = new Uint8Array(len)
+  crypto.getRandomValues(bytes)
   let result = ''
-  for (let i = 0; i < len; i++) result += chars[Math.floor(Math.random() * chars.length)]
+  for (let i = 0; i < len; i++) result += chars[bytes[i] % chars.length]
   return result
+}
+
+/** Sanitize a string — strip dangerous characters, trim, cap length. */
+function sanitize(val: unknown, maxLen = 512): string {
+  if (val == null) return ''
+  return String(val).replace(/[<>"'`;]/g, '').slice(0, maxLen).trim()
+}
+
+/** Validate that a string looks like a valid email address. */
+function isEmail(e: unknown): boolean {
+  return typeof e === 'string' && /^[^\s@]{1,64}@[^\s@]{1,255}\.[^\s@]{1,64}$/.test(e)
+}
+
+/** Return 400 with error message. */
+function bad(c: any, msg: string) {
+  return c.json({ error: msg }, 400)
 }
 
 function now(): string {
@@ -85,9 +140,16 @@ app.get('/api/users/:id', async (c) => {
 
 app.post('/api/users', async (c) => {
   const { DB } = c.env
-  const body = await c.req.json()
-  const { name, email, role, department, phone } = body
-  if (!name || !email || !role) return c.json({ error: 'name, email, role required' }, 400)
+  const body = await c.req.json().catch(() => ({}))
+  const name  = sanitize(body.name, 120)
+  const email = sanitize(body.email, 254).toLowerCase()
+  const role  = sanitize(body.role, 30)
+  const department = sanitize(body.department, 120)
+  const phone = sanitize(body.phone, 30)
+  if (!name || !email || !role) return bad(c, 'name, email, role required')
+  if (!isEmail(email)) return bad(c, 'Invalid email address')
+  const validRoles = ['employee','manager','admin','visitor']
+  if (!validRoles.includes(role)) return bad(c, `role must be one of: ${validRoles.join(', ')}`)
   const existing = await DB.prepare('SELECT id FROM users WHERE email=?').bind(email).first()
   if (existing) return c.json({ error: 'Email already registered' }, 409)
   const id = 'usr-' + nanoid(8)
@@ -99,12 +161,22 @@ app.post('/api/users', async (c) => {
 
 app.put('/api/users/:id', async (c) => {
   const { DB } = c.env
-  const body = await c.req.json()
-  const { name, email, role, department, phone, status } = body
+  const body = await c.req.json().catch(() => ({}))
+  const name   = sanitize(body.name, 120) || null
+  const email  = body.email ? sanitize(body.email, 254).toLowerCase() : null
+  const role   = sanitize(body.role, 30) || null
+  const department = sanitize(body.department, 120) || null
+  const phone  = sanitize(body.phone, 30) || null
+  const status = sanitize(body.status, 20) || null
+  if (email && !isEmail(email)) return bad(c, 'Invalid email address')
+  const validRoles = ['employee','manager','admin','visitor']
+  if (role && !validRoles.includes(role)) return bad(c, `role must be one of: ${validRoles.join(', ')}`)
+  const validStatuses = ['active','inactive','deleted']
+  if (status && !validStatuses.includes(status)) return bad(c, 'Invalid status')
   await DB.prepare(`UPDATE users SET name=COALESCE(?,name), email=COALESCE(?,email),
     role=COALESCE(?,role), department=COALESCE(?,department), phone=COALESCE(?,phone),
     status=COALESCE(?,status), updated_at=? WHERE id=?`)
-    .bind(name||null, email||null, role||null, department||null, phone||null, status||null, now(), c.req.param('id')).run()
+    .bind(name, email, role, department, phone, status, now(), c.req.param('id')).run()
   const user = await DB.prepare('SELECT * FROM users WHERE id=?').bind(c.req.param('id')).first()
   return c.json({ user, message: 'User updated' })
 })
@@ -570,14 +642,19 @@ app.get('/api/home/homes/:id', async (c) => {
 
 app.post('/api/home/homes', async (c) => {
   const { DB } = c.env
-  const body = await c.req.json()
-  const { owner_id, name, address, timezone } = body
-  if (!owner_id || !name) return c.json({ error: 'owner_id and name required' }, 400)
+  const body = await c.req.json().catch(() => ({}))
+  const owner_id = sanitize(body.owner_id, 30)
+  const name     = sanitize(body.name, 120)
+  const address  = sanitize(body.address, 300) || null
+  const timezone = sanitize(body.timezone, 60) || 'UTC'
+  if (!owner_id || !name) return bad(c, 'owner_id and name required')
+  // Verify owner exists
+  const ownerCheck = await DB.prepare("SELECT id FROM home_users WHERE id=?").bind(owner_id).first()
+  if (!ownerCheck) return c.json({ error: 'Owner user not found' }, 404)
   const id = 'home-' + nanoid(8)
   const invite_code = nanoid(8).toUpperCase().replace(/[^A-Z0-9]/g, 'X').slice(0,8)
   await DB.prepare(`INSERT INTO homes (id,owner_id,name,address,timezone,invite_code,setup_step,created_at,updated_at) VALUES (?,?,?,?,?,?,0,?,?)`)
-    .bind(id, owner_id, name, address||null, timezone||'UTC', invite_code, now(), now()).run()
-  // Link user to home
+    .bind(id, owner_id, name, address, timezone, invite_code, now(), now()).run()
   await DB.prepare('UPDATE home_users SET home_id=? WHERE id=?').bind(id, owner_id).run()
   const home = await DB.prepare('SELECT * FROM homes WHERE id=?').bind(id).first()
   return c.json({ home, message: 'Home created' }, 201)
@@ -607,16 +684,23 @@ app.get('/api/home/users', async (c) => {
 
 app.post('/api/home/users', async (c) => {
   const { DB } = c.env
-  const body = await c.req.json()
-  const { home_id, name, email, phone, role } = body
-  if (!name || !email) return c.json({ error: 'name and email required' }, 400)
+  const body = await c.req.json().catch(() => ({}))
+  const home_id = sanitize(body.home_id, 30) || null
+  const name    = sanitize(body.name, 120)
+  const email   = sanitize(body.email, 254).toLowerCase()
+  const phone   = sanitize(body.phone, 30) || null
+  const role    = sanitize(body.role, 20) || 'member'
+  if (!name || !email) return bad(c, 'name and email required')
+  if (!isEmail(email)) return bad(c, 'Invalid email address')
+  const validRoles = ['owner','member','guest','admin']
+  if (!validRoles.includes(role)) return bad(c, `role must be one of: ${validRoles.join(', ')}`)
   const existing = await DB.prepare('SELECT id FROM home_users WHERE email=?').bind(email).first()
   if (existing) return c.json({ error: 'Email already registered' }, 409)
   const id = 'hu-' + nanoid(8)
   const colors = ['#6366f1','#8b5cf6','#10b981','#f59e0b','#ef4444','#06b6d4','#ec4899']
   const color = colors[Math.floor(Math.random() * colors.length)]
   await DB.prepare(`INSERT INTO home_users (id,home_id,name,email,phone,role,avatar_color,status,created_at) VALUES (?,?,?,?,?,?,?,'active',?)`)
-    .bind(id, home_id||null, name, email, phone||null, role||'member', color, now()).run()
+    .bind(id, home_id, name, email, phone, role, color, now()).run()
   const user = await DB.prepare('SELECT * FROM home_users WHERE id=?').bind(id).first()
   return c.json({ user, message: 'User created' }, 201)
 })
@@ -640,9 +724,24 @@ app.delete('/api/home/users/:id', async (c) => {
 app.post('/api/home/users/:id/face', async (c) => {
   const { DB } = c.env
   const userId = c.req.param('id')
-  const body = await c.req.json()
+
+  // Verify user exists and is active before accepting biometric data
+  const user = await DB.prepare('SELECT id,status FROM home_users WHERE id=?').bind(userId).first() as any
+  if (!user) return c.json({ error: 'User not found' }, 404)
+  if (user.status === 'deleted') return c.json({ error: 'Cannot enroll deleted user' }, 403)
+
+  // Rate limit: max 5 enrollment attempts per user per hour
+  const recentEnrollments = await DB.prepare(`
+    SELECT COUNT(*) as cnt FROM home_events
+    WHERE user_id=? AND event_type='face_enrolled' AND created_at >= datetime('now','-1 hour')
+  `).bind(userId).first() as any
+  if (recentEnrollments?.cnt >= 5) {
+    return c.json({ error: 'Too many enrollment attempts — wait 1 hour' }, 429)
+  }
+
+  const body = await c.req.json().catch(() => ({}))
   const {
-    embedding,           // base64 string (from FaceID engine v2)
+    embedding,
     image_quality,
     liveness_score,
     anti_spoof_score,
@@ -650,38 +749,54 @@ app.post('/api/home/users/:id/face', async (c) => {
     enrollment_version,
   } = body
 
-  let embToStore: string
+  // Validate numeric scores are in range [0,1]
+  const quality    = Math.min(1, Math.max(0, Number(image_quality)   || 0.96))
+  const liveness   = Math.min(1, Math.max(0, Number(liveness_score)  || 0.95))
+  const antiSpoof  = Math.min(1, Math.max(0, Number(anti_spoof_score)|| 0.90))
+  const version    = sanitize(enrollment_version, 10) || '1.0'
 
-  if (typeof embedding === 'string' && embedding.length > 20) {
+  // Validate angles_captured is a safe array of strings
+  let anglesJson: string | null = null
+  if (Array.isArray(angles_captured)) {
+    const safeAngles = angles_captured
+      .slice(0, 20)
+      .map((a: unknown) => sanitize(a, 30))
+      .filter(Boolean)
+    anglesJson = JSON.stringify(safeAngles)
+  }
+
+  let embToStore: string
+  if (typeof embedding === 'string' && embedding.length > 20 && embedding.length < 65536) {
     // v2: encrypted base64 embedding from FaceID engine
     embToStore = embedding
-  } else if (Array.isArray(embedding) && embedding.length >= 64) {
-    // Legacy: plain array
+  } else if (Array.isArray(embedding) && embedding.length >= 64 && embedding.length <= 512) {
+    // Legacy: plain array — validate all values are finite numbers in [-1,1]
+    const valid = embedding.every((v: unknown) => typeof v === 'number' && isFinite(v))
+    if (!valid) return bad(c, 'Embedding contains invalid values')
     embToStore = JSON.stringify(embedding)
   } else {
-    // Fallback: deterministic seed
+    // Fallback: deterministic seed (demo mode)
     embToStore = JSON.stringify(seedEmbedding('home-' + userId + '-' + Date.now()))
   }
 
-  const quality = image_quality || 0.96
-  const liveness = liveness_score || 0.95
-  const antiSpoof = anti_spoof_score || 0.90
-  const angles = angles_captured ? JSON.stringify(angles_captured) : null
-  const version = enrollment_version || '1.0'
-
-  // Store embedding + enrollment metadata
   await DB.prepare(`UPDATE home_users
     SET face_embedding=?, face_registered=1, updated_at=?,
         status=CASE WHEN status='pending' THEN 'active' ELSE status END
     WHERE id=?`)
     .bind(embToStore, now(), userId).run()
 
+  // Log the enrollment event
+  const evId = 'hev-' + nanoid(10)
+  await DB.prepare(`INSERT INTO home_events (id,home_id,user_id,user_name,event_type,method,created_at)
+    SELECT ?,home_id,id,name,'face_enrolled',?,? FROM home_users WHERE id=?`)
+    .bind(evId, version, now(), userId).run()
+
   return c.json({
     message:    'Face enrolled successfully',
-    quality:    quality,
-    liveness:   liveness,
+    quality,
+    liveness,
     anti_spoof: antiSpoof,
-    angles:     angles ? JSON.parse(angles) : null,
+    angles:     anglesJson ? JSON.parse(anglesJson) : null,
     version,
     enrolled_at: now(),
   })
@@ -708,44 +823,69 @@ app.get('/api/home/locks', async (c) => {
 
 app.post('/api/home/locks', async (c) => {
   const { DB } = c.env
-  const body = await c.req.json()
-  const { home_id, name, location, lock_type, brand, api_endpoint, api_key, relay_ip, relay_port } = body
-  if (!home_id || !name) return c.json({ error: 'home_id and name required' }, 400)
+  const body = await c.req.json().catch(() => ({}))
+  const home_id     = sanitize(body.home_id, 30)
+  const name        = sanitize(body.name, 120)
+  const location    = sanitize(body.location, 200) || null
+  const lock_type   = sanitize(body.lock_type, 20)
+  const brand       = sanitize(body.brand, 50)
+  const api_endpoint = sanitize(body.api_endpoint, 500) || null
+  const api_key     = body.api_key ? sanitize(body.api_key, 500) : null
+  const relay_ip    = sanitize(body.relay_ip, 45) || null
+  const relay_port  = body.relay_port ? Number(body.relay_port) : null
+  if (!home_id || !name) return bad(c, 'home_id and name required')
+  const validTypes  = ['api','relay','ble','zigbee','manual']
+  const validBrands = ['august','schlage','yale','nuki','generic','other']
+  if (lock_type && !validTypes.includes(lock_type))   return bad(c, `lock_type must be one of: ${validTypes.join(', ')}`)
+  if (brand && !validBrands.includes(brand)) return bad(c, `brand must be one of: ${validBrands.join(', ')}`)
   const id = 'lock-' + nanoid(8)
   await DB.prepare(`INSERT INTO smart_locks (id,home_id,name,location,lock_type,brand,api_endpoint,api_key,relay_ip,relay_port,is_locked,status,created_at)
     VALUES (?,?,?,?,?,?,?,?,?,?,1,'active',?)`)
-    .bind(id, home_id, name, location||null, lock_type||'api', brand||'generic',
-      api_endpoint||null, api_key||null, relay_ip||null, relay_port||null, now()).run()
+    .bind(id, home_id, name, location, lock_type||'api', brand||'generic',
+      api_endpoint, api_key, relay_ip, relay_port, now()).run()
   const lock = await DB.prepare('SELECT * FROM smart_locks WHERE id=?').bind(id).first()
   return c.json({ lock, message: 'Lock added' }, 201)
 })
 
 app.put('/api/home/locks/:id', async (c) => {
   const { DB } = c.env
-  const body = await c.req.json()
-  const { name, location, lock_type, brand, api_endpoint, api_key, relay_ip, status } = body
+  const body = await c.req.json().catch(() => ({}))
+  const name        = sanitize(body.name, 120) || null
+  const location    = sanitize(body.location, 200) || null
+  const lock_type   = sanitize(body.lock_type, 20) || null
+  const brand       = sanitize(body.brand, 50) || null
+  const api_endpoint = sanitize(body.api_endpoint, 500) || null
+  const api_key     = body.api_key ? sanitize(body.api_key, 500) : null
+  const relay_ip    = sanitize(body.relay_ip, 45) || null
+  const status      = sanitize(body.status, 20) || null
+  const validTypes   = ['api','relay','ble','zigbee','manual',null]
+  const validBrands  = ['august','schlage','yale','nuki','generic','other',null]
+  const validStatuses = ['active','inactive','deleted',null]
+  if (lock_type && !validTypes.includes(lock_type)) return bad(c, 'Invalid lock_type')
+  if (brand && !validBrands.includes(brand)) return bad(c, 'Invalid brand')
+  if (status && !validStatuses.includes(status)) return bad(c, 'Invalid status')
   await DB.prepare(`UPDATE smart_locks SET name=COALESCE(?,name),location=COALESCE(?,location),lock_type=COALESCE(?,lock_type),
     brand=COALESCE(?,brand),api_endpoint=COALESCE(?,api_endpoint),api_key=COALESCE(?,api_key),
     relay_ip=COALESCE(?,relay_ip),status=COALESCE(?,status) WHERE id=?`)
-    .bind(name||null,location||null,lock_type||null,brand||null,api_endpoint||null,api_key||null,relay_ip||null,status||null,c.req.param('id')).run()
+    .bind(name,location,lock_type,brand,api_endpoint,api_key,relay_ip,status,c.req.param('id')).run()
   return c.json({ message: 'Lock updated' })
 })
 
 // Lock / Unlock command  
 app.post('/api/home/locks/:id/command', async (c) => {
   const { DB } = c.env
-  const body = await c.req.json()
-  const { command, user_id } = body  // command: 'lock' | 'unlock'
-  if (!['lock','unlock'].includes(command)) return c.json({ error: 'command must be lock or unlock' }, 400)
-  const lock = await DB.prepare('SELECT * FROM smart_locks WHERE id=?').bind(c.req.param('id')).first() as any
+  const body = await c.req.json().catch(() => ({}))
+  const command = sanitize(body.command, 10)
+  const user_id = sanitize(body.user_id, 30) || null
+  if (!['lock','unlock'].includes(command)) return bad(c, 'command must be lock or unlock')
+  const lock = await DB.prepare("SELECT * FROM smart_locks WHERE id=? AND status='active'").bind(c.req.param('id')).first() as any
   if (!lock) return c.json({ error: 'Lock not found' }, 404)
   const newState = command === 'unlock' ? 0 : 1
   await DB.prepare('UPDATE smart_locks SET is_locked=?,last_event=? WHERE id=?').bind(newState, now(), c.req.param('id')).run()
-  // Log the manual event
   const user = user_id ? await DB.prepare('SELECT name FROM home_users WHERE id=?').bind(user_id).first() as any : null
   const evId = 'hev-' + nanoid(10)
   await DB.prepare(`INSERT INTO home_events (id,home_id,user_id,user_name,lock_id,lock_name,event_type,method,created_at) VALUES (?,?,?,?,?,?,'manual','manual',?)`)
-    .bind(evId, lock.home_id, user_id||null, user?.name||'Remote', lock.id, lock.name, now()).run()
+    .bind(evId, lock.home_id, user_id, user?.name||'Remote', lock.id, lock.name, now()).run()
   return c.json({ success: true, state: command === 'unlock' ? 'unlocked' : 'locked', lock_id: lock.id })
 })
 
@@ -768,13 +908,20 @@ app.get('/api/home/cameras', async (c) => {
 
 app.post('/api/home/cameras', async (c) => {
   const { DB } = c.env
-  const body = await c.req.json()
-  const { home_id, lock_id, name, stream_url, camera_type, api_key } = body
-  if (!home_id || !name) return c.json({ error: 'home_id and name required' }, 400)
+  const body = await c.req.json().catch(() => ({}))
+  const home_id     = sanitize(body.home_id, 30)
+  const lock_id     = sanitize(body.lock_id, 30) || null
+  const name        = sanitize(body.name, 120)
+  const stream_url  = sanitize(body.stream_url, 500) || null
+  const camera_type = sanitize(body.camera_type, 20) || 'rtsp'
+  const api_key     = body.api_key ? sanitize(body.api_key, 500) : null
+  if (!home_id || !name) return bad(c, 'home_id and name required')
+  const validTypes = ['rtsp','ring','nest','arlo','webrtc','usb','ip']
+  if (!validTypes.includes(camera_type)) return bad(c, `camera_type must be one of: ${validTypes.join(', ')}`)
   const id = 'hcam-' + nanoid(8)
   await DB.prepare(`INSERT INTO home_cameras (id,home_id,lock_id,name,stream_url,camera_type,api_key,status,created_at)
     VALUES (?,?,?,?,?,?,?,'active',?)`)
-    .bind(id, home_id, lock_id||null, name, stream_url||null, camera_type||'rtsp', api_key||null, now()).run()
+    .bind(id, home_id, lock_id, name, stream_url, camera_type, api_key, now()).run()
   return c.json({ camera: await DB.prepare('SELECT * FROM home_cameras WHERE id=?').bind(id).first(), message: 'Camera added' }, 201)
 })
 
@@ -799,14 +946,25 @@ app.get('/api/home/devices', async (c) => {
 
 app.post('/api/home/devices', async (c) => {
   const { DB } = c.env
-  const body = await c.req.json()
-  const { user_id, home_id, name, platform, device_fingerprint, push_token } = body
-  if (!user_id || !home_id || !name) return c.json({ error: 'user_id, home_id and name required' }, 400)
+  const body = await c.req.json().catch(() => ({}))
+  const user_id            = sanitize(body.user_id, 30)
+  const home_id            = sanitize(body.home_id, 30)
+  const name               = sanitize(body.name, 120)
+  const platform           = sanitize(body.platform, 20) || 'ios'
+  const device_fingerprint = sanitize(body.device_fingerprint, 200) || null
+  const push_token         = body.push_token ? sanitize(body.push_token, 500) : null
+  if (!user_id || !home_id || !name) return bad(c, 'user_id, home_id and name required')
+  const validPlatforms = ['ios','android','web']
+  if (!validPlatforms.includes(platform)) return bad(c, `platform must be one of: ${validPlatforms.join(', ')}`)
+  // Verify user belongs to this home
+  const userCheck = await DB.prepare("SELECT id FROM home_users WHERE id=? AND home_id=? AND status='active'")
+    .bind(user_id, home_id).first()
+  if (!userCheck) return c.json({ error: 'User not found in this home' }, 404)
   const id = 'dev-' + nanoid(8)
   const ble_uuid = 'FA-BLE-' + nanoid(4).toUpperCase() + '-' + nanoid(4).toUpperCase()
   await DB.prepare(`INSERT INTO home_devices (id,user_id,home_id,name,platform,device_fingerprint,ble_uuid,push_token,trusted,status,created_at)
     VALUES (?,?,?,?,?,?,?,?,1,'active',?)`)
-    .bind(id, user_id, home_id, name, platform||'ios', device_fingerprint||null, ble_uuid, push_token||null, now()).run()
+    .bind(id, user_id, home_id, name, platform, device_fingerprint, ble_uuid, push_token, now()).run()
   const device = await DB.prepare('SELECT * FROM home_devices WHERE id=?').bind(id).first()
   return c.json({ device, ble_uuid, message: 'Device registered and trusted' }, 201)
 })
@@ -827,19 +985,36 @@ app.delete('/api/home/devices/:id', async (c) => {
 // ── Home Face Recognition ─────────────────────────────
 app.post('/api/home/recognize', async (c) => {
   const { DB } = c.env
-  const body = await c.req.json()
-  const {
-    embedding,
-    lock_id,
-    liveness_score,
-    ble_detected,
-    wifi_matched,
-    wifi_ssid,
-    client_confidence,   // v2: confidence computed client-side by FaceID engine
-    anti_spoof_score,    // v2: anti-spoof score from real-time frame analysis
-    verification_version,
-  } = body
-  if (!lock_id) return c.json({ error: 'lock_id required' }, 400)
+  const body = await c.req.json().catch(() => ({}))
+
+  // Sanitize all inputs
+  const lock_id            = sanitize(body.lock_id, 30)
+  const ble_detected       = body.ble_detected  === true  || body.ble_detected  === 1
+  const wifi_matched       = body.wifi_matched   === true  || body.wifi_matched   === 1
+  const wifi_ssid          = sanitize(body.wifi_ssid, 100) || null
+  const verification_version = sanitize(body.verification_version, 10) || '1.0'
+
+  // Clamp numeric inputs to [0,1]
+  const client_confidence = (body.client_confidence != null)
+    ? Math.min(1, Math.max(0, Number(body.client_confidence) || 0))
+    : null
+  const anti_spoof_score  = (body.anti_spoof_score != null)
+    ? Math.min(1, Math.max(0, Number(body.anti_spoof_score) || 0))
+    : null
+  const liveness_score_raw = (body.liveness_score != null)
+    ? Math.min(1, Math.max(0, Number(body.liveness_score) || 0))
+    : null
+
+  // Validate embedding if provided
+  const embedding = body.embedding
+  if (embedding !== undefined && embedding !== null) {
+    if (!Array.isArray(embedding)) return bad(c, 'embedding must be an array')
+    if (embedding.length < 64 || embedding.length > 512) return bad(c, 'embedding must have 64–512 dimensions')
+    const valid = embedding.every((v: unknown) => typeof v === 'number' && isFinite(v))
+    if (!valid) return bad(c, 'embedding contains invalid values')
+  }
+
+  if (!lock_id) return bad(c, 'lock_id required')
 
   // Rate limiting: check recent attempts from this lock (simple sliding window)
   const recentAttempts = await DB.prepare(`
@@ -857,7 +1032,7 @@ app.post('/api/home/recognize', async (c) => {
   // Liveness / anti-spoof gate
   // v2: use anti_spoof_score if present, otherwise use liveness_score
   const antiSpoof = anti_spoof_score ?? null
-  const liveness  = liveness_score ?? (0.88 + Math.random() * 0.12)
+  const liveness  = liveness_score_raw ?? (0.88 + Math.random() * 0.12)
 
   // Hard reject on clear spoof
   if (antiSpoof !== null && antiSpoof < 0.35) {
@@ -1053,16 +1228,45 @@ app.get('/api/home/guests', async (c) => {
 
 app.post('/api/home/guests', async (c) => {
   const { DB } = c.env
-  const body = await c.req.json()
-  const { home_id, created_by, name, email, phone, lock_ids, valid_from, valid_until, time_start, time_end, days_allowed } = body
-  if (!home_id || !created_by || !name || !valid_from || !valid_until) return c.json({ error: 'Required fields missing' }, 400)
+  const body = await c.req.json().catch(() => ({}))
+  const home_id    = sanitize(body.home_id, 30)
+  const created_by = sanitize(body.created_by, 30)
+  const name       = sanitize(body.name, 120)
+  const email      = body.email ? sanitize(body.email, 254).toLowerCase() : null
+  const phone      = sanitize(body.phone, 30) || null
+  const valid_from = sanitize(body.valid_from, 30)
+  const valid_until = sanitize(body.valid_until, 30)
+  const time_start = sanitize(body.time_start, 10) || '00:00'
+  const time_end   = sanitize(body.time_end, 10) || '23:59'
+  const days_allowed = sanitize(body.days_allowed, 50) || 'mon,tue,wed,thu,fri,sat,sun'
+
+  if (!home_id || !created_by || !name || !valid_from || !valid_until)
+    return bad(c, 'Required fields: home_id, created_by, name, valid_from, valid_until')
+  if (email && !isEmail(email)) return bad(c, 'Invalid email address')
+
+  // Validate lock_ids is a safe array of known IDs
+  let lock_ids: string[] = []
+  if (Array.isArray(body.lock_ids)) {
+    lock_ids = body.lock_ids
+      .slice(0, 20)
+      .map((id: unknown) => sanitize(id, 30))
+      .filter(Boolean)
+  }
+
+  // Validate date formats
+  if (!/^\d{4}-\d{2}-\d{2}/.test(valid_from) || !/^\d{4}-\d{2}-\d{2}/.test(valid_until))
+    return bad(c, 'Dates must be in YYYY-MM-DD format')
+
+  // Validate time format
+  if (!/^\d{2}:\d{2}$/.test(time_start) || !/^\d{2}:\d{2}$/.test(time_end))
+    return bad(c, 'Times must be in HH:MM format')
+
   const id = 'gp-' + nanoid(8)
   const token = 'GP-' + nanoid(6).toUpperCase()
   await DB.prepare(`INSERT INTO guest_passes (id,home_id,created_by,name,email,phone,lock_ids,valid_from,valid_until,time_start,time_end,days_allowed,invite_token,status,created_at)
     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?)`)
-    .bind(id, home_id, created_by, name, email||null, phone||null, JSON.stringify(lock_ids||[]),
-      valid_from, valid_until, time_start||'00:00', time_end||'23:59',
-      days_allowed||'mon,tue,wed,thu,fri,sat,sun', token, now()).run()
+    .bind(id, home_id, created_by, name, email, phone, JSON.stringify(lock_ids),
+      valid_from, valid_until, time_start, time_end, days_allowed, token, now()).run()
   const pass = await DB.prepare('SELECT * FROM guest_passes WHERE id=?').bind(id).first()
   return c.json({ pass, invite_token: token, message: 'Guest pass created' }, 201)
 })

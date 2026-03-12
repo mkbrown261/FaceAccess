@@ -356,6 +356,181 @@ async function updateSetupProgress(step) {
   if (obHomeId) await axios.put(`${API}/api/home/homes/${obHomeId}/setup`, { step }).catch(() => {});
 }
 
+// ── Step 3: Fallback photo upload ─────────────────────
+/**
+ * obFaceUpload(event) — called when user picks a file in the fallback upload.
+ * Reads the image, extracts a simulated embedding via EmbeddingGenerator,
+ * stores it as obFaceResult so saveFace() can POST it to the API.
+ */
+async function obFaceUpload(event) {
+  const file = event?.target?.files?.[0];
+  if (!file) return;
+
+  // Validate: images only, max 10 MB
+  if (!file.type.startsWith('image/')) {
+    updateFaceStepUI('error', null, { message: 'Please select an image file (JPEG, PNG, WEBP).' });
+    return;
+  }
+  if (file.size > 10 * 1024 * 1024) {
+    updateFaceStepUI('error', null, { message: 'Image too large — maximum 10 MB.' });
+    return;
+  }
+
+  const statusBar = document.getElementById('ob-face-statusbar');
+  if (statusBar) statusBar.innerHTML = `<div style="color:rgba(255,255,255,0.5);font-size:13px;padding:10px 0;">Processing photo…</div>`;
+
+  try {
+    const imgURL = URL.createObjectURL(file);
+    const img = new Image();
+    await new Promise((res, rej) => { img.onload = res; img.onerror = rej; img.src = imgURL; });
+
+    // Draw to canvas and extract a simulated embedding
+    const canvas = document.createElement('canvas');
+    canvas.width  = 112;
+    canvas.height = 112;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(img, 0, 0, 112, 112);
+    URL.revokeObjectURL(imgURL);
+
+    let embedding;
+    if (window.FaceIDEngine?.EmbeddingGenerator) {
+      const gen = new window.FaceIDEngine.EmbeddingGenerator();
+      const imgData = ctx.getImageData(0, 0, 112, 112);
+      embedding = gen.extract(imgData) || _photoFallbackEmbedding(ctx, 112, 112);
+    } else {
+      embedding = _photoFallbackEmbedding(ctx, 112, 112);
+    }
+
+    obFaceResult = {
+      embedding,
+      averageQuality: 72,       // lower quality than live capture
+      livenessScore:  0.70,     // photo: lower liveness (no live challenge)
+      antiSpoofScore: 0.65,     // photo: medium anti-spoof
+      capturedAngles: ['front'],
+      method: 'photo_upload',
+    };
+    obFaceRegistered = true;
+    updateFaceStepUI('complete', obFaceResult);
+
+  } catch(e) {
+    console.error('[obFaceUpload]', e);
+    updateFaceStepUI('error', null, { message: 'Could not process photo — try a different image.' });
+  }
+}
+
+/** Simple DCT-like embedding from image pixel data (128 floats, L2-normalised). */
+function _photoFallbackEmbedding(ctx, w, h) {
+  const d = ctx.getImageData(0, 0, w, h).data;
+  const emb = new Float32Array(128);
+  const step = Math.floor(d.length / 4 / 128);
+  for (let i = 0; i < 128; i++) {
+    const pxOff = i * step * 4;
+    const r = d[pxOff] / 255, g = d[pxOff+1] / 255, b = d[pxOff+2] / 255;
+    emb[i] = 0.299*r + 0.587*g + 0.114*b - 0.5;
+  }
+  // L2 normalise
+  let norm = 0;
+  for (let i = 0; i < 128; i++) norm += emb[i] * emb[i];
+  norm = Math.sqrt(norm) || 1;
+  return Array.from(emb).map(v => v / norm);
+}
+
+// ── Fallback: photo upload enrollment ─────────────────
+/**
+ * Called when the user selects a photo from the file input on step 3.
+ * Reads the file as a data URL, renders a preview, generates a
+ * deterministic placeholder embedding (production: send to server for
+ * server-side feature extraction), and marks face as registered.
+ */
+async function obFaceUpload(event) {
+  const file = event?.target?.files?.[0];
+  if (!file) return;
+
+  // Basic validation
+  if (!file.type.startsWith('image/')) {
+    showStepError(3, 'Please select an image file (JPG, PNG, HEIC).');
+    return;
+  }
+  if (file.size > 8 * 1024 * 1024) {
+    showStepError(3, 'Image too large — maximum 8 MB.');
+    return;
+  }
+
+  updateFaceStepUI('ready'); // clear previous state
+
+  const statusBar = document.getElementById('ob-face-statusbar');
+  if (statusBar) {
+    statusBar.innerHTML = `<div style="padding:12px;text-align:center;color:rgba(255,255,255,0.4);font-size:13px;">
+      <i class="fas fa-spinner fa-spin mr-2"></i>Processing photo…
+    </div>`;
+  }
+
+  try {
+    // Read image as DataURL for preview
+    const dataUrl = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload  = e => resolve(e.target.result);
+      reader.onerror = () => reject(new Error('Failed to read file'));
+      reader.readAsDataURL(file);
+    });
+
+    // Show photo preview in container
+    const container = document.getElementById('ob-faceid-container');
+    if (container) {
+      container.innerHTML = `
+        <div style="text-align:center;padding:16px;">
+          <img src="${dataUrl}" alt="Enrollment photo"
+            style="width:160px;height:160px;object-fit:cover;border-radius:50%;
+                   border:3px solid rgba(99,102,241,0.6);margin:0 auto 12px;display:block;">
+          <div style="font-size:12px;color:rgba(255,255,255,0.4);">Photo uploaded</div>
+        </div>`;
+      container.style.display = 'block';
+    }
+
+    // Generate a deterministic 128-dim embedding from image bytes
+    // (In production this would be a real server-side feature extraction endpoint)
+    const arrayBuffer = await file.arrayBuffer();
+    const bytes = new Uint8Array(arrayBuffer);
+    const embedding = [];
+    for (let i = 0; i < 128; i++) {
+      // Use byte values to seed a pseudo-random embedding vector
+      const v = bytes[i % bytes.length] / 255.0 - 0.5;
+      embedding.push(v + (bytes[(i * 7 + 3) % bytes.length] / 255.0 - 0.5) * 0.3);
+    }
+    // L2-normalize
+    const norm = Math.sqrt(embedding.reduce((s, v) => s + v * v, 0)) || 1;
+    const normalized = embedding.map(v => v / norm);
+
+    obFaceResult = {
+      embedding: normalized,
+      capturedAngles: ['upload'],
+      averageQuality: 70,
+      livenessScore: 0.60,   // Lower — photo upload is less secure
+      antiSpoofScore: 0.55,
+      method: 'photo_upload',
+    };
+    obFaceRegistered = true;
+
+    updateFaceStepUI('complete', {
+      ...obFaceResult,
+      capturedAngles: ['photo'],
+    });
+
+    // Show warning about reduced security
+    const sb = document.getElementById('ob-face-statusbar');
+    if (sb) {
+      sb.innerHTML += `<div style="margin-top:8px;padding:10px 14px;background:rgba(245,158,11,0.1);
+        border:1px solid rgba(245,158,11,0.3);border-radius:10px;font-size:12px;color:#f59e0b;">
+        <i class="fas fa-exclamation-triangle mr-1"></i>
+        Photo enrollment is less secure than live capture. We recommend re-enrolling
+        with the camera on your phone for best accuracy.
+      </div>`;
+    }
+  } catch(err) {
+    updateFaceStepUI('error', null, err);
+  }
+}
+
 // ── Helpers ────────────────────────────────────────────
 window.addEventListener('beforeunload', () => {
   if (obFaceIDUI) obFaceIDUI.stop();
