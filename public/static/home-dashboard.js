@@ -396,8 +396,20 @@ async function loadRecognize() {
   if (_recogOverlayAnim)   { cancelAnimationFrame(_recogOverlayAnim); _recogOverlayAnim = null; }
 
   const el = document.getElementById('tab-recognize');
+
+  // Guard: wait for currentHomeId if init() hasn't finished yet
+  if (!currentHomeId) {
+    el.innerHTML = `<div style="padding:40px;text-align:center;color:rgba(255,255,255,0.4);"><i class="fas fa-spinner fa-spin" style="font-size:28px;margin-bottom:12px;display:block;"></i>Loading home data...</div>`;
+    await new Promise(resolve => {
+      const poll = setInterval(() => { if (currentHomeId) { clearInterval(poll); resolve(); } }, 200);
+      setTimeout(() => { clearInterval(poll); resolve(); }, 8000);
+    });
+  }
+
   const locksR = await axios.get(`${API}/api/home/locks?home_id=${currentHomeId}`).catch(() => ({data:{locks:[]}}));
   const locks = locksR.data.locks || [];
+  // Track selected lock in module-level variable so it's always accessible
+  window._recogSelectedLockId = locks.length > 0 ? locks[0].id : null;
 
   el.innerHTML = `
   <div class="max-w-2xl">
@@ -418,13 +430,44 @@ async function loadRecognize() {
     <div class="card p-0 mb-5 overflow-hidden" style="background:#000;">
       <!-- Top bar -->
       <div style="padding:12px 16px;background:rgba(255,255,255,0.03);border-bottom:1px solid rgba(255,255,255,0.06);display:flex;align-items:center;justify-content:space-between;">
-        <div style="display:flex;align-items:center;gap:10px;">
-          <select id="recog-lock" style="
-            background:rgba(255,255,255,0.07);border:1px solid rgba(255,255,255,0.12);
-            border-radius:8px;padding:6px 12px;color:#fff;font-size:13px;outline:none;
-          ">
-            ${locks.map(l => `<option value="${l.id}">${l.name}</option>`).join('')}
-          </select>
+        <div style="display:flex;align-items:center;gap:8px;position:relative;">
+          <!-- Custom lock picker — replaces broken native select -->
+          <div id="recog-lock-picker" style="position:relative;">
+            <button id="recog-lock-btn" onclick="recogToggleLockMenu()" style="
+              display:flex;align-items:center;gap:8px;
+              background:rgba(99,102,241,0.12);border:1px solid rgba(99,102,241,0.35);
+              border-radius:10px;padding:8px 14px;color:#c7d2fe;font-size:13px;font-weight:600;
+              cursor:pointer;white-space:nowrap;min-width:150px;
+            ">
+              <i class="fas fa-lock" style="color:#818cf8;font-size:11px;"></i>
+              <span id="recog-lock-label">${locks.length > 0 ? locks[0].name : 'No locks'}</span>
+              <i class="fas fa-chevron-down" style="font-size:9px;margin-left:auto;opacity:0.6;"></i>
+            </button>
+            <div id="recog-lock-menu" style="
+              display:none;position:absolute;top:calc(100% + 6px);left:0;z-index:50;
+              background:#1a1a2e;border:1px solid rgba(255,255,255,0.1);border-radius:12px;
+              overflow:hidden;min-width:200px;box-shadow:0 8px 32px rgba(0,0,0,0.6);
+            ">
+              ${locks.length === 0
+                ? `<div style="padding:14px 16px;color:rgba(255,255,255,0.4);font-size:13px;">No locks found</div>`
+                : locks.map((l, i) => `
+              <div onclick="recogSelectLock('${l.id}','${l.name.replace(/'/g,"\\'")}')"
+                style="padding:11px 16px;cursor:pointer;display:flex;align-items:center;gap:10px;
+                  font-size:13px;color:#e2e8f0;transition:background 0.15s;
+                  ${i===0?'background:rgba(99,102,241,0.15);':''}
+                  border-bottom:${i < locks.length-1 ? '1px solid rgba(255,255,255,0.05)' : 'none'};"
+                onmouseover="this.style.background='rgba(99,102,241,0.15)'" onmouseout="this.style.background='${i===0?'rgba(99,102,241,0.15)':"transparent"}'">
+                <i class="fas fa-${l.lock_type==='relay'?'plug':'lock'}" style="color:#818cf8;font-size:11px;width:14px;"></i>
+                <div>
+                  <div style="font-weight:600;">${l.name}</div>
+                  <div style="font-size:11px;color:rgba(255,255,255,0.35);margin-top:1px;">${l.location || l.brand || ''} · ${l.is_locked ? '🔒 Locked' : '🔓 Unlocked'}</div>
+                </div>
+              </div>`).join('')
+              }
+            </div>
+          </div>
+          <!-- Hidden input so existing recog-lock value reads still work -->
+          <input type="hidden" id="recog-lock" value="${locks.length > 0 ? locks[0].id : ''}">
         </div>
         <div style="display:flex;gap:8px;align-items:center;">
           <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:rgba(99,179,237,0.9);cursor:pointer;">
@@ -722,14 +765,22 @@ function _startRecogHUDLoop(video) {
 
     if (m && m.detected) {
       const q = m.quality || 0;
-      if (hudFace)  { hudFace.textContent  = `Face ${q}%`; hudFace.style.color = q > 70 ? '#34d399' : q > 50 ? '#fbbf24' : '#ef4444'; }
-      if (hudBr)    { hudBr.textContent    = `☀ ${Math.round(m.brightness || 0)}`; }
-      if (hudSpoof) { const sc = m.antiSpoof?.score || 0; hudSpoof.textContent = `🛡 ${Math.round(sc*100)}%`; hudSpoof.style.color = sc > 0.72 ? '#34d399' : sc > 0.5 ? '#fbbf24' : '#ef4444'; }
-      if (qBar) { qBar.style.width = q + '%'; qBar.style.background = q >= 75 ? '#34d399' : q >= 55 ? '#f59e0b' : '#ef4444'; }
+      const qMsg = _recogDetector.qualityMessage ? _recogDetector.qualityMessage(m) : null;
+      const faceText = qMsg ? qMsg.msg : `Face ${q}%`;
+      const faceColor = q > 70 ? '#34d399' : q > 45 ? '#fbbf24' : '#ef4444';
+      if (hudFace)  { hudFace.textContent = faceText; hudFace.style.color = faceColor; }
+      if (hudBr)    { hudBr.textContent   = `☀ ${Math.round(m.brightness || 0)} ${m.brightness < 40 ? '(dim)' : ''}`; }
+      if (hudSpoof) {
+        const sc = m.antiSpoof?.score || 0;
+        const ll = m.antiSpoof?.lowLightMode;
+        hudSpoof.textContent = ll ? `🛡 Low-light mode` : `🛡 ${Math.round(sc*100)}%`;
+        hudSpoof.style.color = ll ? '#fbbf24' : sc > 0.72 ? '#34d399' : sc > 0.5 ? '#fbbf24' : '#ef4444';
+      }
+      if (qBar) { qBar.style.width = q + '%'; qBar.style.background = q >= 75 ? '#34d399' : q >= 45 ? '#f59e0b' : '#ef4444'; }
       if (qPct) qPct.textContent = q + '%';
 
-      // Spoof alert
-      if (m.antiSpoof && m.antiSpoof.score < 0.35 && spoofAlert) {
+      // Spoof alert only if NOT low light mode
+      if (m.antiSpoof && m.antiSpoof.score < 0.35 && !m.antiSpoof.lowLightMode && spoofAlert) {
         spoofAlert.style.display = 'block';
         setTimeout(() => { if (spoofAlert) spoofAlert.style.display = 'none'; }, 2000);
       }
@@ -744,11 +795,46 @@ function _startRecogHUDLoop(video) {
   _recogDetectorLoop = requestAnimationFrame(loop);
 }
 
+// Lock picker helpers
+function recogToggleLockMenu() {
+  const menu = document.getElementById('recog-lock-menu');
+  if (!menu) return;
+  const isOpen = menu.style.display !== 'none';
+  menu.style.display = isOpen ? 'none' : 'block';
+  // Close on outside click
+  if (!isOpen) {
+    setTimeout(() => {
+      const handler = (e) => {
+        if (!document.getElementById('recog-lock-picker')?.contains(e.target)) {
+          menu.style.display = 'none';
+          document.removeEventListener('click', handler);
+        }
+      };
+      document.addEventListener('click', handler);
+    }, 10);
+  }
+}
+
+function recogSelectLock(id, name) {
+  window._recogSelectedLockId = id;
+  const hiddenInput = document.getElementById('recog-lock');
+  if (hiddenInput) hiddenInput.value = id;
+  const label = document.getElementById('recog-lock-label');
+  if (label) label.textContent = name;
+  const menu = document.getElementById('recog-lock-menu');
+  if (menu) menu.style.display = 'none';
+  // Update active highlight in menu
+  const items = menu?.querySelectorAll('[onclick^="recogSelectLock"]');
+  items?.forEach(item => { item.style.background = item.getAttribute('onclick').includes(`'${id}'`) ? 'rgba(99,102,241,0.15)' : 'transparent'; });
+  toast(`Lock: ${name}`, 'success');
+}
+
 async function recogRunVerification() {
-  const lockId = document.getElementById('recog-lock')?.value;
+  // Use module-level selected lock (reliable), fall back to hidden input
+  const lockId = window._recogSelectedLockId || document.getElementById('recog-lock')?.value;
   const ble    = document.getElementById('recog-ble')?.checked  || false;
   const wifi   = document.getElementById('recog-wifi')?.checked || false;
-  if (!lockId) { toast('Select a lock first', 'warn'); return; }
+  if (!lockId) { toast('No locks configured — add a lock in Settings first', 'warn'); return; }
   if (!_recogStream) { toast('Start camera first', 'warn'); return; }
 
   const vbtn = document.getElementById('rec-verify-btn');

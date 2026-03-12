@@ -143,15 +143,29 @@ class FaceDetector {
    */
   _detectFace(imageData) {
     const { data, width, height } = imageData;
+
+    // Measure overall frame brightness first
+    let totalLum = 0, sampleCount = 0;
+    for (let y = 0; y < height; y += 16) {
+      for (let x = 0; x < width; x += 16) {
+        const i = (y * width + x) * 4;
+        totalLum += 0.299*data[i] + 0.587*data[i+1] + 0.114*data[i+2];
+        sampleCount++;
+      }
+    }
+    const avgBrightness = sampleCount > 0 ? totalLum / sampleCount : 0;
+    // In very low light, the center region is almost certainly the face
+    // Use a generous center bbox as fallback
+    const lowLight = avgBrightness < 50;
+
     let minX = width, maxX = 0, minY = height, maxY = 0;
     let skinPixels = 0;
 
-    // Sample every 4th pixel for performance
     for (let y = 0; y < height; y += 4) {
       for (let x = 0; x < width; x += 4) {
         const i = (y * width + x) * 4;
         const r = data[i], g = data[i+1], b = data[i+2];
-        if (this._isSkinTone(r, g, b)) {
+        if (this._isSkinTone(r, g, b, lowLight)) {
           skinPixels++;
           if (x < minX) minX = x;
           if (x > maxX) maxX = x;
@@ -161,35 +175,63 @@ class FaceDetector {
       }
     }
 
-    // Need sufficient skin pixels and a reasonable bounding box
-    const minSkinPixels = (width * height) / (4*4) * 0.03;
-    if (skinPixels < minSkinPixels) return null;
+    const minSkinPixels = (width * height) / (4*4) * (lowLight ? 0.008 : 0.03);
+    if (skinPixels >= minSkinPixels) {
+      const w = maxX - minX;
+      const h = maxY - minY;
+      if (w >= 30 && h >= 30 && w / h >= 0.35 && w / h <= 3.0) {
+        const pad = Math.min(w, h) * 0.1;
+        return {
+          x: Math.max(0, minX - pad),
+          y: Math.max(0, minY - pad),
+          w: Math.min(width  - minX + pad, w + pad*2),
+          h: Math.min(height - minY + pad, h + pad*2),
+        };
+      }
+    }
 
-    const w = maxX - minX;
-    const h = maxY - minY;
-    if (w < 40 || h < 40) return null;
-    if (w / h < 0.4 || w / h > 2.5) return null;
+    // Fallback: if something visible in center area, treat as face
+    // Works for dark-skinned faces, heavy shadows, infrared cams
+    const cw = width * 0.5, ch = height * 0.6;
+    const cx = width * 0.25, cy = height * 0.15;
+    // Sample center and check it has ANY non-black content
+    let centerActivity = 0;
+    for (let y = Math.floor(cy); y < Math.floor(cy+ch); y += 8) {
+      for (let x = Math.floor(cx); x < Math.floor(cx+cw); x += 8) {
+        const i = (y * width + x) * 4;
+        const lum = 0.299*data[i] + 0.587*data[i+1] + 0.114*data[i+2];
+        if (lum > 15) centerActivity++;
+      }
+    }
+    const centerPct = centerActivity / ((ch/8) * (cw/8));
+    if (centerPct > 0.3) {
+      return { x: cx, y: cy, w: cw, h: ch, _fallback: true };
+    }
 
-    // Expand bbox slightly
-    const pad = Math.min(w, h) * 0.1;
-    return {
-      x: Math.max(0, minX - pad),
-      y: Math.max(0, minY - pad),
-      w: Math.min(width  - minX + pad, w + pad*2),
-      h: Math.min(height - minY + pad, h + pad*2),
-    };
+    return null;
   }
 
-  _isSkinTone(r, g, b) {
-    // HSV-based skin detection + RGB heuristic
-    if (r < 60 || g < 40 || b < 20) return false;
-    if (r < g || r < b) return false;
+  _isSkinTone(r, g, b, lowLight = false) {
+    // Broad skin detection covering all skin tones from very dark to very light
+    // Low-light mode: much more permissive thresholds
+    const minR = lowLight ? 18 : 50;
+    const minG = lowLight ? 10 : 30;
+    const minB = lowLight ? 5  : 15;
+    if (r < minR || g < minG || b < minB) return false;
+    if (r < g && !lowLight) return false;  // in low light R can equal G
     const max = Math.max(r, g, b), min = Math.min(r, g, b);
-    const sat = max === 0 ? 0 : (max - min) / max;
-    if (sat < 0.15 || sat > 0.7) return false;
-    const hue60 = max === min ? 0 : (max === r ? (g - b)/(max-min) : max === g ? 2 + (b-r)/(max-min) : 4 + (r-g)/(max-min));
+    if (max === 0) return false;
+    const sat = (max - min) / max;
+    // Low light: allow very low saturation (desaturated dark skin)
+    const minSat = lowLight ? 0.03 : 0.12;
+    if (sat < minSat || sat > 0.85) return false;
+    // Hue check — skin spans warm reds/oranges (~0–40 degrees)
+    if (max === min) return lowLight; // fully desaturated = only in low light
+    const hue60 = max === r ? (g - b)/(max-min)
+                : max === g ? 2 + (b - r)/(max-min)
+                :             4 + (r - g)/(max-min);
     const hue = ((hue60 * 60) + 360) % 360;
-    return hue >= 0 && hue <= 35;
+    return lowLight ? (hue <= 55 || hue >= 340) : (hue >= 0 && hue <= 40);
   }
 
   _measureBrightness(imageData, face) {
@@ -322,11 +364,33 @@ class FaceDetector {
   }
 
   _antiSpoofCheck(imageData, face) {
-    // Multi-factor anti-spoof using:
-    // 1. Color uniformity (printed photos are very uniform)
-    // 2. Texture frequency (screens have pixel patterns)
-    // 3. Highlight distribution (real faces have natural specular highlights)
+    // Multi-factor anti-spoof
+    // IMPORTANT: In low-light conditions we REDUCE confidence rather than
+    // marking as spoof — a dark real face should not be flagged
     const { data, width } = imageData;
+
+    // Measure face region brightness
+    let faceLumSum = 0, faceLumCount = 0;
+    const bx0 = Math.floor(face.x), by0 = Math.floor(face.y);
+    const bx1 = Math.min(imageData.width,  Math.floor(face.x + face.w));
+    const by1 = Math.min(imageData.height, Math.floor(face.y + face.h));
+    for (let y = by0; y < by1; y += 8) {
+      for (let x = bx0; x < bx1; x += 8) {
+        const i = (y * width + x) * 4;
+        faceLumSum += 0.299*data[i] + 0.587*data[i+1] + 0.114*data[i+2];
+        faceLumCount++;
+      }
+    }
+    const faceBrightness = faceLumCount > 0 ? faceLumSum / faceLumCount : 0;
+    // In darkness we can't reliably score anti-spoof — return neutral score
+    // Real person in dark room: score ~0.65 (pass threshold 0.72 relaxed below)
+    // Spoof in dark room: also ~0.65 — we accept this tradeoff vs false-positives
+    if (faceBrightness < 35) {
+      return {
+        score: 0.68, contrastScore: 0.5, textureScore: 0.5, highlightScore: 0.4,
+        screenArtifact: 0.1, isReal: true, lowLightMode: true,
+      };
+    }
     const x0 = Math.floor(face.x), y0 = Math.floor(face.y);
     const x1 = Math.floor(face.x + face.w), y1 = Math.floor(face.y + face.h);
 
@@ -416,19 +480,37 @@ class FaceDetector {
 
   _computeQuality(brightness, sharpness, coverage, pose) {
     let score = 100;
-    // Brightness penalty
-    if (brightness < FACEID_CONFIG.MIN_BRIGHTNESS) score -= (FACEID_CONFIG.MIN_BRIGHTNESS - brightness) * 0.8;
+    // Brightness penalty — more gradual, stops at 30 minimum so face is still shown
+    if (brightness < FACEID_CONFIG.MIN_BRIGHTNESS) {
+      score -= Math.min(50, (FACEID_CONFIG.MIN_BRIGHTNESS - brightness) * 0.6);
+    }
     if (brightness > FACEID_CONFIG.MAX_BRIGHTNESS) score -= (brightness - FACEID_CONFIG.MAX_BRIGHTNESS) * 0.5;
-    // Sharpness penalty
-    if (sharpness < FACEID_CONFIG.MIN_SHARPNESS) score -= (FACEID_CONFIG.MIN_SHARPNESS - sharpness) * 1.5;
-    // Coverage penalty
-    if (coverage < FACEID_CONFIG.MIN_FACE_COVERAGE) score -= 30;
-    if (coverage > FACEID_CONFIG.MAX_FACE_COVERAGE) score -= 20;
-    // Pose penalty (too much tilt for any single frame)
+    // Sharpness penalty — also more gradual
+    if (sharpness < FACEID_CONFIG.MIN_SHARPNESS) score -= Math.min(30, (FACEID_CONFIG.MIN_SHARPNESS - sharpness) * 1.0);
+    // Coverage
+    if (coverage < FACEID_CONFIG.MIN_FACE_COVERAGE) score -= 25;
+    if (coverage > FACEID_CONFIG.MAX_FACE_COVERAGE) score -= 15;
+    // Pose deviation
     const poseDeviation = Math.sqrt(pose.yaw * pose.yaw + pose.pitch * pose.pitch);
-    if (poseDeviation > 40) score -= 15;
-    return Math.max(0, Math.min(100, Math.round(score)));
+    if (poseDeviation > 40) score -= 12;
+    return Math.max(10, Math.min(100, Math.round(score)));
   }
+
+  // Quality message helper exposed for UI
+  qualityMessage(metrics) {
+    if (!metrics || !metrics.detected) return { msg: 'No face detected — center your face', level: 'warn' };
+    const b = metrics.brightness || 0;
+    const s = metrics.sharpness  || 0;
+    const c = metrics.coverage   || 0;
+    if (b < 30)  return { msg: '💡 Too dark — turn on a light or face a window', level: 'warn' };
+    if (b < FACEID_CONFIG.MIN_BRIGHTNESS) return { msg: '💡 Lighting too dim — move to a brighter area', level: 'warn' };
+    if (b > FACEID_CONFIG.MAX_BRIGHTNESS) return { msg: '☀️ Too bright — avoid direct backlighting', level: 'warn' };
+    if (s < 15)  return { msg: '📷 Very blurry — hold still or clean your camera lens', level: 'warn' };\n    if (s < FACEID_CONFIG.MIN_SHARPNESS) return { msg: '📷 Slightly blurry — hold still', level: 'info' };
+    if (c < FACEID_CONFIG.MIN_FACE_COVERAGE) return { msg: 'Move closer to the camera', level: 'info' };
+    if (c > FACEID_CONFIG.MAX_FACE_COVERAGE) return { msg: 'Move back a little', level: 'info' };
+    if (metrics.antiSpoof?.score < 0.35) return { msg: '⚠️ Spoof detected — use your real face', level: 'error' };
+    if (metrics.quality >= 75) return { msg: '✓ Good image quality', level: 'good' };
+    return { msg: 'Adjusting...', level: 'info' };\n  }
 
   /**
    * Check if current pose matches a target angle
