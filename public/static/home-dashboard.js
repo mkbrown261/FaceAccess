@@ -1041,10 +1041,15 @@ async function loadMembers() {
       </div>
       <div class="flex gap-2">
         ${!m.face_registered ? `<button onclick="enrollFace('${m.id}')" class="flex-1 py-2 text-xs bg-green-500/15 text-green-400 hover:bg-green-500/25 rounded-lg border border-green-500/20 transition-colors font-semibold">
-          <i class="fas fa-face-smile mr-1"></i> Enroll Face
-        </button>` : `<button onclick="deleteFace('${m.id}')" class="flex-1 py-2 text-xs bg-red-500/10 text-red-400 hover:bg-red-500/20 rounded-lg border border-red-500/20 transition-colors">
-          <i class="fas fa-trash mr-1"></i> Erase Face
-        </button>`}
+          <i class="fas fa-fingerprint mr-1"></i> Enroll Face ID
+        </button>` : `<div class="flex gap-1.5 flex-1">
+          <button onclick="enrollFace('${m.id}')" class="flex-1 py-2 text-xs bg-indigo-500/10 text-indigo-400 hover:bg-indigo-500/20 rounded-lg border border-indigo-500/20 transition-colors font-semibold">
+            <i class="fas fa-sync mr-1"></i> Re-enroll
+          </button>
+          <button onclick="deleteFace('${m.id}')" class="py-2 px-3 text-xs bg-red-500/10 text-red-400 hover:bg-red-500/20 rounded-lg border border-red-500/20 transition-colors">
+            <i class="fas fa-trash"></i>
+          </button>
+        </div>`}
         ${m.role !== 'owner' ? `<button onclick="removeMember('${m.id}')" class="py-2 px-3 text-xs btn-ghost rounded-lg">Remove</button>` : ''}
       </div>
     </div>`).join('')}
