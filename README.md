@@ -1,185 +1,121 @@
-# FaceAccess — Facial Recognition Access Control System
+# FaceAccess — AI-Enhanced Facial Recognition Access Control System
 
 ## Project Overview
-A complete facial recognition-based access control system replacing traditional keycards. Enterprise-grade security with role-based access, real-time monitoring, and mobile 2FA companion app.
+A complete facial recognition-based access control system with AI-driven predictive behavior, dynamic trust scoring, and real-time anomaly detection. Enterprise-grade security for both corporate and home environments.
 
-**Live Demo:** [https://3000-i3ubg32zacalv1wqttedz-cbeee0f9.sandbox.novita.ai](https://3000-i3ubg32zacalv1wqttedz-cbeee0f9.sandbox.novita.ai)
-
-**Mobile App:** [https://3000-i3ubg32zacalv1wqttedz-cbeee0f9.sandbox.novita.ai/mobile](https://3000-i3ubg32zacalv1wqttedz-cbeee0f9.sandbox.novita.ai/mobile)
-
----
-
-## Features Implemented
-
-### ✅ Core System
-- **Real-time face recognition** — cosine similarity matching against stored AES-256 encrypted embeddings
-- **Confidence scoring** — high (auto-grant), medium (triggers 2FA), low (denied)
-- **Liveness detection** — anti-spoofing score validation
-- **Webcam capture** — live camera feed with face scanning overlay
-- **Image upload** — register faces via file upload
-
-### ✅ User Management (10-second onboarding)
-- Add user: enter name + email + role → done
-- Instant face registration modal auto-opens after user creation
-- Roles: `employee`, `manager`, `admin`, `visitor`
-- Full CRUD: edit, suspend, delete users
-- Biometric erasure (GDPR right to erasure)
-
-### ✅ Access Control
-- **8 pre-configured access zones** (Main Entrance, Server Room, Executive Suite, Research Lab, etc.)
-- **Role-based permissions** with time windows and day restrictions
-- **Per-user door overrides**
-- **Security levels**: low / standard / high / critical
-- **Two-Factor Authentication** per door or per role
-
-### ✅ Mobile Companion App (`/mobile`)
-- Access request notifications with countdown timer
-- **Approve / Deny** with single tap
-- **Proximity verification** (Bluetooth BLE + WiFi simulation)
-- Prevents remote approvals — must be physically near the door
-- Access history, profile management
-- Biometric data deletion control
-
-### ✅ Admin Dashboard
-- **Live Monitor** — real-time event feed, auto-refresh every 5s
-- **Face ID Test Console** — test recognition against any door
-- **Analytics** — hourly activity charts, door traffic, access rate pie chart
-- **Attendance Tracking** — days present, last access, total events
-- **Camera Management** — IP/USB/RTSP cameras
-- **System Settings** — thresholds, liveness toggle, lockout rules
-
-### ✅ Security & Privacy
-- Face embeddings stored (not raw images) — AES-256 encryption
-- Rate limiting hooks (configurable max attempts + lockout)
-- Device authentication for mobile app
-- GDPR-compliant data deletion
-- Full audit log of every access attempt
-- TLS 1.3 in transit (Cloudflare edge)
+**Production:** [https://faceaccess.pages.dev](https://faceaccess.pages.dev)  
+**Home Dashboard:** [https://faceaccess.pages.dev/home/dashboard](https://faceaccess.pages.dev/home/dashboard)  
+**Mobile App:** [https://faceaccess.pages.dev/home/mobile](https://faceaccess.pages.dev/home/mobile)
 
 ---
 
-## Architecture
+## ✅ Completed Features
+
+### AI Intelligence (v3.0 — New)
+- **Dynamic Trust Scoring** — Composite score: Face (35%) + Behavioral (35%) + Predictive (20%) - Anomaly Penalty (10%)
+- **Continuous Learning** — Exponential Moving Average (α=0.15) updates after every access event
+- **Trust Tiers**: `trusted` (≥85%) → instant access; `standard` (≥60%); `watchlist` (≥40%) → extra verification; `blocked` (<40%)
+- **Behavioral Pattern Analysis** — Hourly/day-of-week frequency maps, typical window detection
+- **Predictive Arrival Engine** — Predicts next arrival using historical DoW averages with ≤2.5h std dev threshold
+- **Anomaly Detection** — 7 anomaly types: `spoof_attempt` (critical, −25%), `repeated_failures` (high, −15%), `unusual_time` (high, −12%), `off_schedule` (medium, −5%), `behavioral_drift` (low, −3%)
+- **AI Recommendations** — Auto-generated suggestions: revoke access, upgrade verification, pre-approve guests, schedule restrictions
+- **Admin AI Dashboard** — Real-time trust score cards, behavioral heatmap (24×7), anomaly feed, prediction panel
+- **Mobile Trust Display** — Circular trust gauge with score breakdown in mobile profile tab
+- **Mobile Predictive Notifications** — Arrival prediction banner + anomaly security alerts on home tab
+
+### Core Face Recognition
+- Liveness detection + anti-spoofing validation
+- Cosine similarity matching against encrypted embeddings
+- Confidence tiers: High ≥85% (auto-grant), Medium 65-84% (triggers 2FA), Low <65% (denied)
+- Phone proximity verification (BLE + WiFi)
+
+### FaceAccess Home (Consumer Product)
+- Smart lock management (August, Schlage, Yale, Nuki, Generic/Relay, ZigBee)
+- Multi-camera support (RTSP, Ring, Nest, Arlo, WebRTC)
+- Household member and guest pass management
+- Trusted device registration with BLE UUID
+
+### Security Hardening
+- Cryptographically secure nanoid (Web Crypto API)
+- Input sanitization + enum validation on all endpoints
+- Rate limiting (10 req/min on recognize, 5 enrollments/hour)
+- XSS prevention with esc() helper
+- CORS locked to known origins, security headers on all responses
+
+---
+
+## AI Architecture
 
 ```
-┌──────────────────────────────────────────────────────┐
-│                  Camera / Browser                    │
-│  getUserMedia() → Frame capture → Embedding gen     │
-└──────────────────────┬───────────────────────────────┘
-                       │ POST /api/recognize
-┌──────────────────────▼───────────────────────────────┐
-│              Hono Edge Worker (Cloudflare)            │
-│  ┌─────────────┐  ┌──────────────┐  ┌────────────┐  │
-│  │ Face Match  │  │ RBAC Check   │  │ 2FA Engine │  │
-│  │ (cosine sim)│  │ (role+time)  │  │ (pending   │  │
-│  └─────────────┘  └──────────────┘  │  verif.)   │  │
-│                                     └────────────┘  │
-└──────────────────────┬───────────────────────────────┘
-                       │
-┌──────────────────────▼───────────────────────────────┐
-│                Cloudflare D1 (SQLite)                 │
-│  users · doors · role_permissions · access_logs      │
-│  pending_verifications · cameras · settings          │
-└──────────────────────────────────────────────────────┘
+Camera → POST /api/home/recognize
+    ├── Liveness/Spoof Gate (hard reject if <0.35/0.5)
+    ├── Rate Limit Check (10/min per lock)
+    ├── Face Embedding Cosine Similarity Match
+    ├── AI Behavioral Analysis
+    │   ├── Load last 90 patterns from behavioral_patterns
+    │   ├── analyzePatterns() → behavioralScore, isTypical, anomalyScore
+    │   ├── detectAnomalyType() → anomaly_events insert + trustDelta
+    │   └── updateTrustProfile() → EMA update → trust_tier
+    ├── Proximity Decision (BLE 0.95, WiFi 0.78)
+    └── Response includes trust_score, trust_tier, behavioral_typical
 ```
+
+### Trust Score Formula
+```
+trust = face_avg×0.35 + behavioral×0.35 + predictive×0.20 - penalty×0.10
+```
+
+### Behavioral Score Components
+- `success_rate × 0.80 + 0.20` base
+- `+0.10` if access is within typical hourly window
+- `−0.15` if atypical access detected
+
+### Anomaly Penalty Healing
+- Each non-anomalous access heals: `penalty -= 0.01`
+- Anomalous access inflicts: `penalty += anomaly_score × 0.1`
 
 ---
 
-## API Endpoints
+## Database Schema (5 tables added in v3.0)
+
+| Table | Purpose |
+|-------|---------|
+| `user_trust_profiles` | Per-user composite trust score + component scores |
+| `behavioral_patterns` | Time-series access events (hour, DoW, result, confidence) |
+| `anomaly_events` | Detected anomalies with severity, type, trust delta |
+| `predictive_sessions` | Predicted arrival windows with pre-auth readiness |
+| `ai_recommendations` | Auto-generated admin action recommendations |
+
+---
+
+## AI API Endpoints (New)
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/users` | List users (filter: role, status) |
-| `POST` | `/api/users` | Create user |
-| `PUT` | `/api/users/:id` | Update user |
-| `DELETE` | `/api/users/:id` | Delete user (biometric erasure) |
-| `POST` | `/api/users/:id/face` | Register face embedding |
-| `DELETE` | `/api/users/:id/face` | Erase biometric data |
-| `POST` | `/api/recognize` | **Core** — Face recognition + access decision |
-| `GET` | `/api/verify/:id` | Check 2FA verification status |
-| `POST` | `/api/verify/:id/respond` | Approve/deny via mobile |
-| `GET` | `/api/doors` | List doors |
-| `POST` | `/api/doors` | Add door |
-| `GET` | `/api/permissions` | List role permissions |
-| `POST` | `/api/permissions` | Add permission rule |
-| `GET` | `/api/logs` | Access log with filters |
-| `GET` | `/api/analytics/summary` | Dashboard stats + charts |
-| `GET` | `/api/analytics/attendance` | Employee attendance |
-| `GET` | `/api/mobile/pending/:user_id` | Mobile: pending approvals |
-| `POST` | `/api/mobile/register` | Register mobile device |
-| `GET` | `/api/cameras` | Camera list |
-| `GET/PUT` | `/api/settings` | System configuration |
-
----
-
-## Data Models
-
-### User
-```json
-{ "id": "usr-xxx", "name": "John Smith", "email": "...", "role": "employee|manager|admin|visitor",
-  "face_embedding": "[128-dim AES-encrypted vector]", "face_registered": 1,
-  "mobile_device_id": "...", "status": "active|inactive|suspended" }
-```
-
-### Access Decision Flow
-```
-Camera → POST /api/recognize { door_id, embedding, liveness_score }
-  → liveness < 0.5? → denied (liveness_failed)
-  → confidence < 65%? → denied (no_match)
-  → no role permission? → denied (no_permission)
-  → outside hours? → denied (outside_hours)
-  → confidence < 85% OR door requires 2FA?
-      → pending_2fa → push to mobile → approve/deny
-  → else → granted
-```
+| `GET` | `/api/ai/trust/:home_id` | All trust profiles for a home |
+| `GET` | `/api/ai/trust/user/:user_id` | Single user trust + hour distribution |
+| `POST` | `/api/ai/trust/recalculate/:user_id` | Force recalculate from history |
+| `GET` | `/api/ai/anomalies/:home_id` | Anomaly events (filter: severity, resolved) |
+| `PUT` | `/api/ai/anomalies/:id/acknowledge` | Mark anomaly acknowledged |
+| `PUT` | `/api/ai/anomalies/:id/resolve` | Mark anomaly resolved |
+| `GET` | `/api/ai/predictions/:home_id` | Active predictive sessions |
+| `POST` | `/api/ai/predictions/generate/:home_id` | Generate predictions for all users |
+| `GET` | `/api/ai/recommendations/:home_id` | AI-generated recommendations |
+| `PUT` | `/api/ai/recommendations/:id/dismiss` | Dismiss a recommendation |
+| `GET` | `/api/ai/dashboard/:home_id` | Aggregated AI dashboard data |
+| `GET` | `/api/ai/behavioral/:user_id` | Full behavioral analysis |
 
 ---
 
 ## Tech Stack
-- **Runtime**: Cloudflare Pages + Workers (edge)
+- **Runtime**: Cloudflare Workers (edge, global)
 - **Framework**: Hono v4
 - **Database**: Cloudflare D1 (SQLite)
-- **Frontend**: Tailwind CSS (CDN) + Chart.js + Axios
-- **AI/ML**: FaceNet-compatible embedding (cosine similarity matching)
-- **Build**: Vite + @hono/vite-build
+- **Frontend**: Vanilla JS + Tailwind CSS (CDN) + Chart.js
+- **Build**: Vite + TypeScript
 
----
-
-## Local Development
-
-```bash
-npm install
-npm run db:migrate:local   # Create local D1 tables
-npm run db:seed            # Seed demo data
-npm run build              # Build worker
-pm2 start ecosystem.config.cjs  # Start dev server
-
-# Reset database
-npm run db:reset
-```
-
-## Production Deployment (Cloudflare Pages)
-
-```bash
-npx wrangler d1 create faceaccess-production
-# Add database_id to wrangler.jsonc
-npx wrangler d1 migrations apply faceaccess-production
-npm run build
-npx wrangler pages deploy dist --project-name faceaccess
-```
-
----
-
-## Demo Users
-| Name | Role | Email |
-|------|------|-------|
-| Sarah Chen | Admin | sarah.chen@acme.com |
-| James Wilson | Manager | james.wilson@acme.com |
-| Michael Park | Employee | michael.park@acme.com |
-| Alex Martinez | Visitor | alex.martinez@visitor.com |
-
----
-
-## Deployment Status
-- **Platform**: Cloudflare Pages / Workers
-- **Status**: 🔄 Development (sandbox)
+## Deployment
+- **Platform**: Cloudflare Pages
+- **Status**: ✅ Active
 - **Last Updated**: 2026-03-12
+- **Commit**: b91b7c8 (AI trust engine v3.0)
