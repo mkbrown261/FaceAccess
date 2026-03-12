@@ -116,6 +116,310 @@ function checkTimeAllowed(timeStart: string, timeEnd: string): boolean {
 }
 
 // ─────────────────────────────────────────────
+// AI TRUST ENGINE (v3.0)
+// ─────────────────────────────────────────────
+
+/**
+ * Compute composite trust score from component scores.
+ * Weights: face 35%, behavioral 35%, predictive 20%, anomaly penalty 10%
+ */
+function computeTrustScore(
+  faceAvg: number,
+  behavioralScore: number,
+  predictiveScore: number,
+  anomalyPenalty: number
+): number {
+  const raw = faceAvg * 0.35 + behavioralScore * 0.35 + predictiveScore * 0.20 - anomalyPenalty * 0.10
+  return Math.min(1, Math.max(0, raw))
+}
+
+/** Map trust score (0-1) to tier label */
+function trustTier(score: number): string {
+  if (score >= 0.85) return 'trusted'
+  if (score >= 0.60) return 'standard'
+  if (score >= 0.40) return 'watchlist'
+  return 'blocked'
+}
+
+/**
+ * Analyze access patterns for a user: return behavioral score
+ * and whether current access is "typical" (within normal window).
+ */
+function analyzePatterns(patterns: any[], currentHour: number, currentDow: number): {
+  behavioralScore: number
+  isTypical: boolean
+  anomalyScore: number
+  typicalHours: number[]
+  typicalDows: number[]
+} {
+  if (!patterns || patterns.length < 3) {
+    return { behavioralScore: 0.70, isTypical: true, anomalyScore: 0.0, typicalHours: [], typicalDows: [] }
+  }
+
+  // Build frequency maps
+  const hourFreq: Record<number, number> = {}
+  const dowFreq: Record<number, number>  = {}
+  let successCount = 0
+
+  for (const p of patterns) {
+    hourFreq[p.access_hour] = (hourFreq[p.access_hour] || 0) + 1
+    dowFreq[p.access_dow]   = (dowFreq[p.access_dow]   || 0) + 1
+    if (p.result === 'granted') successCount++
+  }
+
+  const total = patterns.length
+  const successRate = successCount / total
+
+  // Typical hours = top 70% of access hours
+  const sortedHours = Object.entries(hourFreq).sort((a, b) => Number(b[1]) - Number(a[1]))
+  const hourThreshold = total * 0.10  // hours with at least 10% share
+  const typicalHours = sortedHours.filter(([, cnt]) => Number(cnt) >= hourThreshold).map(([h]) => Number(h))
+
+  const sortedDows = Object.entries(dowFreq).sort((a, b) => Number(b[1]) - Number(a[1]))
+  const dowThreshold = total * 0.08
+  const typicalDows = sortedDows.filter(([, cnt]) => Number(cnt) >= dowThreshold).map(([d]) => Number(d))
+
+  // Check if current access is within typical window
+  const hourOk = typicalHours.length === 0 || typicalHours.includes(currentHour) ||
+    typicalHours.some(h => Math.abs(h - currentHour) <= 2)
+  const dowOk  = typicalDows.length  === 0 || typicalDows.includes(currentDow)
+  const isTypical = hourOk && dowOk
+
+  // Behavioral score: success rate * consistency bonus
+  const consistencyBonus = isTypical ? 0.10 : -0.15
+  const behavioralScore = Math.min(1, Math.max(0, successRate * 0.80 + 0.20 + consistencyBonus))
+
+  // Anomaly score for this specific access
+  const hourDeviation = typicalHours.length > 0
+    ? Math.min(...typicalHours.map(h => Math.abs(h - currentHour))) / 12
+    : 0
+  const anomalyScore = isTypical ? hourDeviation * 0.3 : 0.45 + hourDeviation * 0.3
+
+  return { behavioralScore, isTypical, anomalyScore: Math.min(1, anomalyScore), typicalHours, typicalDows }
+}
+
+/**
+ * Detect anomaly type and severity from an access event.
+ */
+function detectAnomalyType(
+  isTypical: boolean,
+  anomalyScore: number,
+  failedRecentCount: number,
+  antiSpoof: number | null,
+  currentHour: number
+): { type: string; severity: string; trustDelta: number } | null {
+  if (antiSpoof !== null && antiSpoof < 0.35) {
+    return { type: 'spoof_attempt', severity: 'critical', trustDelta: -0.25 }
+  }
+  if (failedRecentCount >= 3) {
+    return { type: 'repeated_failures', severity: 'high', trustDelta: -0.15 }
+  }
+  if (!isTypical && anomalyScore > 0.7) {
+    const isNight = currentHour < 5 || currentHour >= 23
+    return {
+      type: isNight ? 'unusual_time' : 'off_schedule',
+      severity: isNight ? 'high' : 'medium',
+      trustDelta: isNight ? -0.12 : -0.05
+    }
+  }
+  if (!isTypical && anomalyScore > 0.45) {
+    return { type: 'behavioral_drift', severity: 'low', trustDelta: -0.03 }
+  }
+  return null
+}
+
+/**
+ * Predict arrival window based on historical patterns.
+ * Returns predicted next arrival datetime (ISO string) and confidence.
+ */
+function predictNextArrival(patterns: any[]): {
+  predictedAt: string
+  confidence: number
+  basisHour: number
+} | null {
+  if (!patterns || patterns.length < 5) return null
+
+  const now = new Date()
+  const currentDow = now.getDay()
+
+  // Group by day-of-week, find average arrival hour for that day
+  const dowHours: Record<number, number[]> = {}
+  for (const p of patterns) {
+    if (p.result === 'granted') {
+      if (!dowHours[p.access_dow]) dowHours[p.access_dow] = []
+      dowHours[p.access_dow].push(p.access_hour + p.access_minute / 60)
+    }
+  }
+
+  // Try today first, then tomorrow
+  for (let offset = 0; offset <= 1; offset++) {
+    const targetDow = (currentDow + offset) % 7
+    const hours = dowHours[targetDow]
+    if (!hours || hours.length === 0) continue
+
+    const avgHour = hours.reduce((s, h) => s + h, 0) / hours.length
+    const stdDev  = Math.sqrt(hours.reduce((s, h) => s + Math.pow(h - avgHour, 2), 0) / hours.length)
+
+    // Only predict if std deviation is low enough (< 2 hours = consistent)
+    if (stdDev > 2.5) continue
+
+    const predDate = new Date(now)
+    predDate.setDate(predDate.getDate() + offset)
+    predDate.setHours(Math.floor(avgHour), Math.round((avgHour % 1) * 60), 0, 0)
+
+    // Skip if predicted time already passed
+    if (predDate <= now) continue
+
+    const confidence = Math.min(0.95, 0.50 + hours.length * 0.05 - stdDev * 0.10)
+    return {
+      predictedAt: predDate.toISOString().replace('T', ' ').split('.')[0],
+      confidence,
+      basisHour: Math.floor(avgHour)
+    }
+  }
+  return null
+}
+
+/**
+ * Generate AI recommendations for a home based on anomalies and trust profiles.
+ */
+function generateRecommendations(
+  anomalies: any[],
+  trustProfiles: any[],
+  guestPasses: any[]
+): Array<{ type: string; priority: string; title: string; message: string; actionData: any }> {
+  const recs: Array<{ type: string; priority: string; title: string; message: string; actionData: any }> = []
+
+  // Watchlist/blocked users
+  for (const tp of trustProfiles) {
+    if (tp.trust_tier === 'blocked') {
+      recs.push({
+        type: 'revoke_access',
+        priority: 'urgent',
+        title: `Review blocked user: ${tp.user_name || tp.user_id}`,
+        message: `Trust score dropped to ${Math.round(tp.trust_score * 100)}%. Multiple anomalies detected. Consider revoking access.`,
+        actionData: { user_id: tp.user_id }
+      })
+    } else if (tp.trust_tier === 'watchlist') {
+      recs.push({
+        type: 'upgrade_verification',
+        priority: 'high',
+        title: `Increase verification for ${tp.user_name || tp.user_id}`,
+        message: `Trust score at ${Math.round(tp.trust_score * 100)}%. Recommend requiring device proximity for all unlocks.`,
+        actionData: { user_id: tp.user_id }
+      })
+    }
+  }
+
+  // Guest passes expiring within 7 days
+  for (const gp of guestPasses) {
+    const daysLeft = Math.ceil((new Date(gp.valid_until).getTime() - Date.now()) / 86400000)
+    if (daysLeft >= 0 && daysLeft <= 7) {
+      recs.push({
+        type: 'pre_approve_guest',
+        priority: 'medium',
+        title: `Guest pass expiring: ${gp.name}`,
+        message: `"${gp.name}" guest pass expires in ${daysLeft} day${daysLeft === 1 ? '' : 's'}. Renew or revoke.`,
+        actionData: { guest_id: gp.id }
+      })
+    }
+  }
+
+  // Critical anomalies in last 24h
+  const criticalCount = anomalies.filter(a => a.severity === 'critical' && !a.resolved).length
+  if (criticalCount > 0) {
+    recs.push({
+      type: 'review_anomalies',
+      priority: 'urgent',
+      title: `${criticalCount} critical security alert${criticalCount > 1 ? 's' : ''}`,
+      message: `Potential spoof attempts or critical anomalies detected in the last 24 hours. Review immediately.`,
+      actionData: { filter: 'critical' }
+    })
+  }
+
+  return recs.slice(0, 10)  // max 10 recommendations
+}
+
+/**
+ * Upsert a user trust profile after an access event.
+ * Calculates new composite score and persists it.
+ */
+async function updateTrustProfile(
+  DB: D1Database,
+  userId: string,
+  homeId: string,
+  eventResult: 'granted' | 'denied' | 'pending',
+  faceConfidence: number,
+  behavioralScore: number,
+  anomalyScore: number,
+  isTypical: boolean
+): Promise<{ trust_score: number; trust_tier: string }> {
+  // Load existing profile
+  const existing: any = await DB.prepare(
+    'SELECT * FROM user_trust_profiles WHERE user_id=?'
+  ).bind(userId).first()
+
+  const prev = existing || {
+    trust_score: 0.70,
+    face_confidence_avg: 0.70,
+    behavioral_score: 0.70,
+    predictive_score: 0.70,
+    anomaly_penalty: 0.00,
+    total_attempts: 0,
+    successful_unlocks: 0,
+    denied_count: 0,
+    anomaly_count: 0
+  }
+
+  // Exponential moving average (alpha=0.15 – slow adaptation for stability)
+  const alpha = 0.15
+  const newFaceAvg  = prev.face_confidence_avg  * (1 - alpha) + faceConfidence * alpha
+  const newBehav    = prev.behavioral_score     * (1 - alpha) + behavioralScore * alpha
+  const newPredictive = prev.predictive_score   // updated separately by prediction engine
+  const anomalyDelta  = anomalyScore > 0.5 ? anomalyScore * 0.1 : -0.01  // heal slowly
+  const newPenalty  = Math.min(0.5, Math.max(0, prev.anomaly_penalty + anomalyDelta))
+
+  const newScore = computeTrustScore(newFaceAvg, newBehav, newPredictive, newPenalty)
+  const tier     = trustTier(newScore)
+
+  const newTotal    = prev.total_attempts + 1
+  const newSuccess  = prev.successful_unlocks + (eventResult === 'granted' ? 1 : 0)
+  const newDenied   = prev.denied_count       + (eventResult === 'denied'  ? 1 : 0)
+  const newAnomalies= prev.anomaly_count      + (anomalyScore > 0.5 ? 1 : 0)
+
+  if (existing) {
+    await DB.prepare(`
+      UPDATE user_trust_profiles
+      SET trust_score=?, trust_tier=?, face_confidence_avg=?, behavioral_score=?,
+          anomaly_penalty=?, total_attempts=?, successful_unlocks=?, denied_count=?,
+          anomaly_count=?, last_updated=?, last_access=?
+      WHERE user_id=?
+    `).bind(
+      newScore, tier, newFaceAvg, newBehav,
+      newPenalty, newTotal, newSuccess, newDenied,
+      newAnomalies, now(), now(), userId
+    ).run()
+  } else {
+    const profileId = 'tp-' + nanoid(10)
+    await DB.prepare(`
+      INSERT INTO user_trust_profiles
+        (id, user_id, home_id, trust_score, trust_tier, face_confidence_avg,
+         behavioral_score, predictive_score, anomaly_penalty,
+         total_attempts, successful_unlocks, denied_count, anomaly_count,
+         last_updated, last_access, created_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    `).bind(
+      profileId, userId, homeId, newScore, tier, newFaceAvg,
+      newBehav, newPredictive, newPenalty,
+      newTotal, newSuccess, newDenied, newAnomalies,
+      now(), now(), now()
+    ).run()
+  }
+
+  return { trust_score: newScore, trust_tier: tier }
+}
+
+// ─────────────────────────────────────────────
 // API: USERS
 // ─────────────────────────────────────────────
 app.get('/api/users', async (c) => {
@@ -1142,6 +1446,55 @@ app.post('/api/home/recognize', async (c) => {
   const proximityScore = bleOk ? 0.95 : wifiOk ? 0.78 : 0.0
   const proximityVerified = bleOk || wifiOk
 
+  // ── AI: Load behavioral patterns for matched user ──────
+  const currentHour = new Date().getHours()
+  const currentDow  = new Date().getDay()
+  let behavioralScore = 0.70
+  let isTypical       = true
+  let anomalyScore    = 0.0
+  let typicalHours:   number[] = []
+  let typicalDows:    number[] = []
+  let trustInfo: { trust_score: number; trust_tier: string } | null = null
+
+  if (matched && !isGuest) {
+    const { results: patterns } = await DB.prepare(`
+      SELECT access_hour, access_minute, access_dow, result
+      FROM behavioral_patterns
+      WHERE user_id=? AND home_id=?
+      ORDER BY created_at DESC LIMIT 90
+    `).bind(matched.id, lock.home_id).all() as any
+
+    const analysis = analyzePatterns(patterns as any[], currentHour, currentDow)
+    behavioralScore = analysis.behavioralScore
+    isTypical       = analysis.isTypical
+    anomalyScore    = analysis.anomalyScore
+    typicalHours    = analysis.typicalHours
+    typicalDows     = analysis.typicalDows
+
+    // Recent failure count for anomaly detection
+    const failRow: any = await DB.prepare(`
+      SELECT COUNT(*) as cnt FROM behavioral_patterns
+      WHERE user_id=? AND result='denied'
+      AND created_at >= datetime('now','-30 minutes')
+    `).bind(matched.id).first()
+    const failedRecentCount = failRow?.cnt || 0
+
+    // Detect anomalies
+    const anomaly = detectAnomalyType(isTypical, anomalyScore, failedRecentCount, antiSpoof, currentHour)
+    if (anomaly) {
+      const aId = 'ae-' + nanoid(10)
+      await DB.prepare(`
+        INSERT INTO anomaly_events (id,user_id,home_id,lock_id,anomaly_type,severity,confidence,details,trust_delta,created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?)
+      `).bind(
+        aId, matched.id, lock.home_id, lock_id,
+        anomaly.type, anomaly.severity, anomalyScore,
+        JSON.stringify({ hour: currentHour, dow: currentDow, isTypical, anomalyScore, typicalHours }),
+        anomaly.trustDelta, now()
+      ).run()
+    }
+  }
+
   // High confidence + proximity → grant immediately
   if (confidence >= HIGH && (proximityVerified || !trustedDevice)) {
     const method = bleOk ? 'face+ble' : wifiOk ? 'face+wifi' : 'face'
@@ -1151,11 +1504,39 @@ app.post('/api/home/recognize', async (c) => {
     await DB.prepare(`INSERT INTO home_events (id,home_id,user_id,user_name,lock_id,lock_name,event_type,method,face_confidence,liveness_score,ble_detected,wifi_matched,proximity_score,created_at)
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
       .bind(evId, lock.home_id, matched.id, matched.name, lock_id, lock.name, et, method, confidence, liveness, bleOk?1:0, wifiOk?1:0, proximityScore, now()).run()
-    return c.json({ result: 'granted', method, user: { id: matched.id, name: matched.name, role: isGuest?'guest':matched.role }, confidence, proximity_score: proximityScore, liveness_score: liveness, anti_spoof_score: antiSpoof, engine_version: '2.0' })
+
+    // Log behavioral pattern
+    if (!isGuest) {
+      const bpId = 'bp-' + nanoid(10)
+      await DB.prepare(`
+        INSERT INTO behavioral_patterns (id,user_id,home_id,lock_id,access_hour,access_minute,access_dow,access_date,ble_detected,wifi_matched,face_confidence,liveness_score,result,is_typical,anomaly_score,created_at)
+        VALUES (?,?,?,?,?,?,?,date('now'),?,?,?,?,'granted',?,?,?)
+      `).bind(bpId, matched.id, lock.home_id, lock_id, currentHour, new Date().getMinutes(), currentDow, bleOk?1:0, wifiOk?1:0, confidence, liveness, isTypical?1:0, anomalyScore, now()).run()
+
+      // Update trust profile
+      trustInfo = await updateTrustProfile(DB, matched.id, lock.home_id, 'granted', confidence, behavioralScore, anomalyScore, isTypical)
+    }
+
+    return c.json({
+      result: 'granted', method,
+      user: { id: matched.id, name: matched.name, role: isGuest?'guest':matched.role },
+      confidence, proximity_score: proximityScore, liveness_score: liveness, anti_spoof_score: antiSpoof,
+      trust_score: trustInfo?.trust_score ?? null,
+      trust_tier:  trustInfo?.trust_tier  ?? null,
+      behavioral_typical: isTypical,
+      engine_version: '3.0'
+    })
   }
 
   // Medium confidence OR no proximity → request remote approval
   if (matched && !isGuest) {
+    // Log behavioral pattern (pending)
+    const bpId = 'bp-' + nanoid(10)
+    await DB.prepare(`
+      INSERT INTO behavioral_patterns (id,user_id,home_id,lock_id,access_hour,access_minute,access_dow,access_date,ble_detected,wifi_matched,face_confidence,liveness_score,result,is_typical,anomaly_score,created_at)
+      VALUES (?,?,?,?,?,?,?,date('now'),?,?,?,?,'pending',?,?,?)
+    `).bind(bpId, matched.id, lock.home_id, lock_id, currentHour, new Date().getMinutes(), currentDow, bleOk?1:0, wifiOk?1:0, confidence, liveness, isTypical?1:0, anomalyScore, now()).run()
+
     const verId = 'hev-' + nanoid(10)
     const expiresAt = new Date(Date.now() + 120000).toISOString().replace('T',' ').split('.')[0]
     await DB.prepare(`INSERT INTO home_verifications (id,home_id,user_id,lock_id,lock_name,face_confidence,liveness_score,expires_at,status,created_at)
@@ -1168,8 +1549,19 @@ app.post('/api/home/recognize', async (c) => {
       user: { id: matched.id, name: matched.name },
       confidence,
       proximity_score: proximityScore,
+      behavioral_typical: isTypical,
       message: 'Approval request sent to your phone'
     })
+  }
+
+  // Denied — log behavioral pattern
+  if (matched && !isGuest) {
+    const bpId = 'bp-' + nanoid(10)
+    await DB.prepare(`
+      INSERT INTO behavioral_patterns (id,user_id,home_id,lock_id,access_hour,access_minute,access_dow,access_date,ble_detected,wifi_matched,face_confidence,liveness_score,result,is_typical,anomaly_score,created_at)
+      VALUES (?,?,?,?,?,?,?,date('now'),?,?,?,?,'denied',?,?,?)
+    `).bind(bpId, matched.id, lock.home_id, lock_id, currentHour, new Date().getMinutes(), currentDow, bleOk?1:0, wifiOk?1:0, confidence, liveness, isTypical?1:0, anomalyScore, now()).run()
+    await updateTrustProfile(DB, matched.id, lock.home_id, 'denied', confidence, behavioralScore, anomalyScore, isTypical)
   }
 
   return c.json({ result: 'denied', reason: 'no_match', confidence })
@@ -1411,9 +1803,12 @@ app.get('/home/mobile/*', (c) => c.html(getHomeMobileHTML()))
 app.get('/home/onboard', (c) => c.html(getHomeOnboardHTML()))
 app.get('/home/onboard/*', (c) => c.html(getHomeOnboardHTML()))
 
-app.get('*', (c) => {
-  return c.html(getMainHTML())
-})
+// ──────────────────────────────────────────────────────────
+// NOTE: AI API routes are registered BEFORE the catch-all *
+// See bottom of file for implementation — moved above here
+// ──────────────────────────────────────────────────────────
+
+// catch-all SPA route MOVED to bottom of file after AI routes
 
 // ─────────────────────────────────────────────
 // Main Dashboard HTML
@@ -2143,6 +2538,15 @@ select.input option{background:#0f0f1e}
       <i class="fas fa-bolt w-4 text-center"></i> Automations
     </a>
 
+    <div class="text-xs font-semibold text-gray-700 uppercase tracking-widest px-3 py-2 mt-2">AI Intelligence</div>
+    <a onclick="showTab('ai')" class="nav-item" id="nav-ai">
+      <i class="fas fa-brain w-4 text-center"></i> AI Dashboard
+      <span class="ml-auto text-xs bg-indigo-500/20 text-indigo-400 px-1.5 py-0.5 rounded-full font-medium">NEW</span>
+    </a>
+    <a onclick="showTab('anomalies')" class="nav-item" id="nav-anomalies">
+      <i class="fas fa-exclamation-triangle w-4 text-center"></i> Anomalies
+    </a>
+
     <div class="mt-4 border-t border-gray-900 pt-3">
       <a href="/home/mobile" target="_blank" class="nav-item text-purple-400">
         <i class="fas fa-mobile-alt w-4 text-center"></i> Mobile App
@@ -2190,6 +2594,8 @@ select.input option{background:#0f0f1e}
   <div id="tab-activity" class="tab-page p-6 hidden"></div>
   <div id="tab-cameras" class="tab-page p-6 hidden"></div>
   <div id="tab-automations" class="tab-page p-6 hidden"></div>
+  <div id="tab-ai" class="tab-page p-6 hidden"></div>
+  <div id="tab-anomalies" class="tab-page p-6 hidden"></div>
 </main>
 
 <!-- Toast -->
@@ -2541,5 +2947,398 @@ body{font-family:system-ui,sans-serif;background:#07071a;color:#e2e8f0;max-width
 </body>
 </html>`
 }
+
+// ═══════════════════════════════════════════════════════════
+// AI TRUST & BEHAVIORAL API ROUTES (v3.0)
+// ═══════════════════════════════════════════════════════════
+
+// ── GET /api/ai/trust/:home_id ─────────────────────────────
+// Returns all trust profiles for a home, joined with user names
+app.get('/api/ai/trust/:home_id', async (c) => {
+  const { DB } = c.env
+  const homeId = c.req.param('home_id')
+  if (!isValidId(homeId)) return bad(c, 'Invalid home_id')
+
+  const { results } = await DB.prepare(`
+    SELECT tp.*, hu.name as user_name, hu.email as user_email,
+           hu.avatar_color, hu.role as user_role
+    FROM user_trust_profiles tp
+    JOIN home_users hu ON tp.user_id = hu.id
+    WHERE tp.home_id = ?
+    ORDER BY tp.trust_score ASC
+  `).bind(homeId).all()
+
+  return c.json({ trust_profiles: results })
+})
+
+// ── GET /api/ai/trust/user/:user_id ───────────────────────
+// Returns single user trust profile with recent patterns
+app.get('/api/ai/trust/user/:user_id', async (c) => {
+  const { DB } = c.env
+  const userId = c.req.param('user_id')
+  if (!isValidId(userId)) return bad(c, 'Invalid user_id')
+
+  const profile = await DB.prepare(`
+    SELECT tp.*, hu.name as user_name, hu.email as user_email, hu.role as user_role
+    FROM user_trust_profiles tp
+    JOIN home_users hu ON tp.user_id = hu.id
+    WHERE tp.user_id = ?
+  `).bind(userId).first()
+
+  // Recent 30-day patterns aggregated by hour
+  const { results: hourDist } = await DB.prepare(`
+    SELECT access_hour, COUNT(*) as cnt,
+           ROUND(AVG(face_confidence), 3) as avg_confidence,
+           SUM(CASE WHEN result='granted' THEN 1 ELSE 0 END) as granted_count
+    FROM behavioral_patterns
+    WHERE user_id=? AND created_at >= datetime('now','-30 days')
+    GROUP BY access_hour ORDER BY access_hour
+  `).bind(userId).all()
+
+  const { results: recent } = await DB.prepare(`
+    SELECT access_hour, access_dow, result, face_confidence, anomaly_score, is_typical, created_at
+    FROM behavioral_patterns WHERE user_id=? ORDER BY created_at DESC LIMIT 20
+  `).bind(userId).all()
+
+  return c.json({ profile, hour_distribution: hourDist, recent_patterns: recent })
+})
+
+// ── POST /api/ai/trust/recalculate/:user_id ────────────────
+// Force-recalculate trust score from all historical data
+app.post('/api/ai/trust/recalculate/:user_id', async (c) => {
+  const { DB } = c.env
+  const userId = c.req.param('user_id')
+  if (!isValidId(userId)) return bad(c, 'Invalid user_id')
+
+  const user: any = await DB.prepare('SELECT * FROM home_users WHERE id=? AND status=?').bind(userId, 'active').first()
+  if (!user) return c.json({ error: 'User not found' }, 404)
+
+  const { results: patterns } = await DB.prepare(`
+    SELECT * FROM behavioral_patterns WHERE user_id=? ORDER BY created_at DESC LIMIT 200
+  `).bind(userId).all() as any
+
+  const hour = new Date().getHours()
+  const dow  = new Date().getDay()
+  const analysis = analyzePatterns(patterns as any[], hour, dow)
+
+  const profile: any = await DB.prepare('SELECT * FROM user_trust_profiles WHERE user_id=?').bind(userId).first()
+  const faceAvg = profile?.face_confidence_avg || 0.70
+
+  const newScore = computeTrustScore(faceAvg, analysis.behavioralScore, profile?.predictive_score || 0.70, profile?.anomaly_penalty || 0.0)
+  const tier = trustTier(newScore)
+
+  if (profile) {
+    await DB.prepare(`
+      UPDATE user_trust_profiles SET trust_score=?, trust_tier=?, behavioral_score=?, last_updated=? WHERE user_id=?
+    `).bind(newScore, tier, analysis.behavioralScore, now(), userId).run()
+  }
+
+  return c.json({ user_id: userId, trust_score: newScore, trust_tier: tier, behavioral_score: analysis.behavioralScore })
+})
+
+// ── GET /api/ai/anomalies/:home_id ────────────────────────
+// Returns anomaly events for a home
+app.get('/api/ai/anomalies/:home_id', async (c) => {
+  const { DB } = c.env
+  const homeId   = c.req.param('home_id')
+  if (!isValidId(homeId)) return bad(c, 'Invalid home_id')
+  const severity = c.req.query('severity')
+  const resolved = c.req.query('resolved')
+  const limit    = parseIntParam(c.req.query('limit'), 50, 200)
+
+  let q = `
+    SELECT ae.*, hu.name as user_name, sl.name as lock_name
+    FROM anomaly_events ae
+    LEFT JOIN home_users hu ON ae.user_id = hu.id
+    LEFT JOIN smart_locks sl ON ae.lock_id = sl.id
+    WHERE ae.home_id=?`
+  const args: any[] = [homeId]
+
+  if (severity) { q += ' AND ae.severity=?'; args.push(sanitize(severity, 20)) }
+  if (resolved !== undefined) { q += ' AND ae.resolved=?'; args.push(resolved === '1' ? 1 : 0) }
+  q += ' ORDER BY ae.created_at DESC LIMIT ?'; args.push(limit)
+
+  const { results } = await DB.prepare(q).bind(...args).all()
+  const countRow: any = await DB.prepare(`
+    SELECT COUNT(*) as cnt FROM anomaly_events WHERE home_id=? AND resolved=0 AND acknowledged=0
+  `).bind(homeId).first()
+
+  return c.json({ anomalies: results, unacknowledged_count: countRow?.cnt || 0 })
+})
+
+// ── PUT /api/ai/anomalies/:id/acknowledge ─────────────────
+app.put('/api/ai/anomalies/:id/acknowledge', async (c) => {
+  const { DB } = c.env
+  const id = c.req.param('id')
+  if (!isValidId(id)) return bad(c, 'Invalid id')
+  const body = await c.req.json().catch(() => ({}))
+  const note = sanitize(body.admin_note || '', 500)
+  await DB.prepare(`UPDATE anomaly_events SET acknowledged=1, admin_note=? WHERE id=?`).bind(note, id).run()
+  return c.json({ ok: true })
+})
+
+// ── PUT /api/ai/anomalies/:id/resolve ─────────────────────
+app.put('/api/ai/anomalies/:id/resolve', async (c) => {
+  const { DB } = c.env
+  const id = c.req.param('id')
+  if (!isValidId(id)) return bad(c, 'Invalid id')
+  await DB.prepare(`UPDATE anomaly_events SET resolved=1, acknowledged=1 WHERE id=?`).bind(id).run()
+  return c.json({ ok: true })
+})
+
+// ── GET /api/ai/predictions/:home_id ─────────────────────
+// Returns active predictive sessions
+app.get('/api/ai/predictions/:home_id', async (c) => {
+  const { DB } = c.env
+  const homeId = c.req.param('home_id')
+  if (!isValidId(homeId)) return bad(c, 'Invalid home_id')
+
+  const { results } = await DB.prepare(`
+    SELECT ps.*, hu.name as user_name, sl.name as lock_name
+    FROM predictive_sessions ps
+    LEFT JOIN home_users hu ON ps.user_id = hu.id
+    LEFT JOIN smart_locks sl ON ps.lock_id = sl.id
+    WHERE ps.home_id=? AND ps.outcome='pending' AND ps.expires_at > datetime('now')
+    ORDER BY ps.predicted_arrival ASC
+  `).bind(homeId).all()
+
+  return c.json({ predictions: results })
+})
+
+// ── POST /api/ai/predictions/generate/:home_id ────────────
+// Analyze all users' patterns and create predictive sessions for next arrivals
+app.post('/api/ai/predictions/generate/:home_id', async (c) => {
+  const { DB } = c.env
+  const homeId = c.req.param('home_id')
+  if (!isValidId(homeId)) return bad(c, 'Invalid home_id')
+
+  const { results: users } = await DB.prepare(`
+    SELECT id, name FROM home_users WHERE home_id=? AND status='active'
+  `).bind(homeId).all() as any
+
+  const created: any[] = []
+
+  for (const user of users as any[]) {
+    const { results: patterns } = await DB.prepare(`
+      SELECT access_hour, access_minute, access_dow, result
+      FROM behavioral_patterns WHERE user_id=? AND result='granted'
+      ORDER BY created_at DESC LIMIT 60
+    `).bind(user.id).all() as any
+
+    const prediction = predictNextArrival(patterns as any[])
+    if (!prediction) continue
+
+    // Check if a similar prediction already exists
+    const existing: any = await DB.prepare(`
+      SELECT id FROM predictive_sessions
+      WHERE user_id=? AND outcome='pending' AND expires_at > datetime('now')
+    `).bind(user.id).first()
+    if (existing) continue
+
+    const psId = 'ps-' + nanoid(10)
+    const expiresAt = new Date(new Date(prediction.predictedAt).getTime() + 3600000).toISOString().replace('T', ' ').split('.')[0]
+
+    await DB.prepare(`
+      INSERT INTO predictive_sessions (id,user_id,home_id,predicted_arrival,prediction_confidence,prediction_basis,pre_auth_ready,expires_at,created_at)
+      VALUES (?,?,?,?,?,'pattern',0,?,?)
+    `).bind(psId, user.id, homeId, prediction.predictedAt, prediction.confidence, expiresAt, now()).run()
+
+    created.push({ user_id: user.id, user_name: user.name, predicted_at: prediction.predictedAt, confidence: prediction.confidence })
+  }
+
+  return c.json({ generated: created.length, predictions: created })
+})
+
+// ── GET /api/ai/recommendations/:home_id ─────────────────
+// Returns AI-generated access management recommendations
+app.get('/api/ai/recommendations/:home_id', async (c) => {
+  const { DB } = c.env
+  const homeId = c.req.param('home_id')
+  if (!isValidId(homeId)) return bad(c, 'Invalid home_id')
+  const refresh = c.req.query('refresh') === '1'
+
+  if (!refresh) {
+    // Return stored recommendations first
+    const { results: stored } = await DB.prepare(`
+      SELECT r.*, hu.name as user_name FROM ai_recommendations r
+      LEFT JOIN home_users hu ON r.user_id = hu.id
+      WHERE r.home_id=? AND r.dismissed=0
+      AND (r.expires_at IS NULL OR r.expires_at > datetime('now'))
+      ORDER BY CASE r.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, r.created_at DESC
+      LIMIT 10
+    `).bind(homeId).all()
+    if ((stored as any[]).length > 0) return c.json({ recommendations: stored })
+  }
+
+  // Generate fresh recommendations
+  const { results: trustProfiles } = await DB.prepare(`
+    SELECT tp.*, hu.name as user_name FROM user_trust_profiles tp
+    JOIN home_users hu ON tp.user_id=hu.id WHERE tp.home_id=?
+  `).bind(homeId).all() as any
+
+  const { results: anomalies } = await DB.prepare(`
+    SELECT * FROM anomaly_events WHERE home_id=? AND resolved=0
+    AND created_at >= datetime('now','-24 hours')
+  `).bind(homeId).all() as any
+
+  const { results: guestPasses } = await DB.prepare(`
+    SELECT * FROM guest_passes WHERE home_id=? AND status='active'
+    AND valid_until <= datetime('now','+7 days')
+  `).bind(homeId).all() as any
+
+  const recs = generateRecommendations(anomalies as any[], trustProfiles as any[], guestPasses as any[])
+
+  // Persist new recommendations
+  await DB.prepare(`DELETE FROM ai_recommendations WHERE home_id=? AND dismissed=0 AND acted_on=0`).bind(homeId).run()
+  for (const rec of recs) {
+    const recId = 'ar-' + nanoid(10)
+    const expiresAt = new Date(Date.now() + 86400000 * 3).toISOString().replace('T', ' ').split('.')[0]
+    await DB.prepare(`
+      INSERT INTO ai_recommendations (id,home_id,user_id,recommendation_type,priority,title,message,action_data,expires_at,created_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?)
+    `).bind(
+      recId, homeId, rec.actionData?.user_id || null, rec.type,
+      rec.priority, rec.title, rec.message, JSON.stringify(rec.actionData), expiresAt, now()
+    ).run()
+  }
+
+  const { results: fresh } = await DB.prepare(`
+    SELECT * FROM ai_recommendations WHERE home_id=? AND dismissed=0
+    ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END
+    LIMIT 10
+  `).bind(homeId).all()
+
+  return c.json({ recommendations: fresh })
+})
+
+// ── PUT /api/ai/recommendations/:id/dismiss ───────────────
+app.put('/api/ai/recommendations/:id/dismiss', async (c) => {
+  const { DB } = c.env
+  const id = c.req.param('id')
+  if (!isValidId(id)) return bad(c, 'Invalid id')
+  await DB.prepare('UPDATE ai_recommendations SET dismissed=1 WHERE id=?').bind(id).run()
+  return c.json({ ok: true })
+})
+
+// ── GET /api/ai/dashboard/:home_id ───────────────────────
+// Aggregated AI dashboard data (trust, anomalies, predictions)
+app.get('/api/ai/dashboard/:home_id', async (c) => {
+  const { DB } = c.env
+  const homeId = c.req.param('home_id')
+  if (!isValidId(homeId)) return bad(c, 'Invalid home_id')
+
+  const [trustRow, anomalyRow, predRow, recRow] = await Promise.all([
+    DB.prepare(`
+      SELECT
+        COUNT(*) as total,
+        SUM(CASE WHEN trust_tier='trusted'   THEN 1 ELSE 0 END) as trusted_count,
+        SUM(CASE WHEN trust_tier='standard'  THEN 1 ELSE 0 END) as standard_count,
+        SUM(CASE WHEN trust_tier='watchlist' THEN 1 ELSE 0 END) as watchlist_count,
+        SUM(CASE WHEN trust_tier='blocked'   THEN 1 ELSE 0 END) as blocked_count,
+        ROUND(AVG(trust_score), 3) as avg_trust_score
+      FROM user_trust_profiles WHERE home_id=?
+    `).bind(homeId).first(),
+    DB.prepare(`
+      SELECT
+        COUNT(*) as total_unresolved,
+        SUM(CASE WHEN severity='critical' THEN 1 ELSE 0 END) as critical_count,
+        SUM(CASE WHEN severity='high'     THEN 1 ELSE 0 END) as high_count,
+        SUM(CASE WHEN severity='medium'   THEN 1 ELSE 0 END) as medium_count
+      FROM anomaly_events WHERE home_id=? AND resolved=0
+    `).bind(homeId).first(),
+    DB.prepare(`
+      SELECT COUNT(*) as active_predictions FROM predictive_sessions
+      WHERE home_id=? AND outcome='pending' AND expires_at > datetime('now')
+    `).bind(homeId).first(),
+    DB.prepare(`
+      SELECT COUNT(*) as pending_recs FROM ai_recommendations
+      WHERE home_id=? AND dismissed=0 AND acted_on=0
+    `).bind(homeId).first(),
+  ])
+
+  // Top trust score changes in last 7 days
+  const { results: trustTrend } = await DB.prepare(`
+    SELECT tp.user_id, hu.name, tp.trust_score, tp.trust_tier, tp.trust_score - 0.70 as delta
+    FROM user_trust_profiles tp
+    JOIN home_users hu ON tp.user_id=hu.id
+    WHERE tp.home_id=?
+    ORDER BY tp.trust_score ASC LIMIT 5
+  `).bind(homeId).all()
+
+  // Recent anomalies
+  const { results: recentAnomalies } = await DB.prepare(`
+    SELECT ae.*, hu.name as user_name FROM anomaly_events ae
+    LEFT JOIN home_users hu ON ae.user_id=hu.id
+    WHERE ae.home_id=? AND ae.resolved=0
+    ORDER BY ae.created_at DESC LIMIT 5
+  `).bind(homeId).all()
+
+  // Behavioral activity heatmap (accesses per hour last 7 days)
+  const { results: heatmap } = await DB.prepare(`
+    SELECT access_hour, access_dow,
+           COUNT(*) as count,
+           ROUND(AVG(CASE WHEN result='granted' THEN 1.0 ELSE 0 END), 2) as success_rate
+    FROM behavioral_patterns
+    WHERE home_id=? AND created_at >= datetime('now','-7 days')
+    GROUP BY access_hour, access_dow
+    ORDER BY access_dow, access_hour
+  `).bind(homeId).all()
+
+  return c.json({
+    trust_summary:     trustRow,
+    anomaly_summary:   anomalyRow,
+    predictions:       predRow,
+    recommendations:   recRow,
+    trust_watchlist:   trustTrend,
+    recent_anomalies:  recentAnomalies,
+    behavioral_heatmap: heatmap
+  })
+})
+
+// ── GET /api/ai/behavioral/:user_id ──────────────────────
+// Full behavioral analysis for a user
+app.get('/api/ai/behavioral/:user_id', async (c) => {
+  const { DB } = c.env
+  const userId = c.req.param('user_id')
+  if (!isValidId(userId)) return bad(c, 'Invalid user_id')
+  const days = parseIntParam(c.req.query('days'), 30, 90)
+
+  const { results: patterns } = await DB.prepare(`
+    SELECT * FROM behavioral_patterns
+    WHERE user_id=? AND created_at >= datetime('now','-${days} days')
+    ORDER BY created_at DESC
+  `).bind(userId).all() as any
+
+  const hour = new Date().getHours()
+  const dow  = new Date().getDay()
+  const analysis = analyzePatterns(patterns as any[], hour, dow)
+  const prediction = predictNextArrival(patterns as any[])
+
+  // Day-of-week distribution
+  const dowLabels = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat']
+  const dowDist: Record<string, number> = {}
+  for (const p of (patterns as any[])) {
+    const label = dowLabels[p.access_dow]
+    dowDist[label] = (dowDist[label] || 0) + 1
+  }
+
+  return c.json({
+    user_id: userId,
+    days_analyzed: days,
+    total_events: (patterns as any[]).length,
+    analysis,
+    prediction,
+    dow_distribution: dowDist,
+    typical_hours: analysis.typicalHours,
+    typical_days:  analysis.typicalDows.map(d => dowLabels[d])
+  })
+})
+
+// ═══════════════════════════════════════════════════════════
+// Catch-all SPA route (MUST be last — after all API routes)
+// ═══════════════════════════════════════════════════════════
+app.get('*', (c) => {
+  return c.html(getMainHTML())
+})
 
 export default app

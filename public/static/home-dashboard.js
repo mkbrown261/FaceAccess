@@ -106,12 +106,14 @@ function showTab(name) {
   if (nav) nav.classList.add('active');
   const titles = { overview: 'Overview', live: 'Live View', recognize: 'Face Recognition Test',
     locks: 'Smart Locks', members: 'Household Members', guests: 'Guest Passes',
-    devices: 'Trusted Devices', activity: 'Activity Log', cameras: 'Cameras', automations: 'Automations' };
+    devices: 'Trusted Devices', activity: 'Activity Log', cameras: 'Cameras', automations: 'Automations',
+    ai: 'AI Intelligence', anomalies: 'Anomaly Detection' };
   const el = document.getElementById('page-title');
   if (el) el.textContent = titles[name] || name;
   const loaders = { overview: loadOverview, live: loadLive, recognize: loadRecognize,
     locks: loadLocks, members: loadMembers, guests: loadGuests,
-    devices: loadDevices, activity: loadActivity, cameras: loadCameras, automations: loadAutomations };
+    devices: loadDevices, activity: loadActivity, cameras: loadCameras, automations: loadAutomations,
+    ai: loadAI, anomalies: loadAnomalies };
   if (loaders[name]) loaders[name]();
 }
 
@@ -1781,6 +1783,424 @@ function timeAgo(dateStr) {
 function fmtDate(s) {
   if (!s) return '—';
   return new Date(s).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+}
+
+// ═══════════════════════════════════════════════════════
+//  AI INTELLIGENCE — Trust Scoring & Behavioral Analysis
+// ═══════════════════════════════════════════════════════
+
+/** Trust tier → colour mapping */
+function trustColor(tier) {
+  return { trusted: 'green', standard: 'indigo', watchlist: 'yellow', blocked: 'red' }[tier] || 'gray';
+}
+function trustIcon(tier) {
+  return { trusted: 'fa-shield-check', standard: 'fa-shield', watchlist: 'fa-exclamation-triangle', blocked: 'fa-ban' }[tier] || 'fa-circle';
+}
+function severityColor(sev) {
+  return { critical: 'red', high: 'orange', medium: 'yellow', low: 'blue' }[sev] || 'gray';
+}
+
+async function loadAI() {
+  const el = document.getElementById('tab-ai');
+  if (!el) return;
+  el.innerHTML = `<div class="text-gray-500 text-sm py-10 text-center"><i class="fas fa-brain fa-spin text-indigo-400 text-2xl mb-3 block"></i>Loading AI Intelligence...</div>`;
+  try {
+    const [dashR, recsR, predsR] = await Promise.all([
+      axios.get(`${API}/api/ai/dashboard/${currentHomeId}`).catch(() => ({ data: {} })),
+      axios.get(`${API}/api/ai/recommendations/${currentHomeId}`).catch(() => ({ data: { recommendations: [] } })),
+      axios.get(`${API}/api/ai/predictions/${currentHomeId}`).catch(() => ({ data: { predictions: [] } })),
+    ]);
+    const dash  = dashR.data  || {};
+    const recs  = recsR.data.recommendations || [];
+    const preds = predsR.data.predictions    || [];
+
+    const ts   = dash.trust_summary   || {};
+    const as_  = dash.anomaly_summary || {};
+    const watch = dash.trust_watchlist   || [];
+    const recentAnoms = dash.recent_anomalies || [];
+    const heatmap = dash.behavioral_heatmap || [];
+
+    el.innerHTML = `
+    <!-- Header -->
+    <div class="flex items-center justify-between mb-6">
+      <div>
+        <h2 class="text-xl font-bold text-white flex items-center gap-2">
+          <i class="fas fa-brain text-indigo-400"></i> AI Intelligence
+        </h2>
+        <p class="text-xs text-gray-500 mt-0.5">Predictive behavior · Trust scoring · Anomaly detection</p>
+      </div>
+      <button onclick="loadAI()" class="text-xs text-indigo-400 hover:underline"><i class="fas fa-sync mr-1"></i>Refresh</button>
+    </div>
+
+    <!-- Trust Score Summary Cards -->
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
+      <div class="stat-mini border-green-500/20">
+        <div class="flex items-center gap-2 mb-2">
+          <i class="fas fa-shield-check text-green-400"></i>
+          <span class="text-xs text-gray-600 uppercase tracking-wide">Trusted</span>
+        </div>
+        <div class="text-3xl font-black text-green-400">${ts.trusted_count || 0}</div>
+      </div>
+      <div class="stat-mini">
+        <div class="flex items-center gap-2 mb-2">
+          <i class="fas fa-shield text-indigo-400"></i>
+          <span class="text-xs text-gray-600 uppercase tracking-wide">Standard</span>
+        </div>
+        <div class="text-3xl font-black text-white">${ts.standard_count || 0}</div>
+      </div>
+      <div class="stat-mini ${(ts.watchlist_count || 0) > 0 ? 'border-yellow-500/30' : ''}">
+        <div class="flex items-center gap-2 mb-2">
+          <i class="fas fa-exclamation-triangle text-yellow-400"></i>
+          <span class="text-xs text-gray-600 uppercase tracking-wide">Watchlist</span>
+        </div>
+        <div class="text-3xl font-black text-${(ts.watchlist_count || 0) > 0 ? 'yellow-400' : 'white'}">${ts.watchlist_count || 0}</div>
+      </div>
+      <div class="stat-mini ${(as_.critical_count || 0) > 0 ? 'border-red-500/30' : ''}">
+        <div class="flex items-center gap-2 mb-2">
+          <i class="fas fa-ban text-red-400"></i>
+          <span class="text-xs text-gray-600 uppercase tracking-wide">Anomalies</span>
+        </div>
+        <div class="text-3xl font-black text-${(as_.critical_count || 0) > 0 ? 'red-400' : 'white'}">${as_.total_unresolved || 0}</div>
+      </div>
+    </div>
+
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-6">
+      <!-- Trust Profiles -->
+      <div class="lg:col-span-2 card p-5">
+        <div class="flex items-center justify-between mb-4">
+          <h3 class="font-bold text-white text-sm">User Trust Scores</h3>
+          <span class="text-xs text-gray-500">Avg: ${ts.avg_trust_score ? Math.round(ts.avg_trust_score * 100) + '%' : '—'}</span>
+        </div>
+        <div id="trust-profile-list">
+          <p class="text-gray-600 text-sm">Loading...</p>
+        </div>
+      </div>
+
+      <!-- AI Recommendations -->
+      <div class="card p-5">
+        <div class="flex items-center justify-between mb-4">
+          <h3 class="font-bold text-white text-sm"><i class="fas fa-lightbulb text-yellow-400 mr-2"></i>AI Recommendations</h3>
+          <button onclick="refreshRecs()" class="text-xs text-indigo-400 hover:underline">Refresh</button>
+        </div>
+        <div id="ai-recs-list">
+          ${recs.length === 0 ? '<p class="text-gray-500 text-xs text-center py-4">No recommendations right now. System looks healthy!</p>' :
+          recs.map(r => `
+          <div class="mb-3 p-3 rounded-xl bg-gray-900/50 border border-${r.priority === 'urgent' ? 'red' : r.priority === 'high' ? 'orange' : 'gray'}-500/20">
+            <div class="flex items-start justify-between gap-2">
+              <div class="flex-1 min-w-0">
+                <div class="flex items-center gap-1.5 mb-1">
+                  <span class="text-xs font-semibold px-1.5 py-0.5 rounded bg-${r.priority === 'urgent' ? 'red' : r.priority === 'high' ? 'orange' : 'indigo'}-500/20 text-${r.priority === 'urgent' ? 'red' : r.priority === 'high' ? 'orange' : 'indigo'}-400 uppercase">${esc(r.priority)}</span>
+                </div>
+                <div class="text-xs font-semibold text-white">${esc(r.title)}</div>
+                <div class="text-xs text-gray-500 mt-0.5">${esc(r.message)}</div>
+              </div>
+              <button onclick="dismissRec('${esc(r.id)}')" class="text-gray-600 hover:text-gray-400 flex-shrink-0 text-xs" title="Dismiss"><i class="fas fa-times"></i></button>
+            </div>
+          </div>`).join('')}
+        </div>
+      </div>
+    </div>
+
+    <!-- Recent Anomalies -->
+    <div class="card p-5 mb-6">
+      <div class="flex items-center justify-between mb-4">
+        <h3 class="font-bold text-white text-sm"><i class="fas fa-exclamation-circle text-red-400 mr-2"></i>Recent Anomalies</h3>
+        <button onclick="showTab('anomalies')" class="text-xs text-indigo-400 hover:underline">View All →</button>
+      </div>
+      ${recentAnoms.length === 0 ? '<p class="text-gray-500 text-sm text-center py-4"><i class="fas fa-check-circle text-green-500 mr-2"></i>No anomalies detected</p>' :
+      recentAnoms.map(a => `
+      <div class="flex items-start gap-3 py-3 border-b border-gray-900 last:border-0">
+        <div class="w-8 h-8 rounded-lg bg-${severityColor(a.severity)}-500/15 flex items-center justify-center flex-shrink-0">
+          <i class="fas fa-exclamation-triangle text-${severityColor(a.severity)}-400 text-xs"></i>
+        </div>
+        <div class="flex-1 min-w-0">
+          <div class="text-xs font-semibold text-white">${esc(a.anomaly_type?.replace(/_/g,' ') || 'Unknown')}</div>
+          <div class="text-xs text-gray-500">${esc(a.user_name || 'Unknown user')} · ${esc(a.severity)} severity · ${timeAgo(a.created_at)}</div>
+        </div>
+        <button onclick="resolveAnomaly('${esc(a.id)}')" class="text-xs text-green-400 hover:text-green-300 flex-shrink-0">Resolve</button>
+      </div>`).join('')}
+    </div>
+
+    <!-- Predictions -->
+    <div class="card p-5 mb-6">
+      <div class="flex items-center justify-between mb-4">
+        <h3 class="font-bold text-white text-sm"><i class="fas fa-crystal-ball text-purple-400 mr-2 fas fa-magic"></i>Arrival Predictions</h3>
+        <button onclick="generatePredictions()" class="text-xs text-indigo-400 hover:underline"><i class="fas fa-sync mr-1"></i>Generate</button>
+      </div>
+      <div id="ai-predictions-list">
+        ${preds.length === 0 ? '<p class="text-gray-500 text-sm text-center py-4">No active predictions. Need more access data to predict arrivals.</p>' :
+        preds.map(p => `
+        <div class="flex items-center gap-3 py-3 border-b border-gray-900 last:border-0">
+          <div class="w-9 h-9 rounded-xl bg-purple-500/15 flex items-center justify-center flex-shrink-0">
+            <i class="fas fa-clock text-purple-400 text-sm"></i>
+          </div>
+          <div class="flex-1">
+            <div class="text-xs font-semibold text-white">${esc(p.user_name || 'Unknown')}</div>
+            <div class="text-xs text-gray-500">Predicted: ${esc(p.predicted_arrival?.substring(11,16) || '—')} · <span class="text-purple-400">${Math.round((p.prediction_confidence || 0) * 100)}%</span> confidence</div>
+          </div>
+          <span class="badge badge-gray text-xs">${esc(p.lock_name || 'Any lock')}</span>
+        </div>`).join('')}
+      </div>
+    </div>
+
+    <!-- Behavioral Heatmap -->
+    <div class="card p-5">
+      <h3 class="font-bold text-white text-sm mb-4"><i class="fas fa-th text-indigo-400 mr-2"></i>Access Heatmap (Last 7 Days)</h3>
+      ${renderHeatmap(heatmap)}
+    </div>`;
+
+    // Load trust profiles separately
+    loadTrustProfiles();
+  } catch(e) {
+    console.error('AI load error', e);
+    document.getElementById('tab-ai').innerHTML = `<div class="text-red-400 text-sm p-4">Failed to load AI dashboard: ${esc(e.message)}</div>`;
+  }
+}
+
+async function loadTrustProfiles() {
+  try {
+    const r = await axios.get(`${API}/api/ai/trust/${currentHomeId}`);
+    const profiles = r.data.trust_profiles || [];
+    const el = document.getElementById('trust-profile-list');
+    if (!el) return;
+    if (profiles.length === 0) {
+      el.innerHTML = '<p class="text-gray-600 text-sm">No trust profiles yet. Profiles build automatically as users authenticate.</p>';
+      return;
+    }
+    el.innerHTML = profiles.map(p => `
+    <div class="flex items-center gap-3 py-3 border-b border-gray-900 last:border-0 hover:bg-gray-900/30 rounded-lg px-2 transition-colors cursor-pointer" onclick="showUserTrust('${esc(p.user_id)}','${esc(p.user_name || '')}')">
+      <div class="w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0 font-bold text-sm" style="background-color:${esc(p.avatar_color || '#6366f1')}22;color:${esc(p.avatar_color || '#6366f1')}">${(p.user_name||'U').charAt(0)}</div>
+      <div class="flex-1 min-w-0">
+        <div class="flex items-center gap-2">
+          <span class="text-sm font-semibold text-white">${esc(p.user_name || 'Unknown')}</span>
+          <span class="badge text-xs px-2 py-0.5 rounded-full bg-${trustColor(p.trust_tier)}-500/20 text-${trustColor(p.trust_tier)}-400">
+            <i class="fas ${trustIcon(p.trust_tier)} mr-1 text-xs"></i>${esc(p.trust_tier || 'standard')}
+          </span>
+        </div>
+        <div class="text-xs text-gray-500 mt-0.5">
+          ${p.successful_unlocks || 0} unlocks · ${p.anomaly_count || 0} anomalies
+        </div>
+      </div>
+      <div class="flex flex-col items-end gap-1">
+        <div class="text-sm font-black text-${trustColor(p.trust_tier)}-400">${Math.round((p.trust_score || 0) * 100)}%</div>
+        <div class="w-16 h-1.5 rounded-full bg-gray-800 overflow-hidden">
+          <div class="h-full rounded-full bg-${trustColor(p.trust_tier)}-500" style="width:${Math.round((p.trust_score || 0) * 100)}%"></div>
+        </div>
+      </div>
+    </div>`).join('');
+  } catch(e) { console.warn('Trust profiles error', e); }
+}
+
+async function showUserTrust(userId, userName) {
+  if (!isValidId(userId)) return;
+  openModal(`
+  <h3 class="text-lg font-bold text-white mb-4"><i class="fas fa-user-shield text-indigo-400 mr-2"></i>${esc(userName)} — Trust Profile</h3>
+  <div id="user-trust-detail"><p class="text-gray-500 text-sm">Loading...</p></div>
+  `);
+  try {
+    const [trustR, behavR] = await Promise.all([
+      axios.get(`${API}/api/ai/trust/user/${userId}`),
+      axios.get(`${API}/api/ai/behavioral/${userId}?days=30`)
+    ]);
+    const profile = trustR.data.profile || {};
+    const hourDist = trustR.data.hour_distribution || [];
+    const beh = behavR.data;
+    const el = document.getElementById('user-trust-detail');
+    if (!el) return;
+    el.innerHTML = `
+    <div class="grid grid-cols-2 gap-3 mb-4">
+      <div class="bg-gray-900/60 rounded-xl p-3 text-center">
+        <div class="text-2xl font-black text-${trustColor(profile.trust_tier)}-400">${Math.round((profile.trust_score||0)*100)}%</div>
+        <div class="text-xs text-gray-500">Trust Score</div>
+      </div>
+      <div class="bg-gray-900/60 rounded-xl p-3 text-center">
+        <div class="text-2xl font-black text-white">${Math.round((profile.behavioral_score||0)*100)}%</div>
+        <div class="text-xs text-gray-500">Behavioral</div>
+      </div>
+      <div class="bg-gray-900/60 rounded-xl p-3 text-center">
+        <div class="text-2xl font-black text-green-400">${profile.successful_unlocks||0}</div>
+        <div class="text-xs text-gray-500">Unlocks</div>
+      </div>
+      <div class="bg-gray-900/60 rounded-xl p-3 text-center">
+        <div class="text-2xl font-black text-${(profile.anomaly_count||0)>0?'red':'white'}-400">${profile.anomaly_count||0}</div>
+        <div class="text-xs text-gray-500">Anomalies</div>
+      </div>
+    </div>
+    <div class="mb-3">
+      <div class="text-xs text-gray-500 mb-2">Score Components</div>
+      ${[
+        ['Face Confidence', profile.face_confidence_avg, 'indigo'],
+        ['Behavioral',      profile.behavioral_score,    'purple'],
+        ['Predictive',      profile.predictive_score,    'blue'],
+      ].map(([label, val, color]) => `
+      <div class="flex items-center gap-2 mb-1.5">
+        <div class="text-xs text-gray-400 w-28 flex-shrink-0">${label}</div>
+        <div class="flex-1 h-1.5 bg-gray-800 rounded-full overflow-hidden">
+          <div class="h-full bg-${color}-500 rounded-full" style="width:${Math.round((val||0)*100)}%"></div>
+        </div>
+        <div class="text-xs text-gray-400 w-8 text-right">${Math.round((val||0)*100)}%</div>
+      </div>`).join('')}
+    </div>
+    <div class="mb-3">
+      <div class="text-xs text-gray-500 mb-2">Access Pattern (by hour)</div>
+      <div class="flex items-end gap-0.5 h-12">
+        ${Array.from({length:24}, (_, h) => {
+          const bucket = hourDist.find(b => b.access_hour === h);
+          const cnt = bucket?.cnt || 0;
+          const maxCnt = Math.max(1, ...hourDist.map(b => b.cnt));
+          const pct = Math.round((cnt / maxCnt) * 100);
+          return `<div class="flex-1 bg-indigo-500/30 rounded-sm hover:bg-indigo-400/50 transition-colors" style="height:${Math.max(4,pct)}%" title="${h}:00 — ${cnt} accesses"></div>`;
+        }).join('')}
+      </div>
+      <div class="flex justify-between text-xs text-gray-700 mt-1">
+        <span>12am</span><span>6am</span><span>12pm</span><span>6pm</span><span>12am</span>
+      </div>
+    </div>
+    ${beh.prediction ? `
+    <div class="p-3 rounded-xl bg-purple-500/10 border border-purple-500/20 text-xs text-purple-300">
+      <i class="fas fa-magic mr-1 text-purple-400"></i>
+      Next predicted arrival: <strong>${esc(beh.prediction.predictedAt?.substring(11,16)||'')}</strong>
+      · ${Math.round((beh.prediction.confidence||0)*100)}% confidence
+    </div>` : ''}
+    <div class="flex gap-2 mt-4">
+      <button onclick="closeModal()" class="btn-ghost flex-1 text-sm">Close</button>
+      <button onclick="recalculateTrust('${esc(userId)}')" class="btn-primary flex-1 text-sm"><i class="fas fa-sync mr-1"></i>Recalculate</button>
+    </div>`;
+  } catch(e) { const el = document.getElementById('user-trust-detail'); if(el) el.innerHTML = `<p class="text-red-400 text-sm">Error loading trust data: ${esc(e.message)}</p>`; }
+}
+
+async function recalculateTrust(userId) {
+  if (!isValidId(userId)) return;
+  try {
+    const r = await axios.post(`${API}/api/ai/trust/recalculate/${userId}`);
+    toast(`Trust recalculated: ${Math.round(r.data.trust_score*100)}% (${r.data.trust_tier})`);
+    closeModal();
+    loadAI();
+  } catch(e) { toast('Failed to recalculate', 'error'); }
+}
+
+// ── Anomalies tab ──────────────────────────────────────
+async function loadAnomalies() {
+  const el = document.getElementById('tab-anomalies');
+  if (!el) return;
+  el.innerHTML = `<div class="text-gray-500 text-sm py-6 text-center"><i class="fas fa-spinner fa-spin text-indigo-400 mr-2"></i>Loading anomalies...</div>`;
+  try {
+    const r = await axios.get(`${API}/api/ai/anomalies/${currentHomeId}?limit=100`);
+    const anomalies = r.data.anomalies || [];
+    el.innerHTML = `
+    <div class="flex items-center justify-between mb-6">
+      <h2 class="text-xl font-bold text-white flex items-center gap-2">
+        <i class="fas fa-exclamation-triangle text-red-400"></i> Anomaly Detection
+      </h2>
+      <span class="badge badge-red text-xs">${r.data.unacknowledged_count||0} unacknowledged</span>
+    </div>
+    ${anomalies.length === 0 ? `
+    <div class="card p-10 text-center">
+      <i class="fas fa-check-circle text-green-400 text-5xl mb-4"></i>
+      <h3 class="text-lg font-bold text-white mb-2">No Anomalies Detected</h3>
+      <p class="text-gray-500 text-sm">All access patterns look normal. The AI is continuously monitoring.</p>
+    </div>` : `
+    <div class="card">
+      ${anomalies.map(a => `
+      <div class="flex items-start gap-4 p-4 border-b border-gray-900 last:border-0 ${a.acknowledged ? 'opacity-50' : ''}">
+        <div class="w-10 h-10 rounded-xl bg-${severityColor(a.severity)}-500/15 flex items-center justify-center flex-shrink-0 mt-0.5">
+          <i class="fas fa-exclamation-triangle text-${severityColor(a.severity)}-400"></i>
+        </div>
+        <div class="flex-1 min-w-0">
+          <div class="flex flex-wrap items-center gap-2 mb-1">
+            <span class="text-sm font-bold text-white capitalize">${esc(a.anomaly_type?.replace(/_/g,' ')||'Unknown')}</span>
+            <span class="badge text-xs bg-${severityColor(a.severity)}-500/20 text-${severityColor(a.severity)}-400">${esc(a.severity)}</span>
+            ${a.resolved ? '<span class="badge badge-green text-xs">Resolved</span>' : a.acknowledged ? '<span class="badge badge-gray text-xs">Acknowledged</span>' : '<span class="badge badge-red text-xs">New</span>'}
+          </div>
+          <div class="text-xs text-gray-500">
+            ${esc(a.user_name||'Unknown user')} · ${timeAgo(a.created_at)} · AI confidence: ${Math.round((a.confidence||0)*100)}%
+          </div>
+          ${a.admin_note ? `<div class="text-xs text-gray-400 mt-1 italic">${esc(a.admin_note)}</div>` : ''}
+        </div>
+        <div class="flex flex-col gap-1 flex-shrink-0">
+          ${!a.acknowledged ? `<button onclick="ackAnomaly('${esc(a.id)}')" class="text-xs btn-ghost rounded-lg px-2 py-1">Ack</button>` : ''}
+          ${!a.resolved ? `<button onclick="resolveAnomaly('${esc(a.id)}')" class="text-xs text-green-400 hover:text-green-300 px-2 py-1">Resolve</button>` : ''}
+        </div>
+      </div>`).join('')}
+    </div>`}`;
+  } catch(e) { el.innerHTML = `<div class="text-red-400 text-sm p-4">Error: ${esc(e.message)}</div>`; }
+}
+
+async function ackAnomaly(id) {
+  if (!isValidId(id)) return;
+  await axios.put(`${API}/api/ai/anomalies/${id}/acknowledge`).catch(() => {});
+  toast('Anomaly acknowledged');
+  loadAnomalies();
+}
+
+async function resolveAnomaly(id) {
+  if (!isValidId(id)) return;
+  await axios.put(`${API}/api/ai/anomalies/${id}/resolve`).catch(() => {});
+  toast('Anomaly resolved', 'success');
+  loadAnomalies();
+}
+
+async function refreshRecs() {
+  toast('Refreshing recommendations...');
+  const r = await axios.get(`${API}/api/ai/recommendations/${currentHomeId}?refresh=1`).catch(() => ({ data: { recommendations: [] } }));
+  const recs = r.data.recommendations || [];
+  const el = document.getElementById('ai-recs-list');
+  if (el) {
+    el.innerHTML = recs.length === 0 ? '<p class="text-gray-500 text-xs text-center py-4">No recommendations right now.</p>' :
+    recs.map(r => `
+    <div class="mb-3 p-3 rounded-xl bg-gray-900/50 border border-${r.priority === 'urgent' ? 'red' : r.priority === 'high' ? 'orange' : 'gray'}-500/20">
+      <div class="flex items-start justify-between gap-2">
+        <div class="flex-1">
+          <div class="text-xs font-semibold text-white">${esc(r.title)}</div>
+          <div class="text-xs text-gray-500 mt-0.5">${esc(r.message)}</div>
+        </div>
+        <button onclick="dismissRec('${esc(r.id)}')" class="text-gray-600 hover:text-gray-400 text-xs"><i class="fas fa-times"></i></button>
+      </div>
+    </div>`).join('');
+  }
+}
+
+async function dismissRec(id) {
+  if (!isValidId(id)) return;
+  await axios.put(`${API}/api/ai/recommendations/${id}/dismiss`).catch(() => {});
+  toast('Recommendation dismissed');
+  const el = document.getElementById(`rec-${id}`);
+  if (el) el.remove();
+  loadAI();
+}
+
+async function generatePredictions() {
+  toast('Generating arrival predictions...');
+  try {
+    const r = await axios.post(`${API}/api/ai/predictions/generate/${currentHomeId}`);
+    toast(`Generated ${r.data.generated} prediction${r.data.generated !== 1 ? 's' : ''}`);
+    loadAI();
+  } catch(e) { toast('Not enough data to predict yet', 'warn'); }
+}
+
+/** Render a 24×7 heatmap grid */
+function renderHeatmap(heatmapData) {
+  if (!heatmapData || heatmapData.length === 0) {
+    return '<p class="text-gray-600 text-sm text-center py-4">No behavioral data yet. Heatmap builds as users access locks.</p>';
+  }
+  const days  = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+  const maxCnt = Math.max(1, ...heatmapData.map(h => h.count));
+  let html = '<div class="overflow-x-auto"><table class="text-xs w-full">';
+  html += '<tr><th class="text-gray-600 text-xs pr-2 text-right">Hour</th>';
+  for (let d = 0; d < 7; d++) html += `<th class="text-gray-600 text-center px-0.5">${days[d]}</th>`;
+  html += '</tr>';
+  for (let h = 0; h < 24; h++) {
+    html += `<tr><td class="text-gray-600 pr-2 text-right py-0.5">${h.toString().padStart(2,'0')}</td>`;
+    for (let d = 0; d < 7; d++) {
+      const cell = heatmapData.find(x => x.access_hour === h && x.access_dow === d);
+      const intensity = cell ? Math.round((cell.count / maxCnt) * 255) : 0;
+      const alpha     = cell ? (0.15 + (cell.count / maxCnt) * 0.85).toFixed(2) : '0';
+      html += `<td class="px-0.5 py-0.5"><div class="w-5 h-4 rounded" style="background:rgba(99,102,241,${alpha})" title="${days[d]} ${h}:00 — ${cell?.count||0} accesses, ${Math.round((cell?.success_rate||0)*100)}% success"></div></td>`;
+    }
+    html += '</tr>';
+  }
+  html += '</table></div>';
+  return html;
 }
 
 // Start

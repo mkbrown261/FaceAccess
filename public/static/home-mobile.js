@@ -541,4 +541,183 @@ function timeAgoHm(dateStr) {
   return `${Math.floor(diff/86400000)}d`;
 }
 
+function hmTrustColor(tier) {
+  return { trusted: '#10b981', standard: '#818cf8', watchlist: '#f59e0b', blocked: '#ef4444' }[tier] || '#94a3b8';
+}
+function hmTrustIcon(tier) {
+  return { trusted: 'fa-shield-check', standard: 'fa-shield', watchlist: 'fa-exclamation-triangle', blocked: 'fa-ban' }[tier] || 'fa-circle';
+}
+
+// ═══════════════════════════════════════════════════════
+//  AI TRUST SCORE — mobile integration
+// ═══════════════════════════════════════════════════════
+
+/**
+ * Load and render trust score card for mobile profile tab.
+ * Appended after the profile section is rendered.
+ */
+async function renderTrustCard(container) {
+  if (!hmUserId) return;
+  const card = document.createElement('div');
+  card.className = 'card p-5 mb-4';
+  card.innerHTML = `
+  <h3 class="font-semibold text-white mb-3 text-sm">
+    <i class="fas fa-brain mr-2 text-indigo-400"></i>AI Trust Score
+  </h3>
+  <div id="hm-trust-content"><div class="text-gray-600 text-xs text-center py-2"><i class="fas fa-spinner fa-spin mr-1"></i>Loading...</div></div>`;
+  container.insertBefore(card, container.firstChild.nextSibling);
+
+  try {
+    const r = await axios.get(`${API}/api/ai/trust/user/${hmUserId}`);
+    const profile = r.data.profile;
+    const el = document.getElementById('hm-trust-content');
+    if (!el) return;
+
+    if (!profile) {
+      el.innerHTML = '<p class="text-gray-600 text-xs text-center">No trust profile yet. Use face recognition to build your profile.</p>';
+      return;
+    }
+
+    const score = Math.round((profile.trust_score || 0) * 100);
+    const tier  = profile.trust_tier || 'standard';
+    const color = hmTrustColor(tier);
+    const icon  = hmTrustIcon(tier);
+
+    el.innerHTML = `
+    <div class="flex items-center gap-4 mb-4">
+      <div class="relative w-16 h-16 flex-shrink-0">
+        <svg class="w-16 h-16 -rotate-90" viewBox="0 0 64 64">
+          <circle cx="32" cy="32" r="26" fill="none" stroke="#1e293b" stroke-width="6"/>
+          <circle cx="32" cy="32" r="26" fill="none" stroke="${color}" stroke-width="6"
+            stroke-dasharray="${2*Math.PI*26}" stroke-dashoffset="${2*Math.PI*26*(1-score/100)}"
+            stroke-linecap="round"/>
+        </svg>
+        <div class="absolute inset-0 flex items-center justify-center">
+          <span class="text-sm font-black" style="color:${color}">${score}%</span>
+        </div>
+      </div>
+      <div class="flex-1">
+        <div class="flex items-center gap-2 mb-1">
+          <i class="fas ${icon} text-sm" style="color:${color}"></i>
+          <span class="text-sm font-bold text-white capitalize">${tier}</span>
+        </div>
+        <div class="text-xs text-gray-500">${profile.successful_unlocks||0} successful entries · ${profile.anomaly_count||0} anomalies</div>
+        <div class="text-xs text-gray-600 mt-0.5">Last updated: ${timeAgoHm(profile.last_updated)}</div>
+      </div>
+    </div>
+
+    <!-- Score breakdown bars -->
+    <div class="space-y-1.5 mb-3">
+      ${[
+        ['Face Confidence', profile.face_confidence_avg, '#818cf8'],
+        ['Behavioral',      profile.behavioral_score,    '#a855f7'],
+        ['Predictive',      profile.predictive_score,    '#3b82f6'],
+      ].map(([label, val, clr]) => `
+      <div class="flex items-center gap-2">
+        <div class="text-xs text-gray-500 w-28">${label}</div>
+        <div class="flex-1 h-1.5 bg-gray-800 rounded-full overflow-hidden">
+          <div class="h-full rounded-full transition-all" style="width:${Math.round((val||0)*100)}%;background:${clr}"></div>
+        </div>
+        <div class="text-xs text-gray-500 w-8 text-right">${Math.round((val||0)*100)}%</div>
+      </div>`).join('')}
+    </div>
+
+    ${tier === 'trusted' ? `
+    <div class="p-2.5 rounded-xl bg-green-500/10 border border-green-500/20 text-xs text-green-400 flex items-center gap-2">
+      <i class="fas fa-shield-check"></i> High trust — faster access granted automatically
+    </div>` : tier === 'watchlist' ? `
+    <div class="p-2.5 rounded-xl bg-yellow-500/10 border border-yellow-500/20 text-xs text-yellow-400 flex items-center gap-2">
+      <i class="fas fa-exclamation-triangle"></i> Watch mode — additional verification may be required
+    </div>` : tier === 'blocked' ? `
+    <div class="p-2.5 rounded-xl bg-red-500/10 border border-red-500/20 text-xs text-red-400 flex items-center gap-2">
+      <i class="fas fa-ban"></i> Access blocked — contact administrator
+    </div>` : ''}`;
+
+  } catch(e) {
+    const el = document.getElementById('hm-trust-content');
+    if (el) el.innerHTML = '<p class="text-gray-600 text-xs text-center">Trust data unavailable</p>';
+  }
+}
+
+/**
+ * Show predictive arrival notifications in the home tab.
+ * Shows if there is a predicted arrival in the next 60 minutes.
+ */
+async function renderPredictiveNotifications(el) {
+  if (!hmHomeId || !hmUserId) return;
+  try {
+    const r = await axios.get(`${API}/api/ai/predictions/${hmHomeId}`);
+    const preds = (r.data.predictions || []).filter(p => p.user_id === hmUserId);
+    if (preds.length === 0) return;
+
+    const pred = preds[0];
+    const predictedTime = new Date(pred.predicted_arrival);
+    const minsUntil = Math.round((predictedTime - Date.now()) / 60000);
+    if (minsUntil < 0 || minsUntil > 90) return;
+
+    const banner = document.createElement('div');
+    banner.className = 'p-3 rounded-2xl bg-purple-500/10 border border-purple-500/20 mb-4 slide-in';
+    banner.innerHTML = `
+    <div class="flex items-center gap-3">
+      <div class="w-9 h-9 rounded-xl bg-purple-500/20 flex items-center justify-center flex-shrink-0">
+        <i class="fas fa-magic text-purple-400 text-sm"></i>
+      </div>
+      <div class="flex-1">
+        <div class="text-xs font-bold text-purple-300">AI Prediction</div>
+        <div class="text-xs text-gray-400">
+          Arriving in ~${minsUntil} min · ${Math.round((pred.prediction_confidence||0)*100)}% confidence
+        </div>
+      </div>
+      <span class="text-xs text-purple-400 font-mono">${predictedTime.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}</span>
+    </div>`;
+    el.insertBefore(banner, el.firstChild);
+  } catch(e) { /* predictions are optional */ }
+}
+
+/**
+ * Check for and display anomaly alerts in the home tab.
+ */
+async function checkAnomalyAlerts(el) {
+  if (!hmHomeId) return;
+  try {
+    const r = await axios.get(`${API}/api/ai/anomalies/${hmHomeId}?limit=3`);
+    const unacked = (r.data.anomalies || []).filter(a => !a.acknowledged && !a.resolved);
+    if (unacked.length === 0) return;
+
+    const banner = document.createElement('div');
+    banner.className = 'p-3 rounded-2xl bg-red-500/10 border border-red-500/20 mb-4 slide-in cursor-pointer';
+    banner.onclick = () => { window.location.href = '/home/dashboard'; };
+    banner.innerHTML = `
+    <div class="flex items-center gap-3">
+      <div class="w-9 h-9 rounded-xl bg-red-500/20 flex items-center justify-center flex-shrink-0 pulse">
+        <i class="fas fa-exclamation-triangle text-red-400 text-sm"></i>
+      </div>
+      <div class="flex-1">
+        <div class="text-xs font-bold text-red-300">${unacked.length} Security Alert${unacked.length > 1 ? 's' : ''}</div>
+        <div class="text-xs text-gray-400">${unacked[0].anomaly_type?.replace(/_/g,' ')} · Tap to review</div>
+      </div>
+      <i class="fas fa-chevron-right text-red-400/50 text-xs"></i>
+    </div>`;
+    el.insertBefore(banner, el.firstChild);
+  } catch(e) { /* anomalies are optional */ }
+}
+
+// Override renderHomeTab to also inject AI notifications
+const _origRenderHomeTab = renderHomeTab;
+async function renderHomeTab(el) {
+  await _origRenderHomeTab(el);
+  // Inject AI predictive notification and anomaly alerts
+  await Promise.allSettled([
+    renderPredictiveNotifications(el),
+    checkAnomalyAlerts(el),
+  ]);
+}
+
+// Override renderProfileTab to also inject trust card
+const _origRenderProfileTab = renderProfileTab;
+async function renderProfileTab(el) {
+  await _origRenderProfileTab(el);
+  await renderTrustCard(el);
+}
+
 window.addEventListener('DOMContentLoaded', init);
