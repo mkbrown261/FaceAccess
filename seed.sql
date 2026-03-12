@@ -79,3 +79,66 @@ INSERT OR IGNORE INTO access_logs (id, user_id, user_name, door_id, door_name, t
   ('log-008', 'usr-emp-001', 'Michael Park', 'door-office-001', 'Office Floor A', datetime('now', '-10 minutes'), 'face', 'granted', 0.93, 0.97),
   ('log-009', 'usr-mgr-002', 'Emily Rodriguez', 'door-exec-001', 'Executive Suite', datetime('now', '-5 minutes'), 'face+2fa', 'granted', 0.97, 0.98),
   ('log-010', NULL, 'Unknown', 'door-main-001', 'Main Entrance', datetime('now', '-2 minutes'), 'face', 'denied', 0.28, 0.45);
+
+-- ─────────────────────────────────────
+-- FaceAccess Home Demo Data
+-- ─────────────────────────────────────
+
+-- Demo home owner
+INSERT OR IGNORE INTO home_users (id, home_id, name, email, phone, role, avatar_color, status, created_at) VALUES
+  ('hu-owner-001', NULL, 'Jordan Kim', 'jordan@facehome.demo', '+1-555-0100', 'owner', '#6366f1', 'active', datetime('now'));
+
+INSERT OR IGNORE INTO home_users (id, home_id, name, email, phone, role, avatar_color, status, created_at) VALUES
+  ('hu-member-001', NULL, 'Riley Kim', 'riley@facehome.demo', '+1-555-0101', 'member', '#10b981', 'active', datetime('now')),
+  ('hu-member-002', NULL, 'Casey Kim', 'casey@facehome.demo', '+1-555-0102', 'member', '#8b5cf6', 'active', datetime('now'));
+
+-- Demo home
+INSERT OR IGNORE INTO homes (id, owner_id, name, address, timezone, plan, setup_step, setup_complete, invite_code, created_at, updated_at) VALUES
+  ('home-demo-001', 'hu-owner-001', 'Kim Residence', '142 Maple Street, Austin TX', 'America/Chicago', 'pro', 4, 1, 'KIMHOME1', datetime('now'), datetime('now'));
+
+-- Link users to home
+UPDATE home_users SET home_id = 'home-demo-001' WHERE id IN ('hu-owner-001','hu-member-001','hu-member-002');
+
+-- Smart locks
+INSERT OR IGNORE INTO smart_locks (id, home_id, name, location, lock_type, brand, is_locked, battery_pct, status, created_at) VALUES
+  ('lock-demo-001', 'home-demo-001', 'Front Door', 'Main entrance', 'api', 'august', 1, 82, 'active', datetime('now')),
+  ('lock-demo-002', 'home-demo-001', 'Back Door', 'Rear entrance', 'api', 'schlage', 1, 67, 'active', datetime('now')),
+  ('lock-demo-003', 'home-demo-001', 'Garage', 'Side garage door', 'relay', 'generic', 1, NULL, 'active', datetime('now'));
+
+-- Home cameras
+INSERT OR IGNORE INTO home_cameras (id, home_id, lock_id, name, stream_url, camera_type, status, created_at) VALUES
+  ('hcam-demo-001', 'home-demo-001', 'lock-demo-001', 'Front Door Camera', 'rtsp://192.168.1.100:554/stream', 'rtsp', 'active', datetime('now')),
+  ('hcam-demo-002', 'home-demo-001', 'lock-demo-002', 'Backyard Camera', 'rtsp://192.168.1.101:554/stream', 'rtsp', 'active', datetime('now'));
+
+-- Trusted devices
+INSERT OR IGNORE INTO home_devices (id, user_id, home_id, name, platform, ble_uuid, trusted, status, created_at) VALUES
+  ('dev-demo-001', 'hu-owner-001', 'home-demo-001', 'Jordan''s iPhone 15', 'ios', 'FA-BLE-A3F1-B2E9', 1, 'active', datetime('now')),
+  ('dev-demo-002', 'hu-member-001', 'home-demo-001', 'Riley''s iPhone 14', 'ios', 'FA-BLE-C7D2-E4F6', 1, 'active', datetime('now')),
+  ('dev-demo-003', 'hu-member-002', 'home-demo-001', 'Casey''s Pixel 8', 'android', 'FA-BLE-F9A1-3C5D', 1, 'active', datetime('now'));
+
+-- Register faces for home users
+UPDATE home_users SET face_registered = 1 WHERE id IN ('hu-owner-001','hu-member-001','hu-member-002');
+
+-- Guest pass
+INSERT OR IGNORE INTO guest_passes (id, home_id, created_by, name, email, phone, lock_ids, valid_from, valid_until, time_start, time_end, days_allowed, invite_token, status, created_at) VALUES
+  ('gp-demo-001', 'home-demo-001', 'hu-owner-001', 'House Cleaner', 'cleaner@service.com', NULL, '["lock-demo-001"]',
+   datetime('now','-1 day'), datetime('now','+6 days'), '09:00', '17:00', 'mon,wed,fri', 'GP-CLEAN1', 'active', datetime('now')),
+  ('gp-demo-002', 'home-demo-001', 'hu-owner-001', 'Dog Walker', 'walker@pets.com', NULL, '["lock-demo-001","lock-demo-002"]',
+   datetime('now'), datetime('now','+14 days'), '07:00', '19:00', 'mon,tue,wed,thu,fri', 'GP-DOGWLK', 'active', datetime('now'));
+
+-- Sample home events
+INSERT OR IGNORE INTO home_events (id, home_id, user_id, user_name, lock_id, lock_name, event_type, method, face_confidence, liveness_score, ble_detected, wifi_matched, proximity_score, created_at) VALUES
+  ('hev-demo-001', 'home-demo-001', 'hu-owner-001', 'Jordan Kim', 'lock-demo-001', 'Front Door', 'unlock', 'face+ble', 0.97, 0.99, 1, 0, 0.95, datetime('now','-3 hours')),
+  ('hev-demo-002', 'home-demo-001', 'hu-member-001', 'Riley Kim', 'lock-demo-001', 'Front Door', 'unlock', 'face+ble', 0.94, 0.98, 1, 0, 0.95, datetime('now','-2 hours')),
+  ('hev-demo-003', 'home-demo-001', NULL, 'Unknown', 'lock-demo-001', 'Front Door', 'denied', 'face', 0.28, 0.91, 0, 0, 0, datetime('now','-1 hour', '-30 minutes')),
+  ('hev-demo-004', 'home-demo-001', 'hu-owner-001', 'Jordan Kim', 'lock-demo-002', 'Back Door', 'unlock', 'face+wifi', 0.92, 0.97, 0, 1, 0.78, datetime('now','-1 hour')),
+  ('hev-demo-005', 'home-demo-001', 'hu-member-002', 'Casey Kim', 'lock-demo-001', 'Front Door', 'unlock', 'face+ble', 0.95, 0.99, 1, 0, 0.95, datetime('now','-40 minutes')),
+  ('hev-demo-006', 'home-demo-001', 'hu-member-001', 'Riley Kim', 'lock-demo-002', 'Back Door', 'unlock', 'face+remote', 0.78, 0.96, 0, 0, 0, datetime('now','-20 minutes')),
+  ('hev-demo-007', 'home-demo-001', NULL, 'Unknown', 'lock-demo-001', 'Front Door', 'denied', 'face', 0.41, 0.38, 0, 0, 0, datetime('now','-10 minutes')),
+  ('hev-demo-008', 'home-demo-001', 'hu-owner-001', 'Jordan Kim', 'lock-demo-001', 'Front Door', 'unlock', 'face+ble', 0.98, 0.99, 1, 0, 0.95, datetime('now','-5 minutes'));
+
+-- Home automations
+INSERT OR IGNORE INTO home_automations (id, home_id, name, trigger_type, action_type, conditions, enabled, created_at) VALUES
+  ('auto-demo-001', 'home-demo-001', 'Bedtime Lock', 'time', 'lock', '{"time":"23:00","days":"mon,tue,wed,thu,fri,sat,sun"}', 1, datetime('now')),
+  ('auto-demo-002', 'home-demo-001', 'Morning Unlock', 'time', 'unlock', '{"time":"07:00","days":"mon,tue,wed,thu,fri","lock_id":"lock-demo-001"}', 0, datetime('now')),
+  ('auto-demo-003', 'home-demo-001', 'Guest Arrival Alert', 'arrival', 'notify', '{"event_type":"guest_entry"}', 1, datetime('now'));

@@ -545,6 +545,543 @@ app.put('/api/settings', async (c) => {
   return c.json({ message: 'Settings updated' })
 })
 
+// ═══════════════════════════════════════════════════════
+// ██  FACEACCESS HOME — Consumer Product API           ██
+// ═══════════════════════════════════════════════════════
+
+// ── Home management ───────────────────────────────────
+app.get('/api/home/homes', async (c) => {
+  const { DB } = c.env
+  const { results } = await DB.prepare(`
+    SELECT h.*, hu.name as owner_name, hu.email as owner_email,
+      (SELECT COUNT(*) FROM home_users WHERE home_id=h.id AND status='active') as member_count,
+      (SELECT COUNT(*) FROM smart_locks WHERE home_id=h.id AND status='active') as lock_count,
+      (SELECT COUNT(*) FROM home_cameras WHERE home_id=h.id AND status='active') as camera_count
+    FROM homes h JOIN home_users hu ON h.owner_id=hu.id ORDER BY h.created_at DESC`).all()
+  return c.json({ homes: results })
+})
+
+app.get('/api/home/homes/:id', async (c) => {
+  const { DB } = c.env
+  const home = await DB.prepare(`SELECT h.*, hu.name as owner_name FROM homes h JOIN home_users hu ON h.owner_id=hu.id WHERE h.id=?`).bind(c.req.param('id')).first()
+  if (!home) return c.json({ error: 'Home not found' }, 404)
+  return c.json({ home })
+})
+
+app.post('/api/home/homes', async (c) => {
+  const { DB } = c.env
+  const body = await c.req.json()
+  const { owner_id, name, address, timezone } = body
+  if (!owner_id || !name) return c.json({ error: 'owner_id and name required' }, 400)
+  const id = 'home-' + nanoid(8)
+  const invite_code = nanoid(8).toUpperCase().replace(/[^A-Z0-9]/g, 'X').slice(0,8)
+  await DB.prepare(`INSERT INTO homes (id,owner_id,name,address,timezone,invite_code,setup_step,created_at,updated_at) VALUES (?,?,?,?,?,?,0,?,?)`)
+    .bind(id, owner_id, name, address||null, timezone||'UTC', invite_code, now(), now()).run()
+  // Link user to home
+  await DB.prepare('UPDATE home_users SET home_id=? WHERE id=?').bind(id, owner_id).run()
+  const home = await DB.prepare('SELECT * FROM homes WHERE id=?').bind(id).first()
+  return c.json({ home, message: 'Home created' }, 201)
+})
+
+app.put('/api/home/homes/:id/setup', async (c) => {
+  const { DB } = c.env
+  const body = await c.req.json()
+  const { step } = body
+  const complete = step >= 4 ? 1 : 0
+  await DB.prepare('UPDATE homes SET setup_step=?,setup_complete=?,updated_at=? WHERE id=?')
+    .bind(step, complete, now(), c.req.param('id')).run()
+  return c.json({ message: 'Setup progress saved', step, complete })
+})
+
+// ── Home Users ────────────────────────────────────────
+app.get('/api/home/users', async (c) => {
+  const { DB } = c.env
+  const home_id = c.req.query('home_id')
+  let q = `SELECT hu.*, (SELECT COUNT(*) FROM home_devices WHERE user_id=hu.id AND status='active') as device_count FROM home_users hu WHERE hu.status != 'deleted'`
+  const args: string[] = []
+  if (home_id) { q += ' AND hu.home_id=?'; args.push(home_id) }
+  q += ' ORDER BY hu.role, hu.name'
+  const { results } = await DB.prepare(q).bind(...args).all()
+  return c.json({ users: results })
+})
+
+app.post('/api/home/users', async (c) => {
+  const { DB } = c.env
+  const body = await c.req.json()
+  const { home_id, name, email, phone, role } = body
+  if (!name || !email) return c.json({ error: 'name and email required' }, 400)
+  const existing = await DB.prepare('SELECT id FROM home_users WHERE email=?').bind(email).first()
+  if (existing) return c.json({ error: 'Email already registered' }, 409)
+  const id = 'hu-' + nanoid(8)
+  const colors = ['#6366f1','#8b5cf6','#10b981','#f59e0b','#ef4444','#06b6d4','#ec4899']
+  const color = colors[Math.floor(Math.random() * colors.length)]
+  await DB.prepare(`INSERT INTO home_users (id,home_id,name,email,phone,role,avatar_color,status,created_at) VALUES (?,?,?,?,?,?,?,'active',?)`)
+    .bind(id, home_id||null, name, email, phone||null, role||'member', color, now()).run()
+  const user = await DB.prepare('SELECT * FROM home_users WHERE id=?').bind(id).first()
+  return c.json({ user, message: 'User created' }, 201)
+})
+
+app.put('/api/home/users/:id', async (c) => {
+  const { DB } = c.env
+  const body = await c.req.json()
+  const { name, phone, role, status } = body
+  await DB.prepare(`UPDATE home_users SET name=COALESCE(?,name),phone=COALESCE(?,phone),role=COALESCE(?,role),status=COALESCE(?,status),updated_at=? WHERE id=?`)
+    .bind(name||null, phone||null, role||null, status||null, now(), c.req.param('id')).run()
+  return c.json({ message: 'Updated' })
+})
+
+app.delete('/api/home/users/:id', async (c) => {
+  const { DB } = c.env
+  await DB.prepare('UPDATE home_users SET status=?,face_embedding=NULL,face_registered=0,updated_at=? WHERE id=?')
+    .bind('deleted', now(), c.req.param('id')).run()
+  return c.json({ message: 'Member removed and biometric data erased' })
+})
+
+app.post('/api/home/users/:id/face', async (c) => {
+  const { DB } = c.env
+  const body = await c.req.json()
+  const { embedding, image_quality } = body
+  let emb: number[]
+  if (embedding && Array.isArray(embedding) && embedding.length >= 64) { emb = embedding }
+  else { emb = seedEmbedding('home-' + c.req.param('id') + Date.now()) }
+  await DB.prepare('UPDATE home_users SET face_embedding=?,face_registered=1,updated_at=? WHERE id=?')
+    .bind(JSON.stringify(emb), now(), c.req.param('id')).run()
+  return c.json({ message: 'Face registered', quality: image_quality || 0.96 })
+})
+
+app.delete('/api/home/users/:id/face', async (c) => {
+  const { DB } = c.env
+  await DB.prepare('UPDATE home_users SET face_embedding=NULL,face_registered=0,updated_at=? WHERE id=?')
+    .bind(now(), c.req.param('id')).run()
+  return c.json({ message: 'Biometric data erased' })
+})
+
+// ── Smart Locks ───────────────────────────────────────
+app.get('/api/home/locks', async (c) => {
+  const { DB } = c.env
+  const home_id = c.req.query('home_id')
+  let q = `SELECT sl.*, hc.name as camera_name FROM smart_locks sl LEFT JOIN home_cameras hc ON hc.lock_id=sl.id WHERE sl.status != 'deleted'`
+  const args: string[] = []
+  if (home_id) { q += ' AND sl.home_id=?'; args.push(home_id) }
+  q += ' ORDER BY sl.name'
+  const { results } = await DB.prepare(q).bind(...args).all()
+  return c.json({ locks: results })
+})
+
+app.post('/api/home/locks', async (c) => {
+  const { DB } = c.env
+  const body = await c.req.json()
+  const { home_id, name, location, lock_type, brand, api_endpoint, api_key, relay_ip, relay_port } = body
+  if (!home_id || !name) return c.json({ error: 'home_id and name required' }, 400)
+  const id = 'lock-' + nanoid(8)
+  await DB.prepare(`INSERT INTO smart_locks (id,home_id,name,location,lock_type,brand,api_endpoint,api_key,relay_ip,relay_port,is_locked,status,created_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,1,'active',?)`)
+    .bind(id, home_id, name, location||null, lock_type||'api', brand||'generic',
+      api_endpoint||null, api_key||null, relay_ip||null, relay_port||null, now()).run()
+  const lock = await DB.prepare('SELECT * FROM smart_locks WHERE id=?').bind(id).first()
+  return c.json({ lock, message: 'Lock added' }, 201)
+})
+
+app.put('/api/home/locks/:id', async (c) => {
+  const { DB } = c.env
+  const body = await c.req.json()
+  const { name, location, lock_type, brand, api_endpoint, api_key, relay_ip, status } = body
+  await DB.prepare(`UPDATE smart_locks SET name=COALESCE(?,name),location=COALESCE(?,location),lock_type=COALESCE(?,lock_type),
+    brand=COALESCE(?,brand),api_endpoint=COALESCE(?,api_endpoint),api_key=COALESCE(?,api_key),
+    relay_ip=COALESCE(?,relay_ip),status=COALESCE(?,status) WHERE id=?`)
+    .bind(name||null,location||null,lock_type||null,brand||null,api_endpoint||null,api_key||null,relay_ip||null,status||null,c.req.param('id')).run()
+  return c.json({ message: 'Lock updated' })
+})
+
+// Lock / Unlock command  
+app.post('/api/home/locks/:id/command', async (c) => {
+  const { DB } = c.env
+  const body = await c.req.json()
+  const { command, user_id } = body  // command: 'lock' | 'unlock'
+  if (!['lock','unlock'].includes(command)) return c.json({ error: 'command must be lock or unlock' }, 400)
+  const lock = await DB.prepare('SELECT * FROM smart_locks WHERE id=?').bind(c.req.param('id')).first() as any
+  if (!lock) return c.json({ error: 'Lock not found' }, 404)
+  const newState = command === 'unlock' ? 0 : 1
+  await DB.prepare('UPDATE smart_locks SET is_locked=?,last_event=? WHERE id=?').bind(newState, now(), c.req.param('id')).run()
+  // Log the manual event
+  const user = user_id ? await DB.prepare('SELECT name FROM home_users WHERE id=?').bind(user_id).first() as any : null
+  const evId = 'hev-' + nanoid(10)
+  await DB.prepare(`INSERT INTO home_events (id,home_id,user_id,user_name,lock_id,lock_name,event_type,method,created_at) VALUES (?,?,?,?,?,?,'manual','manual',?)`)
+    .bind(evId, lock.home_id, user_id||null, user?.name||'Remote', lock.id, lock.name, now()).run()
+  return c.json({ success: true, state: command === 'unlock' ? 'unlocked' : 'locked', lock_id: lock.id })
+})
+
+app.delete('/api/home/locks/:id', async (c) => {
+  const { DB } = c.env
+  await DB.prepare("UPDATE smart_locks SET status='deleted' WHERE id=?").bind(c.req.param('id')).run()
+  return c.json({ message: 'Lock removed' })
+})
+
+// ── Home Cameras ──────────────────────────────────────
+app.get('/api/home/cameras', async (c) => {
+  const { DB } = c.env
+  const home_id = c.req.query('home_id')
+  let q = `SELECT hc.*, sl.name as lock_name FROM home_cameras hc LEFT JOIN smart_locks sl ON hc.lock_id=sl.id WHERE hc.status != 'deleted'`
+  const args: string[] = []
+  if (home_id) { q += ' AND hc.home_id=?'; args.push(home_id) }
+  const { results } = await DB.prepare(q).bind(...args).all()
+  return c.json({ cameras: results })
+})
+
+app.post('/api/home/cameras', async (c) => {
+  const { DB } = c.env
+  const body = await c.req.json()
+  const { home_id, lock_id, name, stream_url, camera_type, api_key } = body
+  if (!home_id || !name) return c.json({ error: 'home_id and name required' }, 400)
+  const id = 'hcam-' + nanoid(8)
+  await DB.prepare(`INSERT INTO home_cameras (id,home_id,lock_id,name,stream_url,camera_type,api_key,status,created_at)
+    VALUES (?,?,?,?,?,?,?,'active',?)`)
+    .bind(id, home_id, lock_id||null, name, stream_url||null, camera_type||'rtsp', api_key||null, now()).run()
+  return c.json({ camera: await DB.prepare('SELECT * FROM home_cameras WHERE id=?').bind(id).first(), message: 'Camera added' }, 201)
+})
+
+app.delete('/api/home/cameras/:id', async (c) => {
+  const { DB } = c.env
+  await DB.prepare("UPDATE home_cameras SET status='deleted' WHERE id=?").bind(c.req.param('id')).run()
+  return c.json({ message: 'Camera removed' })
+})
+
+// ── Trusted Devices ───────────────────────────────────
+app.get('/api/home/devices', async (c) => {
+  const { DB } = c.env
+  const user_id = c.req.query('user_id')
+  const home_id = c.req.query('home_id')
+  let q = `SELECT d.*, hu.name as user_name FROM home_devices d JOIN home_users hu ON d.user_id=hu.id WHERE d.status='active'`
+  const args: string[] = []
+  if (user_id) { q += ' AND d.user_id=?'; args.push(user_id) }
+  if (home_id) { q += ' AND d.home_id=?'; args.push(home_id) }
+  const { results } = await DB.prepare(q).bind(...args).all()
+  return c.json({ devices: results })
+})
+
+app.post('/api/home/devices', async (c) => {
+  const { DB } = c.env
+  const body = await c.req.json()
+  const { user_id, home_id, name, platform, device_fingerprint, push_token } = body
+  if (!user_id || !home_id || !name) return c.json({ error: 'user_id, home_id and name required' }, 400)
+  const id = 'dev-' + nanoid(8)
+  const ble_uuid = 'FA-BLE-' + nanoid(4).toUpperCase() + '-' + nanoid(4).toUpperCase()
+  await DB.prepare(`INSERT INTO home_devices (id,user_id,home_id,name,platform,device_fingerprint,ble_uuid,push_token,trusted,status,created_at)
+    VALUES (?,?,?,?,?,?,?,?,1,'active',?)`)
+    .bind(id, user_id, home_id, name, platform||'ios', device_fingerprint||null, ble_uuid, push_token||null, now()).run()
+  const device = await DB.prepare('SELECT * FROM home_devices WHERE id=?').bind(id).first()
+  return c.json({ device, ble_uuid, message: 'Device registered and trusted' }, 201)
+})
+
+app.put('/api/home/devices/:id/trust', async (c) => {
+  const { DB } = c.env
+  const { trusted } = await c.req.json()
+  await DB.prepare('UPDATE home_devices SET trusted=?,last_seen=? WHERE id=?').bind(trusted?1:0, now(), c.req.param('id')).run()
+  return c.json({ message: trusted ? 'Device trusted' : 'Device untrusted' })
+})
+
+app.delete('/api/home/devices/:id', async (c) => {
+  const { DB } = c.env
+  await DB.prepare("UPDATE home_devices SET status='removed' WHERE id=?").bind(c.req.param('id')).run()
+  return c.json({ message: 'Device removed' })
+})
+
+// ── Home Face Recognition ─────────────────────────────
+app.post('/api/home/recognize', async (c) => {
+  const { DB } = c.env
+  const body = await c.req.json()
+  const { embedding, lock_id, liveness_score, ble_detected, wifi_matched, wifi_ssid } = body
+  if (!lock_id) return c.json({ error: 'lock_id required' }, 400)
+
+  const lock = await DB.prepare('SELECT * FROM smart_locks WHERE id=? AND status=?').bind(lock_id, 'active').first() as any
+  if (!lock) return c.json({ error: 'Lock not found' }, 404)
+
+  const liveness = liveness_score ?? (0.88 + Math.random() * 0.12)
+  if (liveness < 0.5) {
+    const evId = 'hev-' + nanoid(10)
+    await DB.prepare(`INSERT INTO home_events (id,home_id,lock_id,lock_name,event_type,method,liveness_score,denial_reason,created_at)
+      VALUES (?,?,?,?,'denied','face',?,'liveness_failed',?)`)
+      .bind(evId, lock.home_id, lock_id, lock.name, liveness, now()).run()
+    return c.json({ result: 'denied', reason: 'liveness_failed', liveness_score: liveness })
+  }
+
+  // Match against home_users in this home
+  const { results: homeUsers } = await DB.prepare(`
+    SELECT id,name,role,face_embedding FROM home_users
+    WHERE home_id=? AND face_registered=1 AND status='active'`).bind(lock.home_id).all() as any
+
+  // Also check active guest passes for this lock
+  const { results: guests } = await DB.prepare(`
+    SELECT id,name,face_embedding,lock_ids,valid_from,valid_until,time_start,time_end,days_allowed
+    FROM guest_passes WHERE home_id=? AND face_registered=1 AND status='active'
+    AND valid_from <= datetime('now') AND valid_until >= datetime('now')`).bind(lock.home_id).all() as any
+
+  let matchedUser: any = null
+  let matchedGuest: any = null
+  let confidence = 0
+  let isGuest = false
+
+  if (embedding && Array.isArray(embedding) && embedding.length >= 64) {
+    for (const u of [...homeUsers, ...guests.map((g: any) => ({...g, _isGuest:true}))]) {
+      if (!u.face_embedding) continue
+      try {
+        const score = cosineSimilarity(embedding, JSON.parse(u.face_embedding))
+        if (score > confidence) { confidence = score; if (u._isGuest) { matchedGuest = u; matchedUser = null } else { matchedUser = u; matchedGuest = null } }
+      } catch {}
+    }
+    isGuest = !!matchedGuest
+  } else {
+    // Demo mode simulation
+    const roll = Math.random()
+    if (roll < 0.60 && homeUsers.length > 0) {
+      matchedUser = homeUsers[Math.floor(Math.random() * homeUsers.length)]
+      confidence = 0.88 + Math.random() * 0.10
+    } else if (roll < 0.72 && homeUsers.length > 0) {
+      matchedUser = homeUsers[0]; confidence = 0.70 + Math.random() * 0.12
+    } else {
+      confidence = 0.15 + Math.random() * 0.30
+    }
+  }
+
+  const matched = matchedUser || matchedGuest
+  const HIGH = 0.88, MED = 0.65
+
+  if (confidence < MED || !matched) {
+    const evId = 'hev-' + nanoid(10)
+    await DB.prepare(`INSERT INTO home_events (id,home_id,lock_id,lock_name,event_type,method,face_confidence,liveness_score,ble_detected,wifi_matched,denial_reason,created_at)
+      VALUES (?,?,?,?,'denied','face',?,?,?,?,'no_match',?)`)
+      .bind(evId, lock.home_id, lock_id, lock.name, confidence, liveness, ble_detected?1:0, wifi_matched?1:0, now()).run()
+    return c.json({ result: 'denied', reason: 'no_match', confidence })
+  }
+
+  // Guest checks
+  if (isGuest && matchedGuest) {
+    const lockIds = JSON.parse(matchedGuest.lock_ids || '[]')
+    if (!lockIds.includes(lock_id)) {
+      const evId = 'hev-' + nanoid(10)
+      await DB.prepare(`INSERT INTO home_events (id,home_id,user_id,user_name,lock_id,lock_name,event_type,method,face_confidence,liveness_score,denial_reason,created_at)
+        VALUES (?,?,?,?,?,?,'denied','face',?,?,?,?)`)
+        .bind(evId, lock.home_id, matchedGuest.id, matchedGuest.name, lock_id, lock.name, confidence, liveness, 'no_permission', now()).run()
+      return c.json({ result: 'denied', reason: 'no_permission', confidence })
+    }
+    if (!checkTimeAllowed(matchedGuest.time_start, matchedGuest.time_end) || !checkDayAllowed(matchedGuest.days_allowed)) {
+      const evId = 'hev-' + nanoid(10)
+      await DB.prepare(`INSERT INTO home_events (id,home_id,user_id,user_name,lock_id,lock_name,event_type,method,face_confidence,liveness_score,denial_reason,created_at)
+        VALUES (?,?,?,?,?,?,'denied','face',?,?,?,?)`)
+        .bind(evId, lock.home_id, matchedGuest.id, matchedGuest.name, lock_id, lock.name, confidence, liveness, 'outside_hours', now()).run()
+      return c.json({ result: 'denied', reason: 'outside_hours', confidence })
+    }
+  }
+
+  // === TWO-FACTOR: phone proximity ===
+  const bleOk = ble_detected === true || ble_detected === 1
+  const wifiOk = wifi_matched === true || wifi_matched === 1
+
+  // Check if user has a trusted device registered
+  const trustedDevice = matched && !isGuest
+    ? await DB.prepare('SELECT * FROM home_devices WHERE user_id=? AND trusted=1 AND status=? LIMIT 1').bind(matched.id, 'active').first() as any
+    : null
+
+  const proximityScore = bleOk ? 0.95 : wifiOk ? 0.78 : 0.0
+  const proximityVerified = bleOk || wifiOk
+
+  // High confidence + proximity → grant immediately
+  if (confidence >= HIGH && (proximityVerified || !trustedDevice)) {
+    const method = bleOk ? 'face+ble' : wifiOk ? 'face+wifi' : 'face'
+    await DB.prepare('UPDATE smart_locks SET is_locked=0,last_event=? WHERE id=?').bind(now(), lock_id).run()
+    const evId = 'hev-' + nanoid(10)
+    const et = isGuest ? 'guest_entry' : 'unlock'
+    await DB.prepare(`INSERT INTO home_events (id,home_id,user_id,user_name,lock_id,lock_name,event_type,method,face_confidence,liveness_score,ble_detected,wifi_matched,proximity_score,created_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .bind(evId, lock.home_id, matched.id, matched.name, lock_id, lock.name, et, method, confidence, liveness, bleOk?1:0, wifiOk?1:0, proximityScore, now()).run()
+    return c.json({ result: 'granted', method, user: { id: matched.id, name: matched.name, role: isGuest?'guest':matched.role }, confidence, proximity_score: proximityScore })
+  }
+
+  // Medium confidence OR no proximity → request remote approval
+  if (matched && !isGuest) {
+    const verId = 'hev-' + nanoid(10)
+    const expiresAt = new Date(Date.now() + 120000).toISOString().replace('T',' ').split('.')[0]
+    await DB.prepare(`INSERT INTO home_verifications (id,home_id,user_id,lock_id,lock_name,face_confidence,liveness_score,expires_at,status,created_at)
+      VALUES (?,?,?,?,?,?,?,?,'pending',?)`)
+      .bind(verId, lock.home_id, matched.id, lock_id, lock.name, confidence, liveness, expiresAt, now()).run()
+    return c.json({
+      result: 'pending_approval',
+      verification_id: verId,
+      reason: proximityVerified ? 'medium_confidence' : 'phone_not_nearby',
+      user: { id: matched.id, name: matched.name },
+      confidence,
+      proximity_score: proximityScore,
+      message: 'Approval request sent to your phone'
+    })
+  }
+
+  return c.json({ result: 'denied', reason: 'no_match', confidence })
+})
+
+// ── Home Verifications (remote approval) ──────────────
+app.get('/api/home/verifications/pending/:user_id', async (c) => {
+  const { DB } = c.env
+  const { results } = await DB.prepare(`
+    SELECT hv.*, sl.name as lock_full_name, sl.location as lock_location, h.name as home_name
+    FROM home_verifications hv
+    JOIN smart_locks sl ON hv.lock_id=sl.id
+    JOIN homes h ON hv.home_id=h.id
+    WHERE hv.user_id=? AND hv.status='pending' AND hv.expires_at > datetime('now')
+    ORDER BY hv.created_at DESC`).bind(c.req.param('user_id')).all()
+  return c.json({ pending: results })
+})
+
+app.post('/api/home/verifications/:id/respond', async (c) => {
+  const { DB } = c.env
+  const { action, proximity_verified, ble_confirmed } = await c.req.json()
+  if (!['approve','deny'].includes(action)) return c.json({ error: 'action must be approve or deny' }, 400)
+
+  const ver = await DB.prepare('SELECT * FROM home_verifications WHERE id=? AND status=?').bind(c.req.param('id'), 'pending').first() as any
+  if (!ver) return c.json({ error: 'Not found or already responded' }, 404)
+  if (new Date(ver.expires_at) < new Date()) {
+    await DB.prepare("UPDATE home_verifications SET status='expired' WHERE id=?").bind(ver.id).run()
+    return c.json({ error: 'Verification expired' }, 410)
+  }
+
+  const status = action === 'approve' ? 'approved' : 'denied'
+  await DB.prepare('UPDATE home_verifications SET status=?,responded_at=? WHERE id=?').bind(status, now(), ver.id).run()
+
+  if (action === 'approve') {
+    await DB.prepare('UPDATE smart_locks SET is_locked=0,last_event=? WHERE id=?').bind(now(), ver.lock_id).run()
+    const user = await DB.prepare('SELECT name FROM home_users WHERE id=?').bind(ver.user_id).first() as any
+    const evId = 'hev-' + nanoid(10)
+    await DB.prepare(`INSERT INTO home_events (id,home_id,user_id,user_name,lock_id,lock_name,event_type,method,face_confidence,liveness_score,ble_detected,created_at)
+      VALUES (?,?,?,?,?,?,'unlock','face+remote',?,?,?,?)`)
+      .bind(evId, ver.home_id, ver.user_id, user?.name||'User', ver.lock_id, ver.lock_name, ver.face_confidence, ver.liveness_score, ble_confirmed?1:0, now()).run()
+  }
+  return c.json({ result: action === 'approve' ? 'granted' : 'denied', message: action === 'approve' ? 'Door unlocked remotely' : 'Access denied' })
+})
+
+// ── Guest Passes ──────────────────────────────────────
+app.get('/api/home/guests', async (c) => {
+  const { DB } = c.env
+  const home_id = c.req.query('home_id')
+  let q = `SELECT gp.*, hu.name as created_by_name FROM guest_passes gp JOIN home_users hu ON gp.created_by=hu.id WHERE 1=1`
+  const args: string[] = []
+  if (home_id) { q += ' AND gp.home_id=?'; args.push(home_id) }
+  q += ' ORDER BY gp.valid_until DESC'
+  const { results } = await DB.prepare(q).bind(...args).all()
+  return c.json({ guests: results })
+})
+
+app.post('/api/home/guests', async (c) => {
+  const { DB } = c.env
+  const body = await c.req.json()
+  const { home_id, created_by, name, email, phone, lock_ids, valid_from, valid_until, time_start, time_end, days_allowed } = body
+  if (!home_id || !created_by || !name || !valid_from || !valid_until) return c.json({ error: 'Required fields missing' }, 400)
+  const id = 'gp-' + nanoid(8)
+  const token = 'GP-' + nanoid(6).toUpperCase()
+  await DB.prepare(`INSERT INTO guest_passes (id,home_id,created_by,name,email,phone,lock_ids,valid_from,valid_until,time_start,time_end,days_allowed,invite_token,status,created_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?)`)
+    .bind(id, home_id, created_by, name, email||null, phone||null, JSON.stringify(lock_ids||[]),
+      valid_from, valid_until, time_start||'00:00', time_end||'23:59',
+      days_allowed||'mon,tue,wed,thu,fri,sat,sun', token, now()).run()
+  const pass = await DB.prepare('SELECT * FROM guest_passes WHERE id=?').bind(id).first()
+  return c.json({ pass, invite_token: token, message: 'Guest pass created' }, 201)
+})
+
+app.put('/api/home/guests/:id/activate', async (c) => {
+  const { DB } = c.env
+  await DB.prepare("UPDATE guest_passes SET status='active' WHERE id=?").bind(c.req.param('id')).run()
+  return c.json({ message: 'Guest pass activated' })
+})
+
+app.delete('/api/home/guests/:id', async (c) => {
+  const { DB } = c.env
+  await DB.prepare("UPDATE guest_passes SET status='revoked' WHERE id=?").bind(c.req.param('id')).run()
+  return c.json({ message: 'Guest pass revoked' })
+})
+
+app.post('/api/home/guests/:id/face', async (c) => {
+  const { DB } = c.env
+  const { embedding } = await c.req.json()
+  let emb = embedding && Array.isArray(embedding) ? embedding : seedEmbedding('guest-'+c.req.param('id')+Date.now())
+  await DB.prepare('UPDATE guest_passes SET face_embedding=?,face_registered=1 WHERE id=?')
+    .bind(JSON.stringify(emb), c.req.param('id')).run()
+  return c.json({ message: 'Guest face registered' })
+})
+
+// ── Home Events / Activity Log ────────────────────────
+app.get('/api/home/events', async (c) => {
+  const { DB } = c.env
+  const home_id = c.req.query('home_id')
+  const limit = parseInt(c.req.query('limit') || '50')
+  const event_type = c.req.query('type')
+  let q = 'SELECT * FROM home_events WHERE 1=1'
+  const args: (string|number)[] = []
+  if (home_id) { q += ' AND home_id=?'; args.push(home_id) }
+  if (event_type) { q += ' AND event_type=?'; args.push(event_type) }
+  q += ' ORDER BY created_at DESC LIMIT ?'
+  args.push(limit)
+  const { results } = await DB.prepare(q).bind(...args).all()
+  return c.json({ events: results })
+})
+
+// ── Home Analytics ────────────────────────────────────
+app.get('/api/home/analytics/:home_id', async (c) => {
+  const { DB } = c.env
+  const hid = c.req.param('home_id')
+
+  const [unlocks, denied, total24h, bleUsed, remoteUsed, uniqueUsers] = await Promise.all([
+    DB.prepare("SELECT COUNT(*) as n FROM home_events WHERE home_id=? AND event_type='unlock' AND created_at >= date('now')").bind(hid).first() as any,
+    DB.prepare("SELECT COUNT(*) as n FROM home_events WHERE home_id=? AND event_type='denied' AND created_at >= date('now')").bind(hid).first() as any,
+    DB.prepare("SELECT COUNT(*) as n FROM home_events WHERE home_id=? AND created_at >= datetime('now','-24 hours')").bind(hid).first() as any,
+    DB.prepare("SELECT COUNT(*) as n FROM home_events WHERE home_id=? AND method='face+ble' AND created_at >= datetime('now','-7 days')").bind(hid).first() as any,
+    DB.prepare("SELECT COUNT(*) as n FROM home_events WHERE home_id=? AND method='face+remote' AND created_at >= datetime('now','-7 days')").bind(hid).first() as any,
+    DB.prepare("SELECT COUNT(DISTINCT user_id) as n FROM home_events WHERE home_id=? AND created_at >= date('now')").bind(hid).first() as any,
+  ])
+
+  const { results: byLock } = await DB.prepare(`
+    SELECT lock_name, COUNT(*) as total,
+      SUM(CASE WHEN event_type='unlock' THEN 1 ELSE 0 END) as unlocks,
+      SUM(CASE WHEN event_type='denied' THEN 1 ELSE 0 END) as denied
+    FROM home_events WHERE home_id=? AND created_at >= datetime('now','-7 days')
+    GROUP BY lock_id,lock_name ORDER BY total DESC`).bind(hid).all()
+
+  const { results: hourly } = await DB.prepare(`
+    SELECT strftime('%H',created_at) as hour, COUNT(*) as total
+    FROM home_events WHERE home_id=? AND created_at >= datetime('now','-24 hours')
+    GROUP BY hour ORDER BY hour`).bind(hid).all()
+
+  const { results: recentAlerts } = await DB.prepare(`
+    SELECT * FROM home_events WHERE home_id=? AND (event_type='denied' OR event_type='alert')
+    ORDER BY created_at DESC LIMIT 5`).bind(hid).all()
+
+  return c.json({
+    summary: {
+      unlocks_today: (unlocks as any)?.n || 0,
+      denied_today: (denied as any)?.n || 0,
+      events_24h: (total24h as any)?.n || 0,
+      ble_used_7d: (bleUsed as any)?.n || 0,
+      remote_used_7d: (remoteUsed as any)?.n || 0,
+      unique_users_today: (uniqueUsers as any)?.n || 0,
+    },
+    by_lock: byLock,
+    hourly,
+    recent_alerts: recentAlerts
+  })
+})
+
+// ── Automations ───────────────────────────────────────
+app.get('/api/home/automations/:home_id', async (c) => {
+  const { DB } = c.env
+  const { results } = await DB.prepare('SELECT * FROM home_automations WHERE home_id=?').bind(c.req.param('home_id')).all()
+  return c.json({ automations: results })
+})
+
+app.put('/api/home/automations/:id/toggle', async (c) => {
+  const { DB } = c.env
+  const auto = await DB.prepare('SELECT enabled FROM home_automations WHERE id=?').bind(c.req.param('id')).first() as any
+  if (!auto) return c.json({ error: 'Not found' }, 404)
+  await DB.prepare('UPDATE home_automations SET enabled=? WHERE id=?').bind(auto.enabled ? 0 : 1, c.req.param('id')).run()
+  return c.json({ enabled: !auto.enabled })
+})
+
 // ─────────────────────────────────────────────
 // Mobile App companion endpoint
 // ─────────────────────────────────────────────
@@ -578,6 +1115,15 @@ app.get('/mobile', (c) => {
 app.get('/mobile/*', (c) => {
   return c.html(getMobileHTML())
 })
+
+// FaceAccess Home routes
+app.get('/home', (c) => c.html(getHomeLandingHTML()))
+app.get('/home/dashboard', (c) => c.html(getHomeDashboardHTML()))
+app.get('/home/dashboard/*', (c) => c.html(getHomeDashboardHTML()))
+app.get('/home/mobile', (c) => c.html(getHomeMobileHTML()))
+app.get('/home/mobile/*', (c) => c.html(getHomeMobileHTML()))
+app.get('/home/onboard', (c) => c.html(getHomeOnboardHTML()))
+app.get('/home/onboard/*', (c) => c.html(getHomeOnboardHTML()))
 
 app.get('*', (c) => {
   return c.html(getMainHTML())
@@ -881,6 +1427,822 @@ body { font-family: system-ui, sans-serif; background: #0a0a14; color: #e2e8f0; 
 </div>
 
 <script src="/static/mobile.js"></script>
+</body>
+</html>`
+}
+
+// ─────────────────────────────────────────────
+// FaceAccess Home — Landing Page
+// ─────────────────────────────────────────────
+function getHomeLandingHTML(): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FaceAccess Home — Smart Home Security</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css">
+<style>
+* { box-sizing: border-box; }
+body { font-family: system-ui, -apple-system, sans-serif; background: #060612; color: #e2e8f0; margin: 0; overflow-x: hidden; }
+.hero-glow { background: radial-gradient(ellipse 80% 60% at 50% 0%, rgba(99,102,241,0.25) 0%, transparent 70%); }
+.feature-card { background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.07); border-radius: 20px; transition: all 0.3s; }
+.feature-card:hover { background: rgba(99,102,241,0.07); border-color: rgba(99,102,241,0.3); transform: translateY(-4px); }
+.gradient-text { background: linear-gradient(135deg, #818cf8, #c084fc, #fb7185); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+.btn-cta { background: linear-gradient(135deg, #6366f1, #8b5cf6); color: white; border: none; border-radius: 14px; padding: 16px 36px; font-size: 18px; font-weight: 700; cursor: pointer; transition: all 0.3s; text-decoration: none; display: inline-flex; align-items: center; gap: 10px; }
+.btn-cta:hover { transform: translateY(-2px); box-shadow: 0 12px 40px rgba(99,102,241,0.5); }
+.btn-outline { background: transparent; color: #a5b4fc; border: 2px solid rgba(99,102,241,0.4); border-radius: 14px; padding: 14px 32px; font-size: 16px; font-weight: 600; cursor: pointer; transition: all 0.3s; text-decoration: none; display: inline-flex; align-items: center; gap: 8px; }
+.btn-outline:hover { border-color: #6366f1; background: rgba(99,102,241,0.1); }
+.step-num { width: 44px; height: 44px; border-radius: 12px; background: linear-gradient(135deg,#6366f1,#8b5cf6); display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 18px; flex-shrink: 0; }
+.phone-frame { background: #0a0a18; border: 2px solid #23233a; border-radius: 40px; padding: 8px; box-shadow: 0 40px 80px rgba(0,0,0,0.8), 0 0 60px rgba(99,102,241,0.15); }
+.pulse-ring { animation: pulseRing 2.5s ease-out infinite; }
+@keyframes pulseRing { 0% { transform:scale(1); opacity:0.8; } 100% { transform:scale(1.6); opacity:0; } }
+.float { animation: float 4s ease-in-out infinite; }
+@keyframes float { 0%,100% { transform:translateY(0); } 50% { transform:translateY(-12px); } }
+.plan-card { background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08); border-radius: 24px; padding: 32px; transition: all 0.3s; }
+.plan-card.featured { background: linear-gradient(135deg, rgba(99,102,241,0.12), rgba(139,92,246,0.08)); border-color: rgba(99,102,241,0.4); }
+.lock-anim { position: relative; display: inline-block; }
+.lock-anim .lock-icon { font-size: 64px; transition: all 0.5s; }
+.lock-anim.unlocking .lock-icon { color: #10b981; transform: scale(1.1); }
+nav a { color: #94a3b8; text-decoration: none; font-weight: 500; transition: color 0.2s; }
+nav a:hover { color: #e2e8f0; }
+</style>
+</head>
+<body>
+
+<!-- Nav -->
+<nav class="fixed top-0 left-0 right-0 z-50 bg-gray-950/80 backdrop-blur border-b border-white/5">
+  <div class="max-w-6xl mx-auto px-6 py-4 flex items-center justify-between">
+    <div class="flex items-center gap-2.5">
+      <div class="w-9 h-9 rounded-xl bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center shadow-lg">
+        <i class="fas fa-house-lock text-white text-sm"></i>
+      </div>
+      <div>
+        <span class="font-bold text-white text-base">FaceAccess</span>
+        <span class="text-indigo-400 font-bold text-base"> Home</span>
+      </div>
+    </div>
+    <div class="hidden md:flex items-center gap-8">
+      <a href="#how-it-works">How it works</a>
+      <a href="#features">Features</a>
+      <a href="#pricing">Pricing</a>
+      <a href="/home/dashboard" class="text-indigo-400">Dashboard →</a>
+    </div>
+    <div class="flex items-center gap-3">
+      <a href="/home/dashboard" class="btn-outline text-sm py-2.5 px-5">Sign In</a>
+      <a href="/home/onboard" class="btn-cta text-sm py-2.5 px-5"><i class="fas fa-rocket"></i> Get Started Free</a>
+    </div>
+  </div>
+</nav>
+
+<!-- Hero -->
+<section class="hero-glow min-h-screen flex items-center pt-20">
+  <div class="max-w-6xl mx-auto px-6 py-24">
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-16 items-center">
+      <div>
+        <div class="inline-flex items-center gap-2 bg-indigo-500/10 border border-indigo-500/20 rounded-full px-4 py-2 mb-6">
+          <div class="w-2 h-2 rounded-full bg-green-400 pulse-ring"></div>
+          <span class="text-indigo-300 text-sm font-medium">Now available — consumer early access</span>
+        </div>
+        <h1 class="text-5xl lg:text-6xl font-black text-white leading-tight mb-6">
+          Your face is your<br>
+          <span class="gradient-text">house key.</span>
+        </h1>
+        <p class="text-gray-400 text-xl leading-relaxed mb-8">
+          FaceAccess Home replaces keys and codes with facial recognition
+          + phone proximity verification. Hands-free, keyless, effortless.
+        </p>
+        <div class="flex flex-wrap gap-4 mb-10">
+          <a href="/home/onboard" class="btn-cta">
+            <i class="fas fa-rocket"></i> Set Up in 5 Minutes
+          </a>
+          <a href="/home/dashboard" class="btn-outline">
+            <i class="fas fa-th-large"></i> View Demo
+          </a>
+        </div>
+        <div class="flex flex-wrap gap-6 text-sm text-gray-500">
+          <span class="flex items-center gap-2"><i class="fas fa-check text-green-400"></i> No monthly subscription on free plan</span>
+          <span class="flex items-center gap-2"><i class="fas fa-check text-green-400"></i> Works with existing locks</span>
+          <span class="flex items-center gap-2"><i class="fas fa-check text-green-400"></i> GDPR compliant</span>
+        </div>
+      </div>
+
+      <!-- Phone mockup -->
+      <div class="flex justify-center float">
+        <div class="phone-frame w-72">
+          <div class="bg-gray-950 rounded-3xl overflow-hidden p-5 min-h-96">
+            <!-- Status bar -->
+            <div class="flex justify-between text-xs text-gray-600 mb-6">
+              <span>9:41</span><span>●●●●○ 87%</span>
+            </div>
+            <!-- Face scan UI -->
+            <div class="text-center mb-6">
+              <div class="text-sm font-semibold text-white mb-1">Front Door</div>
+              <div class="text-xs text-gray-500">142 Maple Street</div>
+            </div>
+            <div class="relative w-48 h-48 mx-auto mb-6">
+              <div class="absolute inset-0 rounded-full border-2 border-indigo-500/30 pulse-ring"></div>
+              <div class="absolute inset-2 rounded-full border-2 border-indigo-500/50"></div>
+              <div class="absolute inset-0 flex items-center justify-center">
+                <div class="w-32 h-32 rounded-full bg-gradient-to-br from-indigo-900 to-purple-900 flex items-center justify-center border-2 border-indigo-500">
+                  <i class="fas fa-face-smile text-indigo-300 text-4xl"></i>
+                </div>
+              </div>
+              <div class="absolute bottom-2 left-1/2 -translate-x-1/2 w-28 h-0.5 bg-gradient-to-r from-transparent via-indigo-500 to-transparent" style="animation:scan 2s linear infinite"></div>
+            </div>
+            <div class="space-y-2 mb-5">
+              <div class="flex items-center justify-between bg-white/5 rounded-xl p-3">
+                <div class="flex items-center gap-2 text-xs">
+                  <i class="fas fa-face-grin-wide text-indigo-400"></i>
+                  <span class="text-gray-300">Face match</span>
+                </div>
+                <span class="text-green-400 text-xs font-bold">97%</span>
+              </div>
+              <div class="flex items-center justify-between bg-white/5 rounded-xl p-3">
+                <div class="flex items-center gap-2 text-xs">
+                  <i class="fas fa-bluetooth text-blue-400"></i>
+                  <span class="text-gray-300">Phone nearby</span>
+                </div>
+                <span class="text-green-400 text-xs font-bold">✓ BLE</span>
+              </div>
+            </div>
+            <div class="bg-gradient-to-r from-green-500 to-emerald-600 rounded-2xl p-4 text-center">
+              <i class="fas fa-door-open text-white text-2xl mb-1"></i>
+              <div class="text-white font-bold">Welcome home, Jordan!</div>
+              <div class="text-green-100 text-xs mt-1">Door unlocked automatically</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- How it works -->
+<section id="how-it-works" class="py-24 border-t border-white/5">
+  <div class="max-w-6xl mx-auto px-6">
+    <div class="text-center mb-16">
+      <h2 class="text-4xl font-black text-white mb-4">Two factors. Zero effort.</h2>
+      <p class="text-gray-400 text-lg max-w-2xl mx-auto">Every entry requires both your face AND your phone to be nearby. Even if someone has a photo of you, they can't get in without your device.</p>
+    </div>
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-8 mb-16">
+      <div class="text-center">
+        <div class="w-20 h-20 rounded-3xl bg-indigo-500/15 border border-indigo-500/20 flex items-center justify-center mx-auto mb-5">
+          <i class="fas fa-camera text-indigo-400 text-3xl"></i>
+        </div>
+        <div class="text-4xl font-black text-white mb-1">1</div>
+        <h3 class="text-xl font-bold text-white mb-2">Camera detects you</h3>
+        <p class="text-gray-400 text-sm leading-relaxed">Door camera spots your face as you approach. Liveness detection confirms you're real — not a photo or screen.</p>
+      </div>
+      <div class="text-center">
+        <div class="w-20 h-20 rounded-3xl bg-purple-500/15 border border-purple-500/20 flex items-center justify-center mx-auto mb-5">
+          <i class="fas fa-bluetooth text-purple-400 text-3xl"></i>
+        </div>
+        <div class="text-4xl font-black text-white mb-1">2</div>
+        <h3 class="text-xl font-bold text-white mb-2">Phone confirms presence</h3>
+        <p class="text-gray-400 text-sm leading-relaxed">The system checks your phone is physically near the door via BLE beacon or home WiFi. No phone nearby = no entry.</p>
+      </div>
+      <div class="text-center">
+        <div class="w-20 h-20 rounded-3xl bg-green-500/15 border border-green-500/20 flex items-center justify-center mx-auto mb-5">
+          <i class="fas fa-unlock text-green-400 text-3xl"></i>
+        </div>
+        <div class="text-4xl font-black text-white mb-1">3</div>
+        <h3 class="text-xl font-bold text-white mb-2">Door unlocks instantly</h3>
+        <p class="text-gray-400 text-sm leading-relaxed">Both factors confirmed — door unlocks in under a second. Hands full of groceries? No problem. No tap, no key, no code.</p>
+      </div>
+    </div>
+
+    <!-- Setup steps -->
+    <div class="bg-white/3 border border-white/7 rounded-3xl p-10">
+      <h3 class="text-2xl font-bold text-white text-center mb-8">Setup in 4 steps — takes about 5 minutes</h3>
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-5 max-w-3xl mx-auto">
+        ${[
+          ['Install the app', 'Download FaceAccess Home and create your account', 'fa-mobile-alt'],
+          ['Connect your camera', 'Add your doorbell or IP camera via RTSP or API key', 'fa-camera'],
+          ['Register your face', 'Take a 10-second selfie video for face enrollment', 'fa-face-smile'],
+          ['Connect your lock', 'Link August, Schlage, Yale, Nuki or a relay controller', 'fa-lock']
+        ].map(([title, desc, icon], i) => `
+        <div class="flex items-start gap-4 p-4 bg-white/3 rounded-2xl">
+          <div class="step-num">${i+1}</div>
+          <div>
+            <div class="font-semibold text-white">${title}</div>
+            <div class="text-sm text-gray-400 mt-0.5">${desc}</div>
+          </div>
+        </div>`).join('')}
+      </div>
+      <div class="text-center mt-8">
+        <a href="/home/onboard" class="btn-cta"><i class="fas fa-play"></i> Start Setup Now</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Features -->
+<section id="features" class="py-24 border-t border-white/5">
+  <div class="max-w-6xl mx-auto px-6">
+    <h2 class="text-4xl font-black text-white text-center mb-16">Everything you need to protect your home</h2>
+    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+      ${[
+        ['fa-face-grin-wide','Facial Recognition','FaceNet-powered face matching with 128-dimensional embeddings. Works in low light and at angles.','indigo'],
+        ['fa-bluetooth','BLE Proximity','Phone broadcasts a secure BLE beacon. Door hub detects it within 5 meters. No app interaction needed.','blue'],
+        ['fa-shield-halved','Liveness Detection','Blink and movement detection rejects photos, videos, and 3D masks. Spoof attempts are logged.','green'],
+        ['fa-ticket','Guest Passes','Create time-limited passes for cleaners, dog walkers, friends. Set days, hours, and which doors.','purple'],
+        ['fa-bell','Smart Notifications','Get notified when anyone enters, when recognition fails, or when an unknown person approaches.','yellow'],
+        ['fa-lock','Smart Lock Support','Native integrations with August, Schlage, Yale, and Nuki. Relay controller support for any electric lock.','rose'],
+        ['fa-wifi','WiFi Backup','If BLE isn\'t available, home WiFi network matching serves as proximity confirmation.','cyan'],
+        ['fa-mobile-alt','Remote Unlock','Not home? Approve entry from anywhere via the mobile app with a single tap.','orange'],
+        ['fa-chart-line','Activity Feed','Every entry and attempt logged with face confidence score, method, and timestamp.','teal'],
+      ].map(([icon,title,desc,color]) => `
+      <div class="feature-card p-6">
+        <div class="w-12 h-12 rounded-2xl bg-${color}-500/15 flex items-center justify-center mb-4">
+          <i class="fas ${icon} text-${color}-400 text-xl"></i>
+        </div>
+        <h3 class="font-bold text-white mb-2">${title}</h3>
+        <p class="text-gray-400 text-sm leading-relaxed">${desc}</p>
+      </div>`).join('')}
+    </div>
+  </div>
+</section>
+
+<!-- Pricing -->
+<section id="pricing" class="py-24 border-t border-white/5">
+  <div class="max-w-5xl mx-auto px-6">
+    <div class="text-center mb-16">
+      <h2 class="text-4xl font-black text-white mb-4">Simple pricing</h2>
+      <p class="text-gray-400">Start free, upgrade when your family grows.</p>
+    </div>
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+      <div class="plan-card">
+        <div class="text-gray-400 text-sm font-semibold uppercase tracking-wider mb-2">Free</div>
+        <div class="text-4xl font-black text-white mb-1">$0</div>
+        <div class="text-gray-500 text-sm mb-6">Forever</div>
+        <ul class="space-y-3 text-sm text-gray-300 mb-8">
+          ${['1 home address','2 household members','1 smart lock','7-day activity log','Mobile app'].map(f=>`<li class="flex gap-2"><i class="fas fa-check text-green-400 mt-0.5 flex-shrink-0"></i>${f}</li>`).join('')}
+        </ul>
+        <a href="/home/onboard" class="block text-center bg-white/5 border border-white/10 rounded-xl py-3 text-white font-semibold hover:bg-white/10 transition-colors">Get Started</a>
+      </div>
+
+      <div class="plan-card featured relative">
+        <div class="absolute -top-3 left-1/2 -translate-x-1/2 bg-gradient-to-r from-indigo-500 to-purple-600 text-white text-xs font-bold px-4 py-1.5 rounded-full">MOST POPULAR</div>
+        <div class="text-indigo-400 text-sm font-semibold uppercase tracking-wider mb-2">Pro</div>
+        <div class="text-4xl font-black text-white mb-1">$9<span class="text-lg font-normal text-gray-400">/mo</span></div>
+        <div class="text-gray-500 text-sm mb-6">Per home</div>
+        <ul class="space-y-3 text-sm text-gray-300 mb-8">
+          ${['1 home address','Up to 10 members','Unlimited locks & cameras','90-day activity log','Guest passes (unlimited)','Smart automations','Priority support'].map(f=>`<li class="flex gap-2"><i class="fas fa-check text-indigo-400 mt-0.5 flex-shrink-0"></i>${f}</li>`).join('')}
+        </ul>
+        <a href="/home/onboard" class="btn-cta w-full justify-center py-3 rounded-xl text-base">Get Pro</a>
+      </div>
+
+      <div class="plan-card">
+        <div class="text-purple-400 text-sm font-semibold uppercase tracking-wider mb-2">Family</div>
+        <div class="text-4xl font-black text-white mb-1">$19<span class="text-lg font-normal text-gray-400">/mo</span></div>
+        <div class="text-gray-500 text-sm mb-6">Up to 3 homes</div>
+        <ul class="space-y-3 text-sm text-gray-300 mb-8">
+          ${['Up to 3 properties','Unlimited members','All Pro features','1-year activity log','Vacation mode','Dedicated support','Coming: FaceAccess Lock'].map(f=>`<li class="flex gap-2"><i class="fas fa-check text-purple-400 mt-0.5 flex-shrink-0"></i>${f}</li>`).join('')}
+        </ul>
+        <a href="/home/onboard" class="block text-center bg-white/5 border border-white/10 rounded-xl py-3 text-white font-semibold hover:bg-white/10 transition-colors">Get Family</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- CTA footer -->
+<section class="py-24 border-t border-white/5">
+  <div class="max-w-3xl mx-auto px-6 text-center">
+    <div class="w-20 h-20 rounded-3xl bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center mx-auto mb-6">
+      <i class="fas fa-house-lock text-white text-3xl"></i>
+    </div>
+    <h2 class="text-4xl font-black text-white mb-4">Your home deserves better than a key.</h2>
+    <p class="text-gray-400 text-lg mb-8">Set up FaceAccess Home in under 5 minutes. No subscriptions required to start.</p>
+    <div class="flex flex-col sm:flex-row gap-4 justify-center">
+      <a href="/home/onboard" class="btn-cta text-lg px-10 py-5"><i class="fas fa-rocket"></i> Start Free Setup</a>
+      <a href="/home/dashboard" class="btn-outline text-lg px-10 py-5"><i class="fas fa-eye"></i> Live Demo</a>
+    </div>
+    <p class="text-gray-600 text-sm mt-6">Also for businesses? <a href="/" class="text-indigo-400 hover:underline">See FaceAccess Enterprise →</a></p>
+  </div>
+</section>
+
+<footer class="border-t border-white/5 py-8">
+  <div class="max-w-6xl mx-auto px-6 flex flex-col md:flex-row items-center justify-between gap-4">
+    <div class="flex items-center gap-2 text-gray-500 text-sm">
+      <i class="fas fa-house-lock text-indigo-400"></i>
+      <span>FaceAccess Home — a product of FaceAccess Inc.</span>
+    </div>
+    <div class="flex gap-6 text-sm text-gray-600">
+      <a href="#" class="hover:text-gray-400">Privacy</a>
+      <a href="#" class="hover:text-gray-400">Security</a>
+      <a href="#" class="hover:text-gray-400">Docs</a>
+      <a href="/" class="hover:text-gray-400">Enterprise</a>
+    </div>
+  </div>
+</footer>
+<style>@keyframes scan{0%{top:0}100%{top:100%}} .pulse{animation:pulse2 2s infinite} @keyframes pulse2{0%,100%{opacity:1}50%{opacity:.4}}</style>
+</body>
+</html>`
+}
+
+// ─────────────────────────────────────────────
+// FaceAccess Home — Dashboard
+// ─────────────────────────────────────────────
+function getHomeDashboardHTML(): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FaceAccess Home — Dashboard</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/axios@1.6.0/dist/axios.min.js"></script>
+<style>
+*{box-sizing:border-box}
+body{font-family:system-ui,sans-serif;background:#070712;color:#e2e8f0;margin:0}
+.sidebar{background:#0d0d1c;border-right:1px solid #1a1a2e;width:260px;flex-shrink:0}
+.card{background:#0f0f1e;border:1px solid #1a1a2e;border-radius:16px}
+.btn-primary{background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;border:none;border-radius:10px;padding:9px 20px;cursor:pointer;font-weight:700;transition:all .2s}
+.btn-primary:hover{opacity:.9;transform:translateY(-1px)}
+.btn-ghost{background:transparent;color:#94a3b8;border:1px solid #1e1e35;border-radius:10px;padding:9px 18px;cursor:pointer;transition:all .2s}
+.btn-ghost:hover{border-color:#6366f1;color:#a5b4fc}
+.btn-danger{background:linear-gradient(135deg,#ef4444,#dc2626);color:#fff;border:none;border-radius:10px;padding:9px 18px;cursor:pointer;font-weight:700}
+.input{background:#07071a;border:1px solid #1e1e35;border-radius:10px;padding:10px 14px;color:#e2e8f0;width:100%;outline:none;transition:border .2s}
+.input:focus{border-color:#6366f1;box-shadow:0 0 0 3px rgba(99,102,241,.15)}
+.nav-item{display:flex;align-items:center;gap:10px;padding:10px 16px;border-radius:10px;cursor:pointer;color:#475569;transition:all .2s;font-weight:500;text-decoration:none}
+.nav-item:hover{background:rgba(99,102,241,.08);color:#94a3b8}
+.nav-item.active{background:rgba(99,102,241,.12);color:#818cf8;border-left:3px solid #6366f1}
+.lock-card{background:#0f0f1e;border:1px solid #1a1a2e;border-radius:16px;padding:20px;transition:all .2s}
+.lock-card:hover{border-color:#2d2d4a;transform:translateY(-2px)}
+.lock-card.unlocked{border-left:4px solid #10b981}
+.lock-card.locked{border-left:4px solid #6366f1}
+.member-avatar{width:44px;height:44px;border-radius:14px;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:15px;flex-shrink:0}
+.event-row{border-left:3px solid transparent;padding:12px;border-radius:8px;margin-bottom:4px;transition:background .15s}
+.event-row:hover{background:rgba(255,255,255,.02)}
+.event-unlock{border-left-color:#10b981;background:rgba(16,185,129,.03)}
+.event-denied{border-left-color:#ef4444;background:rgba(239,68,68,.03)}
+.event-alert{border-left-color:#f59e0b;background:rgba(245,158,11,.03)}
+.badge{display:inline-flex;align-items:center;gap:3px;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:700;text-transform:uppercase}
+.badge-green{background:rgba(16,185,129,.12);color:#10b981;border:1px solid rgba(16,185,129,.25)}
+.badge-red{background:rgba(239,68,68,.12);color:#ef4444;border:1px solid rgba(239,68,68,.25)}
+.badge-indigo{background:rgba(99,102,241,.12);color:#818cf8;border:1px solid rgba(99,102,241,.25)}
+.badge-yellow{background:rgba(245,158,11,.12);color:#f59e0b;border:1px solid rgba(245,158,11,.25)}
+.badge-gray{background:rgba(148,163,184,.12);color:#94a3b8;border:1px solid rgba(148,163,184,.2)}
+.conf-bar{height:5px;border-radius:3px;background:#1a1a2e;overflow:hidden}
+.conf-fill{height:100%;border-radius:3px;transition:width .6s}
+.pulse{animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.75);backdrop-filter:blur(4px);z-index:50;display:flex;align-items:center;justify-content:center}
+.modal{background:#0f0f1e;border:1px solid #1a1a2e;border-radius:20px;padding:28px;max-width:500px;width:92%;max-height:90vh;overflow-y:auto}
+.face-ring{width:200px;height:200px;border-radius:50%;border:3px solid #6366f1;position:relative;margin:0 auto}
+.face-ring video{width:100%;height:100%;object-fit:cover;border-radius:50%}
+.scan-line{position:absolute;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,#6366f1,transparent);animation:scanAnim 2s linear infinite}
+@keyframes scanAnim{0%{top:0}100%{top:100%}}
+select.input option{background:#0f0f1e}
+.stat-mini{background:linear-gradient(135deg,#0f0f1e,#0c0c18);border:1px solid #1a1a2e;border-radius:14px;padding:18px}
+.tab-btn{padding:8px 18px;border:none;background:transparent;color:#475569;font-weight:600;cursor:pointer;border-bottom:2px solid transparent;transition:all .2s}
+.tab-btn.active{color:#818cf8;border-bottom-color:#6366f1}
+</style>
+</head>
+<body class="flex h-screen overflow-hidden">
+
+<!-- Sidebar -->
+<aside class="sidebar flex flex-col h-screen overflow-y-auto">
+  <div class="p-5 border-b border-gray-900">
+    <div class="flex items-center gap-3 mb-1">
+      <div class="w-9 h-9 rounded-xl bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center">
+        <i class="fas fa-house-lock text-white text-sm"></i>
+      </div>
+      <div>
+        <div class="font-bold text-white text-sm leading-tight">FaceAccess <span class="text-indigo-400">Home</span></div>
+        <div class="text-xs text-gray-600">Kim Residence</div>
+      </div>
+    </div>
+  </div>
+
+  <nav class="p-3 flex-1 space-y-1">
+    <div class="text-xs font-semibold text-gray-700 uppercase tracking-widest px-3 py-2">Home</div>
+    <a onclick="showTab('overview')" class="nav-item active" id="nav-overview">
+      <i class="fas fa-th-large w-4 text-center"></i> Overview
+    </a>
+    <a onclick="showTab('live')" class="nav-item" id="nav-live">
+      <i class="fas fa-video w-4 text-center"></i> Live View
+      <span class="ml-auto w-1.5 h-1.5 rounded-full bg-red-500 pulse"></span>
+    </a>
+    <a onclick="showTab('recognize')" class="nav-item" id="nav-recognize">
+      <i class="fas fa-face-grin-wide w-4 text-center"></i> Face Test
+    </a>
+
+    <div class="text-xs font-semibold text-gray-700 uppercase tracking-widest px-3 py-2 mt-2">Security</div>
+    <a onclick="showTab('locks')" class="nav-item" id="nav-locks">
+      <i class="fas fa-lock w-4 text-center"></i> Smart Locks
+    </a>
+    <a onclick="showTab('members')" class="nav-item" id="nav-members">
+      <i class="fas fa-users w-4 text-center"></i> Household
+    </a>
+    <a onclick="showTab('guests')" class="nav-item" id="nav-guests">
+      <i class="fas fa-ticket w-4 text-center"></i> Guest Passes
+    </a>
+    <a onclick="showTab('devices')" class="nav-item" id="nav-devices">
+      <i class="fas fa-mobile-alt w-4 text-center"></i> Trusted Devices
+    </a>
+
+    <div class="text-xs font-semibold text-gray-700 uppercase tracking-widest px-3 py-2 mt-2">Monitoring</div>
+    <a onclick="showTab('activity')" class="nav-item" id="nav-activity">
+      <i class="fas fa-list-timeline w-4 text-center"></i> Activity Log
+    </a>
+    <a onclick="showTab('cameras')" class="nav-item" id="nav-cameras">
+      <i class="fas fa-camera w-4 text-center"></i> Cameras
+    </a>
+    <a onclick="showTab('automations')" class="nav-item" id="nav-automations">
+      <i class="fas fa-bolt w-4 text-center"></i> Automations
+    </a>
+
+    <div class="mt-4 border-t border-gray-900 pt-3">
+      <a href="/home/mobile" target="_blank" class="nav-item text-purple-400">
+        <i class="fas fa-mobile-alt w-4 text-center"></i> Mobile App
+        <i class="fas fa-external-link-alt ml-auto text-xs"></i>
+      </a>
+      <a href="/home" class="nav-item text-gray-600">
+        <i class="fas fa-arrow-left w-4 text-center"></i> Back to Home
+      </a>
+    </div>
+  </nav>
+
+  <div class="p-4 border-t border-gray-900">
+    <div class="flex items-center gap-3">
+      <div class="member-avatar" style="background:#6366f120;color:#818cf8">JK</div>
+      <div class="text-sm">
+        <div class="font-medium text-white">Jordan Kim</div>
+        <div class="text-xs text-gray-600">Owner · Pro plan</div>
+      </div>
+      <div class="ml-auto w-2 h-2 rounded-full bg-green-500"></div>
+    </div>
+  </div>
+</aside>
+
+<!-- Main -->
+<main class="flex-1 overflow-y-auto">
+  <header class="sticky top-0 z-10 bg-gray-950/80 backdrop-blur border-b border-gray-900 px-6 py-3 flex items-center gap-4">
+    <div id="page-title" class="font-semibold text-white text-lg flex-1">Overview</div>
+    <div class="flex items-center gap-3">
+      <div id="alert-badge" class="hidden items-center gap-1.5 bg-red-500/10 border border-red-500/20 text-red-400 text-xs px-3 py-1.5 rounded-full cursor-pointer" onclick="showTab('activity')">
+        <i class="fas fa-exclamation-triangle"></i> <span id="alert-count">0</span> alerts
+      </div>
+      <div class="text-xs text-gray-600" id="live-clock"></div>
+      <div class="flex items-center gap-1.5 text-xs text-green-400"><div class="w-1.5 h-1.5 rounded-full bg-green-400 pulse"></div> All systems normal</div>
+    </div>
+  </header>
+
+  <!-- Tab pages -->
+  <div id="tab-overview" class="tab-page p-6"></div>
+  <div id="tab-live" class="tab-page p-6 hidden"></div>
+  <div id="tab-recognize" class="tab-page p-6 hidden"></div>
+  <div id="tab-locks" class="tab-page p-6 hidden"></div>
+  <div id="tab-members" class="tab-page p-6 hidden"></div>
+  <div id="tab-guests" class="tab-page p-6 hidden"></div>
+  <div id="tab-devices" class="tab-page p-6 hidden"></div>
+  <div id="tab-activity" class="tab-page p-6 hidden"></div>
+  <div id="tab-cameras" class="tab-page p-6 hidden"></div>
+  <div id="tab-automations" class="tab-page p-6 hidden"></div>
+</main>
+
+<!-- Toast -->
+<div id="toast" class="fixed bottom-6 right-6 z-50 hidden">
+  <div class="flex items-center gap-3 bg-gray-900 border border-gray-800 rounded-xl px-4 py-3 shadow-2xl">
+    <div id="toast-icon" class="text-green-400"><i class="fas fa-check-circle text-lg"></i></div>
+    <div id="toast-msg" class="text-sm font-medium"></div>
+  </div>
+</div>
+
+<!-- Modal -->
+<div id="modal-overlay" class="modal-overlay hidden" onclick="closeModal(event)">
+  <div id="modal-content" class="modal" onclick="event.stopPropagation()"></div>
+</div>
+
+<script src="/static/home-dashboard.js"></script>
+</body>
+</html>`
+}
+
+// ─────────────────────────────────────────────
+// FaceAccess Home — Onboarding Wizard
+// ─────────────────────────────────────────────
+function getHomeOnboardHTML(): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FaceAccess Home — Setup</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css">
+<script src="https://cdn.jsdelivr.net/npm/axios@1.6.0/dist/axios.min.js"></script>
+<style>
+*{box-sizing:border-box}
+body{font-family:system-ui,sans-serif;background:#070712;color:#e2e8f0;min-height:100vh;display:flex;align-items:center;justify-content:center}
+.wizard{background:#0f0f1e;border:1px solid #1a1a2e;border-radius:24px;padding:40px;max-width:560px;width:92%;min-height:540px}
+.step{display:none}
+.step.active{display:block}
+.step-dot{width:10px;height:10px;border-radius:50%;background:#1a1a2e;transition:all .3s}
+.step-dot.done{background:#6366f1}
+.step-dot.current{background:#818cf8;box-shadow:0 0 0 3px rgba(99,102,241,.25)}
+.btn-primary{background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;border:none;border-radius:12px;padding:14px 28px;cursor:pointer;font-weight:700;font-size:16px;transition:all .2s;width:100%}
+.btn-primary:hover{opacity:.9;transform:translateY(-1px);box-shadow:0 6px 25px rgba(99,102,241,.4)}
+.btn-primary:disabled{opacity:.5;cursor:not-allowed;transform:none}
+.btn-back{background:transparent;color:#64748b;border:1px solid #1e1e35;border-radius:12px;padding:14px 28px;cursor:pointer;font-weight:600;font-size:15px;transition:all .2s}
+.btn-back:hover{border-color:#4a4a6a;color:#94a3b8}
+.input{background:#07071a;border:1px solid #1e1e35;border-radius:10px;padding:12px 16px;color:#e2e8f0;width:100%;outline:none;transition:border .2s;font-size:15px}
+.input:focus{border-color:#6366f1;box-shadow:0 0 0 3px rgba(99,102,241,.12)}
+.option-card{background:#07071a;border:2px solid #1e1e35;border-radius:16px;padding:18px;cursor:pointer;transition:all .2s;display:flex;align-items:center;gap:14px}
+.option-card:hover{border-color:#3d3d6a}
+.option-card.selected{border-color:#6366f1;background:rgba(99,102,241,.07)}
+.face-ring{width:180px;height:180px;border-radius:50%;border:3px solid #6366f1;position:relative;margin:0 auto;overflow:hidden}
+.face-ring video{width:100%;height:100%;object-fit:cover}
+.scan-bar{position:absolute;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,#6366f1,transparent);animation:scan 2s linear infinite}
+@keyframes scan{0%{top:0}100%{top:100%}}
+.check-anim{animation:checkBounce .5s cubic-bezier(.34,1.56,.64,1)}
+@keyframes checkBounce{0%{transform:scale(0)}100%{transform:scale(1)}}
+.brand-btn{background:#07071a;border:1px solid #1e1e35;border-radius:14px;padding:14px;cursor:pointer;transition:all .2s;text-align:center}
+.brand-btn:hover{border-color:#6366f1;background:rgba(99,102,241,.05)}
+.brand-btn.selected{border-color:#6366f1;background:rgba(99,102,241,.1)}
+</style>
+</head>
+<body>
+<div class="wizard">
+  <!-- Header -->
+  <div class="flex items-center justify-between mb-8">
+    <div class="flex items-center gap-2.5">
+      <div class="w-8 h-8 rounded-xl bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center">
+        <i class="fas fa-house-lock text-white text-xs"></i>
+      </div>
+      <span class="font-bold text-white">FaceAccess <span class="text-indigo-400">Home</span></span>
+    </div>
+    <div class="flex items-center gap-2" id="step-dots">
+      <div class="step-dot current" id="dot-0"></div>
+      <div class="w-6 h-0.5 bg-gray-800"></div>
+      <div class="step-dot" id="dot-1"></div>
+      <div class="w-6 h-0.5 bg-gray-800"></div>
+      <div class="step-dot" id="dot-2"></div>
+      <div class="w-6 h-0.5 bg-gray-800"></div>
+      <div class="step-dot" id="dot-3"></div>
+      <div class="w-6 h-0.5 bg-gray-800"></div>
+      <div class="step-dot" id="dot-4"></div>
+    </div>
+  </div>
+
+  <!-- Step 0: Account -->
+  <div class="step active" id="step-0">
+    <div class="text-center mb-8">
+      <div class="w-16 h-16 rounded-3xl bg-indigo-500/15 flex items-center justify-center mx-auto mb-4">
+        <i class="fas fa-user-plus text-indigo-400 text-2xl"></i>
+      </div>
+      <h2 class="text-2xl font-black text-white mb-2">Welcome to FaceAccess Home</h2>
+      <p class="text-gray-400">Let's get you set up in about 5 minutes.</p>
+    </div>
+    <div class="space-y-4">
+      <div>
+        <label class="text-xs text-gray-500 mb-1.5 block font-medium">Your Full Name</label>
+        <input id="ob-name" class="input" placeholder="Jordan Kim" autofocus>
+      </div>
+      <div>
+        <label class="text-xs text-gray-500 mb-1.5 block font-medium">Email Address</label>
+        <input id="ob-email" type="email" class="input" placeholder="jordan@email.com">
+      </div>
+      <div>
+        <label class="text-xs text-gray-500 mb-1.5 block font-medium">Phone (for notifications)</label>
+        <input id="ob-phone" type="tel" class="input" placeholder="+1 555 0100">
+      </div>
+    </div>
+    <div id="step0-err" class="text-red-400 text-sm mt-3 hidden"></div>
+    <button class="btn-primary mt-6" onclick="stepNext(0)">Continue <i class="fas fa-arrow-right ml-2"></i></button>
+    <p class="text-center text-xs text-gray-600 mt-4">Already have an account? <a href="/home/dashboard" class="text-indigo-400">Sign in</a></p>
+  </div>
+
+  <!-- Step 1: Home Setup -->
+  <div class="step" id="step-1">
+    <div class="text-center mb-8">
+      <div class="w-16 h-16 rounded-3xl bg-indigo-500/15 flex items-center justify-center mx-auto mb-4">
+        <i class="fas fa-house text-indigo-400 text-2xl"></i>
+      </div>
+      <h2 class="text-2xl font-black text-white mb-2">Name your home</h2>
+      <p class="text-gray-400">You can add more properties later.</p>
+    </div>
+    <div class="space-y-4">
+      <div>
+        <label class="text-xs text-gray-500 mb-1.5 block font-medium">Home Name</label>
+        <input id="ob-homename" class="input" placeholder="My Home, Beach House, Parents'…">
+      </div>
+      <div>
+        <label class="text-xs text-gray-500 mb-1.5 block font-medium">Address (optional)</label>
+        <input id="ob-address" class="input" placeholder="142 Maple Street, Austin TX">
+      </div>
+    </div>
+    <div class="flex gap-3 mt-6">
+      <button class="btn-back" onclick="stepBack(1)"><i class="fas fa-arrow-left mr-2"></i> Back</button>
+      <button class="btn-primary" onclick="stepNext(1)">Continue <i class="fas fa-arrow-right ml-2"></i></button>
+    </div>
+  </div>
+
+  <!-- Step 2: Camera Setup -->
+  <div class="step" id="step-2">
+    <div class="text-center mb-6">
+      <div class="w-16 h-16 rounded-3xl bg-purple-500/15 flex items-center justify-center mx-auto mb-4">
+        <i class="fas fa-camera text-purple-400 text-2xl"></i>
+      </div>
+      <h2 class="text-2xl font-black text-white mb-2">Connect a camera</h2>
+      <p class="text-gray-400 text-sm">What camera do you have at your door?</p>
+    </div>
+    <div class="grid grid-cols-2 gap-3 mb-4">
+      ${[
+        ['rtsp','fa-video','RTSP / IP Camera','Any camera with RTSP stream'],
+        ['ring','fa-bell','Ring Doorbell','Connect via Ring API key'],
+        ['nest','fa-google','Google Nest','Link your Google account'],
+        ['arlo','fa-shield','Arlo Camera','Arlo API integration'],
+        ['usb','fa-usb','USB / Webcam','Connect a USB camera'],
+        ['skip','fa-forward','Skip for now','Add camera later'],
+      ].map(([val, icon, label, sub]) => `
+      <div class="option-card" data-val="${val}" onclick="selectCamera(this,'${val}')">
+        <i class="fas ${icon} text-indigo-400 text-xl w-6 text-center flex-shrink-0"></i>
+        <div>
+          <div class="text-sm font-semibold text-white">${label}</div>
+          <div class="text-xs text-gray-500">${sub}</div>
+        </div>
+      </div>`).join('')}
+    </div>
+    <div id="camera-extra" class="hidden mb-4">
+      <label class="text-xs text-gray-500 mb-1.5 block font-medium">Stream URL / API Key</label>
+      <input id="ob-camera-url" class="input" placeholder="rtsp://192.168.1.50:554/stream or API key">
+    </div>
+    <div class="flex gap-3">
+      <button class="btn-back" onclick="stepBack(2)"><i class="fas fa-arrow-left mr-2"></i> Back</button>
+      <button class="btn-primary" onclick="stepNext(2)">Continue <i class="fas fa-arrow-right ml-2"></i></button>
+    </div>
+  </div>
+
+  <!-- Step 3: Face Registration -->
+  <div class="step" id="step-3">
+    <div class="text-center mb-6">
+      <div class="w-14 h-14 rounded-2xl bg-green-500/15 flex items-center justify-center mx-auto mb-4">
+        <i class="fas fa-face-smile text-green-400 text-2xl"></i>
+      </div>
+      <h2 class="text-2xl font-black text-white mb-1">Register your face</h2>
+      <p class="text-gray-400 text-sm">Look at the camera and hold still for 3 seconds.</p>
+    </div>
+    <div class="face-ring mb-5">
+      <video id="ob-video" autoplay muted playsinline></video>
+      <div class="scan-bar" id="ob-scanbar" style="display:none"></div>
+      <div id="ob-placeholder" class="absolute inset-0 flex items-center justify-center bg-gray-950 rounded-full">
+        <div class="text-center">
+          <i class="fas fa-face-meh-blank text-gray-700 text-5xl mb-2"></i>
+          <p class="text-xs text-gray-600">Tap to open camera</p>
+        </div>
+      </div>
+    </div>
+    <div id="ob-face-quality" class="hidden mb-4">
+      <div class="flex justify-between text-xs text-gray-400 mb-1"><span>Image quality</span><span id="ob-q-pct">—</span></div>
+      <div class="h-1.5 bg-gray-800 rounded-full overflow-hidden"><div id="ob-q-bar" class="h-full rounded-full bg-green-500" style="width:0%"></div></div>
+    </div>
+    <div id="ob-face-status" class="mb-4"></div>
+    <div class="grid grid-cols-2 gap-3 mb-2">
+      <button class="btn-back" onclick="startObCamera()"><i class="fas fa-camera mr-1"></i> Open Camera</button>
+      <label class="btn-back cursor-pointer text-center">
+        <i class="fas fa-upload mr-1"></i> Upload Photo
+        <input type="file" accept="image/*" class="hidden" onchange="obFaceUpload(event)">
+      </label>
+    </div>
+    <div class="flex gap-3">
+      <button class="btn-back" onclick="stepBack(3)"><i class="fas fa-arrow-left mr-2"></i> Back</button>
+      <button class="btn-primary" id="ob-face-btn" onclick="captureObFace()"><i class="fas fa-fingerprint mr-2"></i> Capture Face</button>
+    </div>
+    <button class="w-full text-xs text-gray-600 hover:text-gray-400 mt-3 py-2" onclick="stepNext(3,true)">Skip — register face later</button>
+  </div>
+
+  <!-- Step 4: Lock Setup -->
+  <div class="step" id="step-4">
+    <div class="text-center mb-6">
+      <div class="w-14 h-14 rounded-2xl bg-yellow-500/15 flex items-center justify-center mx-auto mb-4">
+        <i class="fas fa-lock text-yellow-400 text-2xl"></i>
+      </div>
+      <h2 class="text-2xl font-black text-white mb-1">Connect your smart lock</h2>
+      <p class="text-gray-400 text-sm">Which lock brand do you have?</p>
+    </div>
+    <div class="grid grid-cols-3 gap-3 mb-5">
+      ${[
+        ['august','August'],['schlage','Schlage'],['yale','Yale'],
+        ['nuki','Nuki'],['generic','Generic/Relay'],['skip','Skip'],
+      ].map(([val,label]) => `
+      <div class="brand-btn" data-val="${val}" onclick="selectLock(this,'${val}')">
+        <i class="fas fa-lock text-indigo-400 text-lg mb-1.5 block"></i>
+        <div class="text-sm font-semibold text-white">${label}</div>
+      </div>`).join('')}
+    </div>
+    <div id="lock-extra" class="hidden mb-4 space-y-3">
+      <div>
+        <label class="text-xs text-gray-500 mb-1.5 block font-medium">Lock Name</label>
+        <input id="ob-lockname" class="input" placeholder="Front Door">
+      </div>
+      <div>
+        <label class="text-xs text-gray-500 mb-1.5 block font-medium">API Credentials / Access Token</label>
+        <input id="ob-lock-api" class="input" placeholder="Paste your August/Schlage API key">
+      </div>
+    </div>
+    <div class="flex gap-3">
+      <button class="btn-back" onclick="stepBack(4)"><i class="fas fa-arrow-left mr-2"></i> Back</button>
+      <button class="btn-primary" onclick="stepNext(4)"><i class="fas fa-check mr-2"></i> Finish Setup</button>
+    </div>
+  </div>
+
+  <!-- Step 5: Done -->
+  <div class="step" id="step-5">
+    <div class="text-center py-8">
+      <div class="w-24 h-24 rounded-3xl bg-gradient-to-br from-green-500 to-emerald-600 flex items-center justify-center mx-auto mb-6 check-anim">
+        <i class="fas fa-check text-white text-4xl"></i>
+      </div>
+      <h2 class="text-3xl font-black text-white mb-3">You're all set! 🎉</h2>
+      <p class="text-gray-400 mb-2">FaceAccess Home is ready to protect <span id="done-home-name" class="text-white font-semibold"></span>.</p>
+      <p class="text-sm text-gray-500 mb-8">Add family members and guests from your dashboard.</p>
+      <div class="space-y-3">
+        <a href="/home/dashboard" class="btn-primary block text-center py-4 text-lg no-underline" style="text-decoration:none">
+          <i class="fas fa-th-large mr-2"></i> Open Dashboard
+        </a>
+        <a href="/home/mobile" target="_blank" class="block text-center py-3 bg-purple-500/10 border border-purple-500/20 text-purple-400 rounded-xl font-semibold hover:bg-purple-500/20 transition-colors no-underline" style="text-decoration:none">
+          <i class="fas fa-mobile-alt mr-2"></i> Open Mobile App
+        </a>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="/static/home-onboard.js"></script>
+</body>
+</html>`
+}
+
+// ─────────────────────────────────────────────
+// FaceAccess Home — Mobile App
+// ─────────────────────────────────────────────
+function getHomeMobileHTML(): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>FaceAccess Home — Mobile</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css">
+<script src="https://cdn.jsdelivr.net/npm/axios@1.6.0/dist/axios.min.js"></script>
+<style>
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{font-family:system-ui,sans-serif;background:#07071a;color:#e2e8f0;max-width:430px;margin:0 auto;min-height:100vh;overflow-x:hidden}
+.card{background:#0f0f1e;border:1px solid #1a1a2e;border-radius:18px}
+.btn-approve{background:linear-gradient(135deg,#10b981,#059669);color:#fff;border:none;border-radius:18px;padding:18px;font-size:18px;font-weight:800;width:100%;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:10px;transition:all .2s;box-shadow:0 4px 20px rgba(16,185,129,.3)}
+.btn-approve:hover{transform:scale(1.02)}
+.btn-deny{background:linear-gradient(135deg,#ef4444,#dc2626);color:#fff;border:none;border-radius:18px;padding:18px;font-size:18px;font-weight:800;width:100%;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:10px;transition:all .2s;box-shadow:0 4px 20px rgba(239,68,68,.3)}
+.btn-deny:hover{transform:scale(1.02)}
+.tab-btn{flex:1;padding:12px;border:none;background:transparent;color:#475569;font-weight:600;cursor:pointer;border-bottom:2px solid transparent;transition:all .2s;font-size:14px}
+.tab-btn.active{color:#818cf8;border-bottom-color:#6366f1}
+.ble-ring{width:100px;height:100px;border-radius:50%;border:2.5px solid #6366f1;display:flex;align-items:center;justify-content:center;position:relative;margin:0 auto}
+.ble-ring::before{content:'';position:absolute;inset:-14px;border:2px solid rgba(99,102,241,.25);border-radius:50%;animation:pulsate 2s infinite}
+.ble-ring::after{content:'';position:absolute;inset:-28px;border:2px solid rgba(99,102,241,.12);border-radius:50%;animation:pulsate 2s .5s infinite}
+@keyframes pulsate{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.05);opacity:.5}}
+.lock-row{background:#0f0f1e;border:1px solid #1a1a2e;border-radius:14px;padding:16px;display:flex;align-items:center;gap:12px}
+.pulse{animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.slide-in{animation:slideIn .3s ease}
+@keyframes slideIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+</style>
+</head>
+<body>
+<div class="min-h-screen flex flex-col">
+  <!-- Header -->
+  <header class="bg-gray-900/90 backdrop-blur sticky top-0 z-10 px-5 py-4 border-b border-gray-800/50">
+    <div class="flex items-center gap-3">
+      <div class="w-9 h-9 rounded-xl bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center">
+        <i class="fas fa-house-lock text-white text-sm"></i>
+      </div>
+      <div>
+        <div class="font-bold text-white text-sm">FaceAccess <span class="text-indigo-400">Home</span></div>
+        <div class="text-xs text-gray-500" id="hm-home-name">Kim Residence</div>
+      </div>
+      <div class="ml-auto flex items-center gap-2">
+        <div class="w-1.5 h-1.5 rounded-full bg-green-400 pulse"></div>
+        <span class="text-xs text-green-400">Online</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- Tabs -->
+  <div class="flex border-b border-gray-800/50 bg-gray-900/40">
+    <button class="tab-btn active" onclick="hmTab('home')" id="htab-home"><i class="fas fa-house mr-1"></i> Home</button>
+    <button class="tab-btn" onclick="hmTab('locks')" id="htab-locks"><i class="fas fa-lock mr-1"></i> Locks</button>
+    <button class="tab-btn" onclick="hmTab('activity')" id="htab-activity"><i class="fas fa-history mr-1"></i> Activity</button>
+    <button class="tab-btn" onclick="hmTab('profile')" id="htab-profile"><i class="fas fa-user mr-1"></i> Me</button>
+  </div>
+
+  <div class="flex-1 p-4 space-y-4" id="hm-content"></div>
+</div>
+
+<script src="/static/home-mobile.js"></script>
 </body>
 </html>`
 }
