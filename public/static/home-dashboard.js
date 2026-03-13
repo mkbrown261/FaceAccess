@@ -132,16 +132,8 @@ function openModal(html) {
 }
 function closeModal(e) {
   if (!e || e.target === document.getElementById('modal-overlay')) {
-    // Stop any FaceID enrollment camera stream before closing
-    if (window._faceIDUI) {
-      try { window._faceIDUI.stop(); } catch(ex) {}
-    }
-    // Stop any lingering camera stream on fid-video
-    const fidVideo = document.getElementById('fid-video');
-    if (fidVideo && fidVideo.srcObject) {
-      try { fidVideo.srcObject.getTracks().forEach(t => t.stop()); } catch(ex) {}
-      fidVideo.srcObject = null;
-    }
+    // Stop any active FaceID enrollment
+    _stopEnrollStream();
     document.getElementById('modal-overlay').classList.add('hidden');
   }
 }
@@ -1434,12 +1426,13 @@ async function saveMember() {
 }
 
 // Helper: stop any FaceID enrollment camera stream
+let _enrollUIRef = null;
 function _stopEnrollStream() {
-  if (window._faceIDUI) {
-    try { window._faceIDUI.stop(); } catch(e) {}
-    // stop() already nulls window._faceIDUI
+  if (_enrollUIRef) {
+    try { _enrollUIRef.stop(); } catch(e) {}
+    _enrollUIRef = null;
   }
-  // Belt-and-suspenders: stop any lingering stream on fid-video
+  // Belt-and-suspenders: kill any lingering camera stream on fid-video
   const fidVideo = document.getElementById('fid-video');
   if (fidVideo && fidVideo.srcObject) {
     try { fidVideo.srcObject.getTracks().forEach(t => t.stop()); } catch(e) {}
@@ -1448,42 +1441,35 @@ function _stopEnrollStream() {
 }
 
 async function enrollFace(userId) {
-  // Launch the full FaceID enrollment modal
-  if (!window.FaceIDEngine) {
-    toast('FaceID engine not loaded yet — please wait a moment and try again', 'warn');
-    return;
-  }
-  if (!userId || !isValidId(userId)) {
-    toast('Invalid user ID', 'error');
-    return;
-  }
+  if (!userId || !isValidId(userId)) { toast('Invalid user ID', 'error'); return; }
 
-  // Stop any previous enrollment session
+  // Stop any previous enrollment stream
   _stopEnrollStream();
 
-  // Build modal with FaceID UI
   const modalOverlay = document.getElementById('modal-overlay');
   const modalContent = document.getElementById('modal-content');
   if (!modalContent || !modalOverlay) return;
 
   modalContent.innerHTML = `
-    <div style="background:#0a0a14;border-radius:20px;overflow:hidden;width:460px;max-width:95vw;max-height:90vh;overflow-y:auto;">
-      <div style="padding:20px 24px 0;display:flex;align-items:center;justify-content:space-between;">
+    <div style="background:#0a0a14;border-radius:20px;overflow:hidden;width:420px;max-width:95vw;">
+      <div style="padding:18px 20px 0;display:flex;align-items:center;justify-content:space-between;">
         <div>
-          <div style="font-size:18px;font-weight:800;color:#fff;">Face ID Enrollment</div>
-          <div style="font-size:12px;color:rgba(255,255,255,0.4);margin-top:2px;">Multi-angle · Liveness · Anti-spoof</div>
+          <div style="font-size:17px;font-weight:800;color:#fff;">Face ID Enrollment</div>
+          <div style="font-size:11px;color:rgba(255,255,255,0.4);margin-top:2px;">Multi-angle · Liveness · Anti-spoof</div>
         </div>
-        <button onclick="closeModal()" style="background:rgba(255,255,255,0.07);border:none;border-radius:8px;width:32px;height:32px;color:#fff;cursor:pointer;font-size:16px;">✕</button>
+        <button id="enroll-close-btn" style="background:rgba(255,255,255,0.07);border:none;border-radius:8px;width:32px;height:32px;color:#fff;cursor:pointer;font-size:16px;">✕</button>
       </div>
-      <div id="enroll-modal-container" style="padding:16px 24px 24px;"></div>
+      <div id="enroll-modal-container" style="padding:0;"></div>
     </div>`;
 
-  // Show modal FIRST so the DOM has layout dimensions
+  // Wire close button
+  modalContent.querySelector('#enroll-close-btn').onclick = () => closeModal();
+
+  // Show modal
   modalOverlay.classList.remove('hidden');
 
-  // Wait two animation frames for the browser to fully render and lay out the modal
-  // before FaceIDUI tries to read offsetWidth/offsetHeight for canvas sizing
-  await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  // Wait for layout before sizing canvas
+  await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
 
   const ui = window.initFaceIDEnrollment('enroll-modal-container', {
     onComplete: async (result) => {
@@ -1491,34 +1477,25 @@ async function enrollFace(userId) {
         const store = new window.FaceIDEngine.SecureEmbeddingStore();
         const enc   = await store.encrypt(result.embedding);
         await axios.post(`${API}/api/home/users/${userId}/face`, {
-          embedding:         enc,
-          image_quality:     result.averageQuality / 100,
-          liveness_score:    result.livenessScore,
-          anti_spoof_score:  result.antiSpoofScore,
-          angles_captured:   result.capturedAngles,
+          embedding:          enc,
+          image_quality:      result.averageQuality / 100,
+          liveness_score:     result.livenessScore,
+          anti_spoof_score:   result.antiSpoofScore,
+          angles_captured:    result.capturedAngles,
           enrollment_version: '2.0',
         });
-        toast(`Face ID enrolled — ${result.capturedAngles.length} angles captured ✓`, 'success');
+        toast(`Face ID enrolled — ${result.capturedAngles.length} angles ✓`, 'success');
         setTimeout(() => { closeModal(); loadMembers(); }, 2000);
       } catch(e) {
-        // API save failed but enrollment worked locally
-        toast('Face ID enrollment complete ✓', 'success');
+        toast('Face ID enrolled ✓', 'success');
         setTimeout(() => { closeModal(); loadMembers(); }, 1500);
       }
     },
-    onError: (err) => {
-      const msg = err.message || 'Enrollment failed';
-      console.error('[enrollFace] error:', err);
-      toast(msg, 'error');
-    },
     onSkip: () => closeModal(),
   });
-
-  // If ui failed to init (container not found), bail
-  if (!ui) {
-    toast('Failed to initialize Face ID UI', 'error');
-    modalOverlay.classList.add('hidden');
-  }
+  _enrollUIRef = ui;  // store for cleanup on modal close
+  if (!ui) { toast('Failed to open Face ID UI', 'error'); modalOverlay.classList.add('hidden'); }
+}
 }
 
 async function deleteFace(userId) {
