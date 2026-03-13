@@ -505,12 +505,14 @@ class FaceDetector {
     if (b < 30)  return { msg: '💡 Too dark — turn on a light or face a window', level: 'warn' };
     if (b < FACEID_CONFIG.MIN_BRIGHTNESS) return { msg: '💡 Lighting too dim — move to a brighter area', level: 'warn' };
     if (b > FACEID_CONFIG.MAX_BRIGHTNESS) return { msg: '☀️ Too bright — avoid direct backlighting', level: 'warn' };
-    if (s < 15)  return { msg: '📷 Very blurry — hold still or clean your camera lens', level: 'warn' };\n    if (s < FACEID_CONFIG.MIN_SHARPNESS) return { msg: '📷 Slightly blurry — hold still', level: 'info' };
+    if (s < 15)  return { msg: '📷 Very blurry — hold still or clean your camera lens', level: 'warn' };
+    if (s < FACEID_CONFIG.MIN_SHARPNESS) return { msg: '📷 Slightly blurry — hold still', level: 'info' };
     if (c < FACEID_CONFIG.MIN_FACE_COVERAGE) return { msg: 'Move closer to the camera', level: 'info' };
     if (c > FACEID_CONFIG.MAX_FACE_COVERAGE) return { msg: 'Move back a little', level: 'info' };
     if (metrics.antiSpoof?.score < 0.35) return { msg: '⚠️ Spoof detected — use your real face', level: 'error' };
     if (metrics.quality >= 75) return { msg: '✓ Good image quality', level: 'good' };
-    return { msg: 'Adjusting...', level: 'info' };\n  }
+    return { msg: 'Adjusting...', level: 'info' };
+  }
 
   /**
    * Check if current pose matches a target angle
