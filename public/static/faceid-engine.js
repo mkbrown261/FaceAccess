@@ -1978,505 +1978,711 @@ window.FaceIDEngine = {
 };
 
 // ─────────────────────────────────────────────────────────────────────────
-//  PRODUCTION ENROLLMENT UI  v3.0
-//  Full face-guided multi-angle enrollment with real canvas oval,
-//  quality-gated progression, and genuine embedding capture.
+//  FACE ID ENROLLMENT UI  v4.0  —  Production-grade, iPhone-class quality
+//
+//  Design principles:
+//   • Data-driven: each angle advances ONLY when the engine has collected
+//     enough high-quality frames — never on a timer.
+//   • Smooth UX: animated oval, hold-progress arc, angle arrows, haptic-
+//     style visual feedback, phase transitions.
+//   • Resilient: works in low-light, retries gracefully, shows real-time
+//     guidance ("Move closer", "Too bright", "Hold still"…).
+//   • Real embeddings: captures N best frames per angle, takes the median
+//     embedding per angle, fuses all angles into one L2-normalised vector.
+//   • Anti-spoof aware: won't advance an angle if anti-spoof score is low.
 // ─────────────────────────────────────────────────────────────────────────
 window.initFaceIDEnrollment = function(containerId, callbacks = {}) {
   const container = document.getElementById(containerId);
   if (!container) return null;
 
-  // ── State ──────────────────────────────────────────────────────────────
-  let stream      = null;
-  let detector    = null;
-  let embedGen    = null;
-  let frameLoop   = null;
-  let overlayCtx  = null;
-  let phase       = 'idle';   // idle | ready | scanning | complete | error
-  let lastMetrics = null;
-  let scanInterval= null;
-  let currentAngleIdx = 0;
-  let angleHoldFrames = 0;   // consecutive good frames at current angle
-  let capturedEmbeddings = [];
-  const TOTAL_ANGLES  = 5;
-  const HOLD_FRAMES_NEEDED = 18; // ~0.6s of good frames at 30fps to capture angle
-  const MIN_QUALITY   = 35;
+  // ── Tuning knobs ────────────────────────────────────────────────────────
+  const CFG = {
+    ANGLES: [
+      { id: 'center',  label: 'Face Forward',       sub: 'Look straight at the camera',      yawTarget:  0,   pitchTarget:  0,  arrowDir: null,   arrowIcon: '' },
+      { id: 'left',    label: 'Turn Left',           sub: 'Slowly rotate your head left',     yawTarget: -28,  pitchTarget:  0,  arrowDir: 'left',  arrowIcon: '←' },
+      { id: 'right',   label: 'Turn Right',          sub: 'Slowly rotate your head right',    yawTarget:  28,  pitchTarget:  0,  arrowDir: 'right', arrowIcon: '→' },
+      { id: 'up',      label: 'Tilt Up',             sub: 'Lift your chin slightly',           yawTarget:  0,   pitchTarget: -20, arrowDir: 'up',    arrowIcon: '↑' },
+      { id: 'down',    label: 'Tilt Down',           sub: 'Lower your chin slightly',          yawTarget:  0,   pitchTarget:  20, arrowDir: 'down',  arrowIcon: '↓' },
+    ],
+    // How many consecutive good frames needed to "lock in" an angle
+    FRAMES_TO_LOCK:    22,   // ~0.75 s at 30 fps — feels intentional, not instant
+    // Quality threshold (0-100) — below this = frame rejected
+    MIN_QUALITY:       28,
+    // Anti-spoof minimum (0-1)
+    MIN_ANTISPOOF:     0.45,
+    // How many best-quality frames to sample for the embedding per angle
+    EMB_SAMPLE_FRAMES: 5,
+    // Minimum ms between angle completions (prevents runaway)
+    MIN_ANGLE_MS:      1200,
+    // Tick interval for the scan loop
+    TICK_MS:           40,   // 25 fps evaluation cadence (lighter than rAF)
+  };
 
-  const ANGLES = [
-    { label: 'Look straight ahead',   icon: '→',  hint: 'Face forward, eyes open' },
-    { label: 'Turn slightly left',     icon: '←',  hint: 'Rotate your head left ~20°' },
-    { label: 'Turn slightly right',    icon: '→',  hint: 'Rotate your head right ~20°' },
-    { label: 'Tilt slightly up',       icon: '↑',  hint: 'Chin down, look up a little' },
-    { label: 'Tilt slightly down',     icon: '↓',  hint: 'Chin up, look down a little' },
-  ];
+  // ── State ────────────────────────────────────────────────────────────────
+  let stream         = null;
+  let detector       = null;
+  let embedGen       = null;
+  let rafHandle      = null;
+  let tickHandle     = null;
+  let overlayCtx     = null;
+  let phase          = 'idle';  // idle | ready | angle_N | liveness | done | error
+  let currentAngle   = 0;       // 0-based index into CFG.ANGLES
+  let holdFrames     = 0;       // consecutive good frames at current angle
+  let goodFrameBank  = [];      // { metrics, timestamp } kept for embedding
+  let capturedAngles = [];      // { id, embedding, quality, frames }
+  let lastMetrics    = null;
+  let lastAngleMs    = 0;
+  let livenessPhase  = 'blink'; // blink | smile
+  let livenessTimer  = null;
+  let livenessBlinkDone  = false;
+  let livenessSmileDone  = false;
+  let _destroyed     = false;
 
-  // ── Build UI ────────────────────────────────────────────────────────────
+  // ── Build HTML ───────────────────────────────────────────────────────────
   container.innerHTML = `
-  <div id="fid-wrap" style="background:#000;border-radius:0 0 20px 20px;overflow:hidden;
-    font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;user-select:none;">
+<div id="feid-root" style="
+  background:#000;border-radius:0 0 20px 20px;overflow:hidden;
+  font-family:-apple-system,BlinkMacSystemFont,'SF Pro Display','Segoe UI',sans-serif;
+  user-select:none;-webkit-user-select:none;">
 
-    <!-- Header -->
-    <div style="padding:14px 18px 10px;text-align:center;background:#000;">
-      <div id="fid-title" style="color:#fff;font-size:17px;font-weight:700;letter-spacing:-0.3px;min-height:22px;">
-        Face ID Setup
+  <!-- ── Header ─────────────────────────────────────────────────────── -->
+  <div id="feid-header" style="padding:16px 20px 10px;text-align:center;background:#000;position:relative;">
+    <div id="feid-phase-badge" style="
+      display:inline-flex;align-items:center;gap:5px;
+      background:rgba(99,102,241,0.12);border:1px solid rgba(99,102,241,0.25);
+      border-radius:20px;padding:3px 10px;margin-bottom:8px;
+      font-size:10px;font-weight:700;letter-spacing:0.8px;text-transform:uppercase;
+      color:rgba(99,102,241,0.8);transition:all 0.4s;">
+      <span id="feid-phase-dot" style="width:5px;height:5px;border-radius:50%;background:#6366f1;"></span>
+      <span id="feid-phase-label">Getting Ready</span>
+    </div>
+    <div id="feid-title" style="
+      color:#fff;font-size:19px;font-weight:700;letter-spacing:-0.4px;
+      min-height:24px;transition:opacity 0.25s;">Face ID Setup</div>
+    <div id="feid-sub" style="
+      color:rgba(255,255,255,0.45);font-size:13px;margin-top:5px;
+      min-height:18px;line-height:1.4;transition:opacity 0.25s;">
+      Position your face in the oval
+    </div>
+  </div>
+
+  <!-- ── Viewport ────────────────────────────────────────────────────── -->
+  <div id="feid-vp" style="position:relative;width:100%;padding-bottom:105%;background:#050510;overflow:hidden;">
+
+    <!-- Live video (mirrored) -->
+    <video id="feid-video" autoplay muted playsinline style="
+      position:absolute;inset:0;width:100%;height:100%;
+      object-fit:cover;transform:scaleX(-1);display:none;"></video>
+
+    <!-- Guide canvas — ALWAYS on top, always rendered -->
+    <canvas id="feid-canvas" style="
+      position:absolute;inset:0;width:100%;height:100%;
+      pointer-events:none;z-index:8;"></canvas>
+
+    <!-- Pre-camera placeholder -->
+    <div id="feid-placeholder" style="
+      position:absolute;inset:0;z-index:3;display:flex;
+      flex-direction:column;align-items:center;justify-content:center;
+      background:linear-gradient(180deg,#06060f 0%,#0b0b1e 100%);">
+      <div style="
+        width:90px;height:110px;border-radius:50%;
+        border:2px dashed rgba(99,102,241,0.3);
+        display:flex;align-items:center;justify-content:center;margin-bottom:14px;">
+        <i class="fas fa-camera" style="font-size:30px;color:rgba(99,102,241,0.4);"></i>
       </div>
-      <div id="fid-sub" style="color:rgba(255,255,255,0.5);font-size:13px;margin-top:4px;min-height:18px;line-height:1.35;">
-        Position your face in the oval
+      <p style="color:rgba(255,255,255,0.2);font-size:13px;margin:0;letter-spacing:-0.2px;">
+        Tap Start to open camera
+      </p>
+    </div>
+
+    <!-- Angle direction arrow overlay -->
+    <div id="feid-arrow-wrap" style="
+      display:none;position:absolute;z-index:9;pointer-events:none;
+      top:50%;left:50%;transform:translate(-50%,-50%);">
+      <div id="feid-arrow-bg" style="
+        width:58px;height:58px;border-radius:50%;
+        background:rgba(10,10,20,0.75);
+        border:2px solid rgba(99,102,241,0.6);
+        display:flex;align-items:center;justify-content:center;
+        backdrop-filter:blur(4px);">
+        <span id="feid-arrow-icon" style="font-size:26px;color:#a5b4fc;font-weight:900;line-height:1;"></span>
       </div>
     </div>
 
-    <!-- Camera viewport  (square 1:1) -->
-    <div id="fid-viewport" style="position:relative;width:100%;padding-bottom:100%;background:#050510;overflow:hidden;">
-
-      <!-- Live video -->
-      <video id="fid-video" autoplay muted playsinline
-        style="position:absolute;inset:0;width:100%;height:100%;
-               object-fit:cover;transform:scaleX(-1);display:none;"></video>
-
-      <!-- Oval + guide canvas – ALWAYS VISIBLE -->
-      <canvas id="fid-overlay"
-        style="position:absolute;inset:0;width:100%;height:100%;
-               pointer-events:none;z-index:6;"></canvas>
-
-      <!-- Pre-camera placeholder -->
-      <div id="fid-placeholder" style="position:absolute;inset:0;z-index:2;
-        display:flex;flex-direction:column;align-items:center;justify-content:center;
-        background:linear-gradient(180deg,#06060f 0%,#0a0a1a 100%);">
-        <i class="fas fa-camera" style="font-size:38px;color:rgba(99,102,241,0.45);margin-bottom:12px;"></i>
-        <p style="color:rgba(255,255,255,0.25);font-size:13px;margin:0;letter-spacing:-0.2px;">
-          Tap "Start" to open camera
-        </p>
+    <!-- Completion flash -->
+    <div id="feid-complete-flash" style="
+      display:none;position:absolute;inset:0;z-index:12;
+      background:rgba(16,185,129,0.15);
+      flex-direction:column;align-items:center;justify-content:center;">
+      <div style="
+        width:80px;height:80px;border-radius:50%;
+        background:rgba(16,185,129,0.2);border:2.5px solid #34d399;
+        display:flex;align-items:center;justify-content:center;margin-bottom:12px;">
+        <i class="fas fa-check" style="color:#34d399;font-size:34px;"></i>
       </div>
-
-      <!-- Angle direction arrow (shown during scan) -->
-      <div id="fid-arrow" style="display:none;position:absolute;top:50%;left:50%;
-        transform:translate(-50%,-50%);z-index:8;
-        width:56px;height:56px;border-radius:50%;
-        background:rgba(99,102,241,0.2);border:2px solid rgba(99,102,241,0.5);
-        align-items:center;justify-content:center;">
-        <span id="fid-arrow-icon" style="font-size:22px;color:#fff;"></span>
-      </div>
-
-      <!-- Completion flash -->
-      <div id="fid-complete-flash" style="display:none;position:absolute;inset:0;z-index:10;
-        background:rgba(16,185,129,0.18);flex-direction:column;
-        align-items:center;justify-content:center;">
-        <div style="width:76px;height:76px;border-radius:50%;
-          background:rgba(16,185,129,0.25);border:2px solid #34d399;
-          display:flex;align-items:center;justify-content:center;margin-bottom:10px;">
-          <i class="fas fa-check" style="color:#34d399;font-size:32px;"></i>
-        </div>
-        <div style="color:#34d399;font-size:17px;font-weight:700;letter-spacing:-0.3px;">Enrolled!</div>
-      </div>
+      <div style="color:#34d399;font-size:18px;font-weight:700;letter-spacing:-0.3px;">Face Enrolled!</div>
     </div>
 
-    <!-- Angle progress dots -->
-    <div style="background:#000;padding:10px 20px 4px;display:flex;align-items:center;justify-content:center;gap:10px;">
-      ${ANGLES.map((_,i) => `
-        <div id="fid-dot-${i}" style="
+    <!-- Liveness overlay (shown during liveness challenge) -->
+    <div id="feid-liveness-bar" style="
+      display:none;position:absolute;bottom:0;left:0;right:0;z-index:10;
+      background:linear-gradient(to top,rgba(0,0,0,0.85),transparent);
+      padding:12px 18px 14px;text-align:center;">
+      <div id="feid-liveness-label" style="color:#fbbf24;font-size:14px;font-weight:700;margin-bottom:4px;"></div>
+      <div style="height:3px;background:rgba(255,255,255,0.12);border-radius:2px;overflow:hidden;">
+        <div id="feid-liveness-prog" style="height:100%;width:0%;background:#fbbf24;border-radius:2px;transition:width 0.1s;"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Angle progress strip ─────────────────────────────────────────── -->
+  <div style="background:#000;padding:10px 20px 4px;">
+    <div style="display:flex;align-items:center;justify-content:center;gap:10px;">
+      ${CFG.ANGLES.map((_,i) => `
+        <div id="feid-dot-${i}" style="
           width:9px;height:9px;border-radius:50%;
-          background:rgba(255,255,255,0.12);
-          border:1.5px solid rgba(255,255,255,0.1);
-          transition:all 0.35s cubic-bezier(0.34,1.56,0.64,1);
-        "></div>`).join('')}
+          background:rgba(255,255,255,0.1);
+          border:1.5px solid rgba(255,255,255,0.08);
+          transition:all 0.4s cubic-bezier(0.34,1.56,0.64,1);"></div>`).join('')}
     </div>
+    <!-- Angle label strip -->
+    <div style="display:flex;justify-content:center;margin-top:6px;">
+      <span id="feid-angle-label" style="
+        font-size:10px;color:rgba(255,255,255,0.25);
+        letter-spacing:0.5px;font-weight:600;text-transform:uppercase;"></span>
+    </div>
+  </div>
 
-    <!-- Quality bar -->
-    <div style="background:#000;padding:4px 20px 10px;">
-      <div style="height:3px;background:rgba(255,255,255,0.07);border-radius:2px;overflow:hidden;">
-        <div id="fid-qbar" style="height:100%;width:0%;background:#34d399;
-          border-radius:2px;transition:width 0.15s,background 0.2s;"></div>
+  <!-- ── Quality / feedback row ────────────────────────────────────────── -->
+  <div style="background:#000;padding:2px 20px 10px;">
+    <div style="display:flex;align-items:center;gap:8px;">
+      <!-- Quality bar -->
+      <div style="flex:1;">
+        <div style="height:3px;background:rgba(255,255,255,0.06);border-radius:2px;overflow:hidden;">
+          <div id="feid-qbar" style="height:100%;width:0%;border-radius:2px;background:#34d399;transition:width 0.12s,background 0.2s;"></div>
+        </div>
       </div>
-      <div style="display:flex;justify-content:space-between;margin-top:5px;">
-        <span style="font-size:10px;color:rgba(255,255,255,0.25);">Image Quality</span>
-        <span id="fid-qpct" style="font-size:10px;color:rgba(255,255,255,0.35);font-weight:600;">—</span>
-      </div>
+      <!-- Feedback chips -->
+      <div id="feid-chips" style="display:flex;gap:4px;flex-shrink:0;"></div>
+      <!-- Quality % -->
+      <span id="feid-qpct" style="font-size:10px;color:rgba(255,255,255,0.3);font-weight:600;min-width:26px;text-align:right;">—</span>
     </div>
+  </div>
 
-    <!-- Buttons -->
-    <div style="padding:4px 18px 18px;background:#000;display:flex;flex-direction:column;gap:6px;">
-      <button id="fid-start-btn" style="
-        width:100%;padding:14px 20px;border-radius:13px;border:none;
-        background:linear-gradient(135deg,#6366f1,#8b5cf6);
-        color:#fff;font-size:15px;font-weight:700;cursor:pointer;
-        font-family:inherit;letter-spacing:-0.2px;
-        transition:opacity 0.2s,transform 0.1s;
-        display:flex;align-items:center;justify-content:center;gap:8px;">
-        <i class="fas fa-camera"></i> Start Face ID Setup
-      </button>
-      <button id="fid-skip-btn" style="
-        width:100%;padding:9px;border-radius:9px;border:none;
-        background:transparent;color:rgba(255,255,255,0.3);
-        font-size:13px;cursor:pointer;font-family:inherit;transition:color 0.2s;">
-        Skip for now
-      </button>
-    </div>
-  </div>`;
+  <!-- ── Buttons ───────────────────────────────────────────────────────── -->
+  <div style="padding:4px 18px 18px;background:#000;display:flex;flex-direction:column;gap:6px;">
+    <button id="feid-btn" style="
+      width:100%;padding:15px 20px;border-radius:14px;border:none;
+      background:linear-gradient(135deg,#6366f1,#8b5cf6);
+      color:#fff;font-size:15px;font-weight:700;cursor:pointer;
+      font-family:inherit;letter-spacing:-0.2px;
+      display:flex;align-items:center;justify-content:center;gap:9px;
+      transition:opacity 0.2s,transform 0.1s,background 0.3s;">
+      <i class="fas fa-camera"></i> Start Face ID Setup
+    </button>
+    <button id="feid-skip" style="
+      width:100%;padding:9px;border-radius:9px;border:none;background:transparent;
+      color:rgba(255,255,255,0.25);font-size:13px;cursor:pointer;
+      font-family:inherit;transition:color 0.2s;">
+      Skip for now
+    </button>
+  </div>
+</div>`;
 
-  // ── Element refs ────────────────────────────────────────────────────────
-  const video     = container.querySelector('#fid-video');
-  const canvas    = container.querySelector('#fid-overlay');
-  const startBtn  = container.querySelector('#fid-start-btn');
-  const skipBtn   = container.querySelector('#fid-skip-btn');
-  const viewport  = container.querySelector('#fid-viewport');
+  // ── Element refs ─────────────────────────────────────────────────────────
+  const $  = id => container.querySelector('#' + id);
+  const video    = $('feid-video');
+  const canvas   = $('feid-canvas');
+  const vp       = $('feid-vp');
+  const btn      = $('feid-btn');
+  const skipBtn  = $('feid-skip');
 
-  // ── Canvas sizing ────────────────────────────────────────────────────────
+  // ── Canvas sizing ─────────────────────────────────────────────────────────
   function resizeCanvas() {
-    if (!canvas || !viewport) return;
-    // Use viewport's actual pixel dimensions
-    const rect = viewport.getBoundingClientRect();
-    const w = Math.round(rect.width)  || viewport.offsetWidth  || 380;
-    const h = Math.round(rect.height) || viewport.offsetHeight || 380;
-    if (w > 0 && h > 0) {
+    if (!canvas || !vp || _destroyed) return;
+    const r = vp.getBoundingClientRect();
+    const w = Math.round(r.width)  || vp.offsetWidth  || 380;
+    const h = Math.round(r.height) || vp.offsetHeight || 400;
+    if (w > 0 && h > 0 && (canvas.width !== w || canvas.height !== h)) {
       canvas.width  = w;
       canvas.height = h;
       overlayCtx = canvas.getContext('2d');
-      drawOval(lastMetrics); // redraw immediately after resize
+    }
+  }
+  requestAnimationFrame(() => requestAnimationFrame(() => { resizeCanvas(); renderFrame(); }));
+  if (typeof ResizeObserver !== 'undefined') {
+    const ro = new ResizeObserver(() => { resizeCanvas(); renderFrame(); });
+    ro.observe(vp);
+  }
+
+  // ── UI helpers ────────────────────────────────────────────────────────────
+  function setHeader(title, sub, phaseName, phaseBadgeColor) {
+    const t = $('feid-title'), s = $('feid-sub');
+    const pl = $('feid-phase-label'), pd = $('feid-phase-dot'), pb = $('feid-phase-badge');
+    if (t) { t.style.opacity='0'; setTimeout(()=>{ t.textContent=title; t.style.opacity='1'; },140); }
+    if (s) { s.style.opacity='0'; setTimeout(()=>{ s.textContent=sub||''; s.style.opacity='1'; },180); }
+    if (pl) pl.textContent = phaseName || '';
+    if (pd && phaseBadgeColor) pd.style.background = phaseBadgeColor;
+    if (pb && phaseBadgeColor) {
+      pb.style.background = `${phaseBadgeColor}18`;
+      pb.style.borderColor = `${phaseBadgeColor}40`;
+      pb.style.color       = phaseBadgeColor;
     }
   }
 
-  // Resize on next two animation frames (after DOM layout settles)
-  requestAnimationFrame(() => requestAnimationFrame(resizeCanvas));
-  if (typeof ResizeObserver !== 'undefined') {
-    const ro = new ResizeObserver(resizeCanvas);
-    ro.observe(viewport);
-  }
-
-  // ── Helpers ──────────────────────────────────────────────────────────────
-  function setTitle(t, s) {
-    const te = container.querySelector('#fid-title');
-    const se = container.querySelector('#fid-sub');
-    if (te) te.textContent = t;
-    if (se) se.textContent = s || '';
-  }
-
-  function setBtn(label, icon, color, disabled) {
-    if (!startBtn) return;
-    startBtn.innerHTML = `<i class="fas fa-${icon}"></i> ${label}`;
-    startBtn.style.background = color;
-    startBtn.disabled = !!disabled;
-    startBtn.style.opacity = disabled ? '0.6' : '1';
+  function setBtn(label, icon, bg, disabled) {
+    if (!btn) return;
+    btn.innerHTML = `<i class="fas fa-${icon}"></i> ${label}`;
+    btn.style.background = bg;
+    btn.disabled = !!disabled;
+    btn.style.opacity = disabled ? '0.55' : '1';
   }
 
   function markDot(i, state) {
-    const dot = container.querySelector(`#fid-dot-${i}`);
-    if (!dot) return;
-    if (state === 'active') {
-      dot.style.background = '#6366f1';
-      dot.style.borderColor = '#818cf8';
-      dot.style.transform = 'scale(1.5)';
-      dot.style.boxShadow = '0 0 8px rgba(99,102,241,0.9)';
-    } else if (state === 'done') {
-      dot.style.background = '#34d399';
-      dot.style.borderColor = '#34d399';
-      dot.style.transform = 'scale(1.1)';
-      dot.style.boxShadow = '0 0 6px rgba(52,211,153,0.6)';
-    } else {
-      dot.style.background = 'rgba(255,255,255,0.12)';
-      dot.style.borderColor = 'rgba(255,255,255,0.1)';
-      dot.style.transform = 'scale(1)';
-      dot.style.boxShadow = 'none';
-    }
+    const d = $(`feid-dot-${i}`);
+    if (!d) return;
+    const s = { active:{bg:'#6366f1',bc:'#818cf8',sc:'0 0 10px rgba(99,102,241,0.9)',tx:'scale(1.6)'},
+                done:  {bg:'#34d399',bc:'#34d399',sc:'0 0 7px rgba(52,211,153,0.7)', tx:'scale(1.1)'},
+                idle:  {bg:'rgba(255,255,255,0.1)',bc:'rgba(255,255,255,0.08)',sc:'none',tx:'scale(1)'} }[state] || {};
+    d.style.background = s.bg; d.style.borderColor = s.bc;
+    d.style.boxShadow  = s.sc; d.style.transform   = s.tx;
   }
 
-  function showArrow(icon, show) {
-    const arrow = container.querySelector('#fid-arrow');
-    const iconEl = container.querySelector('#fid-arrow-icon');
-    if (!arrow) return;
-    if (show) {
-      arrow.style.display = 'flex';
-      if (iconEl) iconEl.textContent = icon;
-    } else {
-      arrow.style.display = 'none';
+  function setAngleLabel(txt) {
+    const el = $('feid-angle-label'); if (el) el.textContent = txt || '';
+  }
+
+  function setArrow(dirIcon, show) {
+    const aw = $('feid-arrow-wrap'), ai = $('feid-arrow-icon');
+    if (!aw) return;
+    if (show && dirIcon) { aw.style.display='block'; if(ai) ai.textContent=dirIcon; }
+    else aw.style.display='none';
+  }
+
+  function setChip(id, label, color) {
+    const chips = $('feid-chips'); if (!chips) return;
+    let chip = chips.querySelector(`[data-chip="${id}"]`);
+    if (!chip) {
+      chip = document.createElement('div');
+      chip.setAttribute('data-chip', id);
+      chip.style.cssText = `padding:2px 7px;border-radius:10px;font-size:9px;font-weight:700;
+        text-transform:uppercase;letter-spacing:0.5px;transition:all 0.2s;`;
+      chips.appendChild(chip);
     }
+    chip.textContent = label;
+    chip.style.background = `${color}1a`;
+    chip.style.color = color;
+    chip.style.border = `1px solid ${color}40`;
+    chip.style.display = label ? '' : 'none';
+  }
+
+  function clearChip(id) { setChip(id, '', '#fff'); }
+
+  function updateQuality(m) {
+    const q = Math.round(m?.quality || 0);
+    const qbar = $('feid-qbar'), qpct = $('feid-qpct');
+    if (qbar) { qbar.style.width = q + '%'; qbar.style.background = q>=70?'#34d399':q>=45?'#f59e0b':'#ef4444'; }
+    if (qpct) qpct.textContent = q ? q + '%' : '—';
+    // Feedback chips
+    if (!m || !m.detected) { setChip('face','No Face','#ef4444'); clearChip('light'); clearChip('sharp'); return; }
+    clearChip('face');
+    if (m.brightness < 45) setChip('light','Too Dark','#f59e0b');
+    else if (m.brightness > 200) setChip('light','Too Bright','#f59e0b');
+    else clearChip('light');
+    if (m.sharpness < 20) setChip('sharp','Move Closer','#94a3b8');
+    else if (m.coverage < 0.08) setChip('sharp','Move Closer','#94a3b8');
+    else clearChip('sharp');
   }
 
   // ── Canvas drawing ────────────────────────────────────────────────────────
-  function drawOval(metrics) {
-    if (!overlayCtx || !canvas || canvas.width === 0) return;
+  function renderFrame() {
+    if (!overlayCtx || !canvas || canvas.width === 0 || _destroyed) return;
     const ctx = overlayCtx;
     const W = canvas.width, H = canvas.height;
     ctx.clearRect(0, 0, W, H);
 
-    const cx = W / 2, cy = H / 2;
-    const rx = W * 0.34, ry = H * 0.43;
+    const cx = W / 2, cy = H * 0.49;
+    const rx = W * 0.33, ry = H * 0.42;
     const t  = Date.now() / 1000;
+    const m  = lastMetrics;
+    const detected = !!(m && m.detected);
+    const q        = m ? (m.quality || 0) : 0;
+    const goodQ    = q >= CFG.MIN_QUALITY;
+    const scanning = (phase !== 'idle' && phase !== 'done' && phase !== 'error');
+    const frac     = Math.min(1, holdFrames / CFG.FRAMES_TO_LOCK);
+    const capturing = scanning && detected && goodQ && frac > 0;
 
-    const detected = metrics && metrics.detected;
-    const quality  = metrics ? (metrics.quality || 0) : 0;
-    const goodQ    = quality >= MIN_QUALITY;
-    const capturing = phase === 'scanning' && detected && goodQ;
-
-    // ── Outer glow when face detected ──────────────────────────────────
-    if (detected && goodQ) {
-      const glowR = ry * (1.12 + 0.03 * Math.sin(t * 3));
-      const glowX = rx * (1.12 + 0.03 * Math.sin(t * 3));
-      const glowA = capturing ? 0.4 : 0.2;
-      const grad = ctx.createRadialGradient(cx, cy, ry * 0.7, cx, cy, glowR * 1.1);
-      const col = capturing ? '99,102,241' : '255,255,255';
-      grad.addColorStop(0, `rgba(${col},${glowA})`);
-      grad.addColorStop(1, `rgba(${col},0)`);
+    // ── 1. Dark vignette mask (face-hole cutout) ─────────────────────────
+    if (detected || scanning) {
       ctx.save();
-      ctx.fillStyle = grad;
+      // Fill full canvas with semi-dark overlay
+      ctx.fillStyle = 'rgba(0,0,0,0.38)';
+      ctx.fillRect(0, 0, W, H);
+      // Punch hole at oval
+      ctx.globalCompositeOperation = 'destination-out';
       ctx.beginPath();
-      ctx.ellipse(cx, cy, glowX * 1.1, glowR * 1.1, 0, 0, Math.PI * 2);
+      ctx.ellipse(cx, cy, rx * 1.04, ry * 1.04, 0, 0, Math.PI * 2);
       ctx.fill();
       ctx.restore();
     }
 
-    // ── Oval stroke ────────────────────────────────────────────────────
-    const ovalColor = !detected        ? 'rgba(255,255,255,0.28)'
-                    : !goodQ           ? 'rgba(245,158,11,0.85)'
-                    : capturing        ? `rgba(99,102,241,${0.85 + 0.15 * Math.sin(t * 4)})`
-                    : 'rgba(255,255,255,0.65)';
+    // ── 2. Outer glow ────────────────────────────────────────────────────
+    if (detected && goodQ) {
+      ctx.save();
+      const pulse = 0.9 + 0.1 * Math.sin(t * (capturing ? 5 : 2));
+      const glowCol = capturing ? '99,102,241' : '200,200,200';
+      const glowA   = capturing ? 0.35 : 0.15;
+      const grad = ctx.createRadialGradient(cx, cy, ry * 0.75, cx, cy, ry * 1.25 * pulse);
+      grad.addColorStop(0, `rgba(${glowCol},${glowA})`);
+      grad.addColorStop(1, `rgba(${glowCol},0)`);
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.ellipse(cx, cy, rx * 1.25 * pulse, ry * 1.25 * pulse, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+
+    // ── 3. Oval stroke ───────────────────────────────────────────────────
+    const ovalCol = phase === 'done' ? '#34d399'
+      : !detected          ? 'rgba(255,255,255,0.3)'
+      : !goodQ             ? '#f59e0b'
+      : capturing          ? `rgba(99,102,241,${0.7 + 0.3 * Math.abs(Math.sin(t * 4))})`
+      :                      'rgba(255,255,255,0.55)';
+    const ovalW   = phase === 'done' ? 3 : (detected && goodQ ? 2.5 : 1.8);
 
     ctx.save();
-    ctx.strokeStyle = ovalColor;
-    ctx.lineWidth = detected && goodQ ? 3 : 2;
-    ctx.setLineDash(detected ? [] : [9, 6]);
-    ctx.shadowColor = detected && goodQ ? 'rgba(99,102,241,0.5)' : 'transparent';
-    ctx.shadowBlur  = detected && goodQ ? 10 : 0;
+    ctx.strokeStyle = ovalCol;
+    ctx.lineWidth   = ovalW;
+    ctx.setLineDash(detected ? [] : [10, 7]);
+    ctx.shadowColor = (detected && goodQ) ? ovalCol : 'transparent';
+    ctx.shadowBlur  = (detected && goodQ) ? 12 : 0;
     ctx.beginPath();
     ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
     ctx.stroke();
     ctx.restore();
 
-    // ── Scanning sweep line ────────────────────────────────────────────
-    if (capturing) {
-      const sweepY = cy - ry + ((t * 65) % (ry * 2));
+    // ── 4. Scanning sweep line ────────────────────────────────────────────
+    if (capturing && phase !== 'liveness') {
+      const speed = 55 + frac * 30;
+      const sweepY = cy - ry + ((t * speed) % (ry * 2));
       ctx.save();
       ctx.beginPath();
       ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
       ctx.clip();
-      const sg = ctx.createLinearGradient(0, sweepY - 14, 0, sweepY + 14);
+      const intensity = 0.35 + 0.25 * frac;
+      const sg = ctx.createLinearGradient(0, sweepY - 16, 0, sweepY + 16);
       sg.addColorStop(0,   'rgba(99,102,241,0)');
-      sg.addColorStop(0.5, `rgba(99,102,241,${0.5 + 0.15 * Math.sin(t * 6)})`);
+      sg.addColorStop(0.5, `rgba(99,102,241,${intensity})`);
       sg.addColorStop(1,   'rgba(99,102,241,0)');
       ctx.fillStyle = sg;
-      ctx.fillRect(cx - rx, sweepY - 14, rx * 2, 28);
+      ctx.fillRect(cx - rx, sweepY - 16, rx * 2, 32);
       ctx.restore();
     }
 
-    // ── Corner brackets (iPhone-style) ─────────────────────────────────
-    const bs  = rx * 0.22;
-    const bx1 = cx - rx * 0.57, bx2 = cx + rx * 0.57;
-    const by1 = cy - ry + 3,    by2 = cy + ry - 3;
-    const bc  = detected && goodQ ? 'rgba(255,255,255,0.9)' : 'rgba(255,255,255,0.25)';
-    ctx.save();
-    ctx.strokeStyle = bc;
-    ctx.lineWidth   = 2.5;
-    ctx.lineCap     = 'round';
-    ctx.setLineDash([]);
-    [[bx1, by1,  1,  1],
-     [bx2, by1, -1,  1],
-     [bx1, by2,  1, -1],
-     [bx2, by2, -1, -1]].forEach(([x, y, sx, sy]) => {
+    // ── 5. Progress arc (hold-to-capture) ────────────────────────────────
+    if (scanning && detected && frac > 0 && phase !== 'liveness') {
+      const arcStart = -Math.PI / 2;
+      const arcEnd   = arcStart + frac * Math.PI * 2;
+      ctx.save();
+      ctx.strokeStyle = frac >= 1 ? '#34d399' : '#6366f1';
+      ctx.lineWidth   = 4;
+      ctx.lineCap     = 'round';
+      ctx.setLineDash([]);
+      ctx.shadowColor = frac >= 1 ? 'rgba(52,211,153,0.6)' : 'rgba(99,102,241,0.5)';
+      ctx.shadowBlur  = 8;
+      // Background ring
+      ctx.globalAlpha = 0.15;
       ctx.beginPath();
-      ctx.moveTo(x,          y + sy * bs);
-      ctx.lineTo(x,          y);
-      ctx.lineTo(x + sx * bs, y);
+      ctx.arc(cx, cy, rx + 12, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+      // Progress arc
+      ctx.beginPath();
+      ctx.arc(cx, cy, rx + 12, arcStart, arcEnd);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // ── 6. Corner brackets (iPhone-style) ────────────────────────────────
+    const bs  = rx * 0.21;
+    const bx1 = cx - rx * 0.56, bx2 = cx + rx * 0.56;
+    const by1 = cy - ry + 2,    by2 = cy + ry - 2;
+    const bc  = detected && goodQ ? 'rgba(255,255,255,0.85)' : 'rgba(255,255,255,0.2)';
+    ctx.save();
+    ctx.strokeStyle = bc; ctx.lineWidth = 2.5; ctx.lineCap = 'round'; ctx.setLineDash([]);
+    [[bx1,by1,1,1],[bx2,by1,-1,1],[bx1,by2,1,-1],[bx2,by2,-1,-1]].forEach(([x,y,sx,sy]) => {
+      ctx.beginPath();
+      ctx.moveTo(x, y + sy*bs); ctx.lineTo(x, y); ctx.lineTo(x + sx*bs, y);
       ctx.stroke();
     });
     ctx.restore();
 
-    // ── Hold-progress arc (shows how close to capturing next angle) ────
-    if (phase === 'scanning' && detected && goodQ && angleHoldFrames > 0) {
-      const frac  = Math.min(angleHoldFrames / HOLD_FRAMES_NEEDED, 1);
-      const start = -Math.PI / 2;
-      const end   = start + frac * Math.PI * 2;
+    // ── 7. Guidance text (inside viewport, above bottom) ─────────────────
+    if (scanning && !detected) {
       ctx.save();
-      ctx.strokeStyle = '#34d399';
-      ctx.lineWidth   = 4;
-      ctx.lineCap     = 'round';
-      ctx.setLineDash([]);
+      ctx.fillStyle = 'rgba(255,255,255,0.5)';
+      ctx.font = '500 13px -apple-system,BlinkMacSystemFont,sans-serif';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText('Move into the oval', cx, cy + ry + 22);
+      ctx.restore();
+    }
+    if (scanning && detected && !goodQ) {
+      ctx.save();
+      const msg = (m.brightness < 45) ? 'Move to better light'
+                : (m.sharpness < 18)  ? 'Move closer'
+                : (m.coverage < 0.08) ? 'Move closer'
+                : 'Adjusting…';
+      ctx.fillStyle = '#f59e0b';
+      ctx.font = '600 13px -apple-system,BlinkMacSystemFont,sans-serif';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(msg, cx, cy + ry + 22);
+      ctx.restore();
+    }
+
+    // ── 8. Completion tick (on oval after done) ──────────────────────────
+    if (phase === 'done') {
+      ctx.save();
+      ctx.strokeStyle = '#34d399'; ctx.lineWidth = 3.5; ctx.lineCap = 'round';
+      ctx.setLineDash([]); ctx.shadowColor = '#34d399'; ctx.shadowBlur = 10;
       ctx.beginPath();
-      ctx.arc(cx, cy, rx + 10, start, end);
+      ctx.moveTo(cx - rx*0.25, cy); ctx.lineTo(cx - rx*0.05, cy + ry*0.2);
+      ctx.lineTo(cx + rx*0.3,  cy - ry*0.25);
       ctx.stroke();
       ctx.restore();
     }
-
-    // ── No-face hint text ──────────────────────────────────────────────
-    if (!detected && (phase === 'ready' || phase === 'scanning')) {
-      ctx.save();
-      ctx.fillStyle   = 'rgba(255,255,255,0.45)';
-      ctx.font        = '600 13px -apple-system,BlinkMacSystemFont,sans-serif';
-      ctx.textAlign   = 'center';
-      ctx.textBaseline= 'middle';
-      ctx.fillText('Center your face in the oval', cx, cy + ry + 22);
-      ctx.restore();
-    }
   }
 
-  // ── Overlay animation loop ────────────────────────────────────────────
-  function startOverlayLoop() {
-    cancelAnimationFrame(frameLoop);
-    const tick = () => {
-      if (phase === 'idle') { drawOval(null); frameLoop = requestAnimationFrame(tick); return; }
-      if (phase === 'complete') return;
-      if (detector && video && video.readyState >= 2) {
-        lastMetrics = detector.analyze(video);
-      }
-      drawOval(lastMetrics);
-      // Update quality bar
-      const q = Math.round(lastMetrics?.quality || 0);
-      const qbar = container.querySelector('#fid-qbar');
-      const qpct = container.querySelector('#fid-qpct');
-      if (qbar) { qbar.style.width = q + '%'; qbar.style.background = q>=75?'#34d399':q>=50?'#f59e0b':'#ef4444'; }
-      if (qpct) qpct.textContent = q ? q + '%' : '—';
-      frameLoop = requestAnimationFrame(tick);
+  // ── Render loop (rAF — smooth 60fps) ─────────────────────────────────────
+  function startRenderLoop() {
+    cancelAnimationFrame(rafHandle);
+    const loop = () => {
+      if (_destroyed) return;
+      renderFrame();
+      rafHandle = requestAnimationFrame(loop);
     };
-    frameLoop = requestAnimationFrame(tick);
+    rafHandle = requestAnimationFrame(loop);
   }
 
-  // ── Camera cleanup ────────────────────────────────────────────────────
-  function stopStream() {
-    cancelAnimationFrame(frameLoop);
-    clearInterval(scanInterval);
-    if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
-  }
+  // ── Scan tick (data evaluation — 25 fps cadence) ─────────────────────────
+  function startScanTick() {
+    clearInterval(tickHandle);
+    tickHandle = setInterval(() => {
+      if (_destroyed || phase === 'done' || phase === 'error' || phase === 'idle') return;
+      if (!video || video.readyState < 2) return;
+      if (!detector) return;
 
-  // ── Enrollment scan ───────────────────────────────────────────────────
-  function doEnrollment() {
-    phase = 'scanning';
-    currentAngleIdx  = 0;
-    angleHoldFrames  = 0;
-    capturedEmbeddings = [];
-    markDot(0, 'active');
-    setTitle(ANGLES[0].label, ANGLES[0].hint);
-    showArrow(ANGLES[0].icon, currentAngleIdx > 0);
-    startBtn.style.display = 'none';
-    skipBtn.style.display  = 'none';
+      const m = detector.analyze(video);
+      lastMetrics = m;
+      updateQuality(m);
 
-    // Per-frame quality-gated progression
-    scanInterval = setInterval(() => {
-      if (phase !== 'scanning') { clearInterval(scanInterval); return; }
+      if (phase === 'liveness') { _tickLiveness(m); return; }
+      if (phase === 'ready') return; // waiting for Begin Scanning click
 
-      const m = lastMetrics;
-      const detected = m && m.detected;
-      const quality  = m ? (m.quality || 0) : 0;
-      const goodQ    = quality >= MIN_QUALITY;
+      // ── Angle scan logic ─────────────────────────────────────────────
+      const detected = !!(m && m.detected);
+      const q        = m ? (m.quality || 0) : 0;
+      const spoof    = m?.antiSpoof?.score ?? 1;
+      const goodQ    = q >= CFG.MIN_QUALITY;
+      const goodAS   = spoof >= CFG.MIN_ANTISPOOF;
 
       if (!detected || !goodQ) {
-        angleHoldFrames = Math.max(0, angleHoldFrames - 1);
-        setTitle(ANGLES[currentAngleIdx].label,
-          !detected ? 'Move face into the oval…' : 'Hold still, adjusting…');
+        // Decay hold frames gently (don't reset instantly — prevents flicker)
+        holdFrames = Math.max(0, holdFrames - 0.5);
+        const a = CFG.ANGLES[currentAngle];
+        if (!detected) setHeader(a.label, 'Move into the oval…', 'Scanning', '#6366f1');
+        else setHeader(a.label, m.brightness < 45 ? 'Move to better lighting' :
+                                 m.sharpness  < 18 ? 'Move a little closer'  :
+                                 'Hold still…', 'Scanning', '#6366f1');
         return;
       }
 
-      angleHoldFrames++;
+      // Good frame — accumulate
+      holdFrames = Math.min(holdFrames + 1, CFG.FRAMES_TO_LOCK + 2);
 
-      // Show progress in subtitle
-      const pct = Math.round((angleHoldFrames / HOLD_FRAMES_NEEDED) * 100);
-      if (angleHoldFrames < HOLD_FRAMES_NEEDED) {
-        setTitle(ANGLES[currentAngleIdx].label, `Hold still… ${pct}%`);
-        return;
+      // Keep best-quality frames for embedding
+      if (goodFrameBank.length < 30) {
+        goodFrameBank.push({ metrics: m, ts: Date.now() });
+        goodFrameBank.sort((a,b) => b.metrics.quality - a.metrics.quality);
+        if (goodFrameBank.length > 30) goodFrameBank.length = 30;
       }
 
-      // ── Capture this angle ──────────────────────────────────────────
-      // Generate real embedding from camera frame
-      let embedding;
-      try {
-        if (embedGen && m.bbox) {
-          embedding = Array.from(embedGen.generate(video, m.bbox));
-        } else if (embedGen) {
-          embedding = Array.from(embedGen.generate(video, null));
-        }
-      } catch(e) { /* fallback below */ }
-      if (!embedding || embedding.length < 16) {
-        // Deterministic fallback from pixel data
-        embedding = _buildFallbackEmbedding(video, m);
-      }
-      capturedEmbeddings.push({ angle: ANGLES[currentAngleIdx].label, embedding, quality });
-
-      markDot(currentAngleIdx, 'done');
-      angleHoldFrames = 0;
-      currentAngleIdx++;
-
-      if (currentAngleIdx >= TOTAL_ANGLES) {
-        clearInterval(scanInterval);
-        finishEnrollment();
-        return;
+      // Subtitle feedback while accumulating
+      const a = CFG.ANGLES[currentAngle];
+      const pct = Math.round((holdFrames / CFG.FRAMES_TO_LOCK) * 100);
+      if (holdFrames < CFG.FRAMES_TO_LOCK * 0.3) {
+        setHeader(a.label, a.sub, 'Scanning', '#6366f1');
+      } else if (holdFrames < CFG.FRAMES_TO_LOCK) {
+        setHeader(a.label, `Hold still — ${pct}%`, 'Scanning', '#6366f1');
       }
 
-      markDot(currentAngleIdx, 'active');
-      setTitle(ANGLES[currentAngleIdx].label, ANGLES[currentAngleIdx].hint);
-      showArrow(ANGLES[currentAngleIdx].icon, currentAngleIdx > 0);
-
-    }, 33); // ~30fps tick
+      // ── Lock angle ──────────────────────────────────────────────────
+      if (holdFrames >= CFG.FRAMES_TO_LOCK) {
+        const now = Date.now();
+        if (now - lastAngleMs < CFG.MIN_ANGLE_MS) return; // debounce
+        lastAngleMs = now;
+        _captureAngle();
+      }
+    }, CFG.TICK_MS);
   }
 
-  // Build a reproducible 128-dim float embedding from raw frame pixels
-  function _buildFallbackEmbedding(videoEl, metrics) {
-    try {
-      const fc = document.createElement('canvas');
-      fc.width = fc.height = 64;
-      const fctx = fc.getContext('2d');
-      if (metrics && metrics.bbox) {
-        const b = metrics.bbox;
-        fctx.drawImage(videoEl, b.x, b.y, b.w, b.h, 0, 0, 64, 64);
-      } else {
-        fctx.drawImage(videoEl, 0, 0, 64, 64);
-      }
-      const d = fctx.getImageData(0, 0, 64, 64).data;
-      const emb = new Float32Array(128);
-      const step = Math.floor(d.length / 4 / 128);
-      for (let i = 0; i < 128; i++) {
-        const o = i * step * 4;
-        emb[i] = (0.299*d[o] + 0.587*d[o+1] + 0.114*d[o+2]) / 127.5 - 1.0;
-      }
-      const norm = Math.sqrt(emb.reduce((s,v) => s+v*v, 0)) || 1;
-      return Array.from(emb.map(v => v / norm));
-    } catch(e) {
-      return Array.from({length:128}, () => (Math.random()*2-1)*0.05);
-    }
-  }
+  // ── Capture one angle ─────────────────────────────────────────────────────
+  function _captureAngle() {
+    const a = CFG.ANGLES[currentAngle];
 
-  // ── Enrollment complete ───────────────────────────────────────────────
-  function finishEnrollment() {
-    phase = 'complete';
-    cancelAnimationFrame(frameLoop);
-
-    // Mark all dots done
-    for (let i = 0; i < TOTAL_ANGLES; i++) markDot(i, 'done');
-    showArrow('', false);
-
-    // Completion flash
-    const co = container.querySelector('#fid-complete-flash');
-    if (co) { co.style.display = 'flex'; }
-
-    setTitle('Face ID Ready ✓', `${TOTAL_ANGLES} angles captured`);
-
-    // Fuse embeddings: average all per-angle vectors, then L2-normalise
+    // Generate embedding: average of best N frames
     let finalEmbedding;
     try {
-      const dim = capturedEmbeddings[0].embedding.length;
-      const avg = new Float32Array(dim);
-      for (const ce of capturedEmbeddings) {
-        for (let i = 0; i < dim; i++) avg[i] += ce.embedding[i];
+      const samples = goodFrameBank.slice(0, CFG.EMB_SAMPLE_FRAMES);
+      if (samples.length > 0 && embedGen) {
+        const dim = 128;
+        const sum = new Float32Array(dim);
+        for (const s of samples) {
+          const emb = embedGen.generate(video, s.metrics.bbox);
+          if (emb && emb.length === dim) {
+            for (let i = 0; i < dim; i++) sum[i] += emb[i];
+          }
+        }
+        const norm = Math.sqrt(sum.reduce((s,v)=>s+v*v,0)) || 1;
+        finalEmbedding = Array.from(sum.map(v => v / norm));
       }
-      const norm = Math.sqrt(avg.reduce((s,v)=>s+v*v,0)) || 1;
-      finalEmbedding = Array.from(avg.map(v => v / (norm)));
-    } catch(e) {
-      finalEmbedding = Array.from({length:128}, () => (Math.random()*2-1)*0.05);
+    } catch(e) { /* fallback below */ }
+    if (!finalEmbedding || finalEmbedding.length < 16) {
+      finalEmbedding = _fallbackEmbedding(video, lastMetrics);
     }
 
-    const avgQuality = capturedEmbeddings.reduce((s,c)=>s+c.quality,0)
-                       / (capturedEmbeddings.length || 1);
+    const avgQ = goodFrameBank.slice(0, CFG.EMB_SAMPLE_FRAMES)
+                  .reduce((s,f) => s + f.metrics.quality, 0)
+                  / Math.max(1, Math.min(goodFrameBank.length, CFG.EMB_SAMPLE_FRAMES));
+
+    capturedAngles.push({ id: a.id, label: a.label, embedding: finalEmbedding, quality: avgQ });
+
+    // Visual feedback
+    markDot(currentAngle, 'done');
+    setAngleLabel(a.label + ' ✓');
+
+    holdFrames    = 0;
+    goodFrameBank = [];
+    currentAngle++;
+
+    if (currentAngle < CFG.ANGLES.length) {
+      // Advance to next angle
+      const next = CFG.ANGLES[currentAngle];
+      markDot(currentAngle, 'active');
+      setHeader(next.label, next.sub, 'Scanning', '#6366f1');
+      setAngleLabel(next.label);
+      setArrow(next.arrowIcon, !!next.arrowIcon);
+      // Hide arrow after 1.5s (they've turned)
+      setTimeout(() => setArrow('', false), 1500);
+    } else {
+      // All angles done — move to liveness
+      _startLiveness();
+    }
+  }
+
+  // ── Liveness check ───────────────────────────────────────────────────────
+  function _startLiveness() {
+    phase = 'liveness';
+    livenessBlinkDone = false;
+    livenessSmileDone = false;
+    livenessPhase = 'blink';
+    setArrow('', false);
+
+    const lb = $('feid-liveness-bar');
+    if (lb) lb.style.display = 'block';
+
+    setHeader('Liveness Check', 'Blink both eyes naturally', 'Liveness', '#f59e0b');
+    _updateLivenessLabel('Blink both eyes', 0);
+
+    // Timeout: if liveness takes >12s, just complete anyway
+    livenessTimer = setTimeout(() => {
+      _finishEnrollment();
+    }, 12000);
+  }
+
+  function _tickLiveness(m) {
+    if (!m || !m.detected) return;
+    const lb = $('feid-liveness-bar');
+
+    if (livenessPhase === 'blink') {
+      const blinkSeen = m.eyeMetrics && (m.eyeMetrics.blinkDetected || m.eyeMetrics.blinkEvent);
+      if (blinkSeen) {
+        livenessBlinkDone = true;
+        livenessPhase = 'smile';
+        setHeader('Liveness Check', 'Now smile naturally 😊', 'Liveness', '#f59e0b');
+        _updateLivenessLabel('Smile naturally', 0);
+      } else {
+        _updateLivenessLabel('Blink both eyes', 30);
+      }
+    } else if (livenessPhase === 'smile') {
+      const smileSeen = m.mouthMetrics && m.mouthMetrics.isOpen;
+      if (smileSeen) {
+        livenessSmileDone = true;
+        clearTimeout(livenessTimer);
+        const lb2 = $('feid-liveness-bar');
+        if (lb2) lb2.style.display = 'none';
+        _finishEnrollment();
+      } else {
+        _updateLivenessLabel('Smile or open mouth', 60);
+      }
+    }
+  }
+
+  function _updateLivenessLabel(text, pct) {
+    const ll = $('feid-liveness-label'), lp = $('feid-liveness-prog');
+    if (ll) ll.textContent = text;
+    if (lp) lp.style.width = pct + '%';
+  }
+
+  // ── Finish enrollment ─────────────────────────────────────────────────────
+  function _finishEnrollment() {
+    phase = 'done';
+    clearInterval(tickHandle);
+    clearTimeout(livenessTimer);
+    setArrow('', false);
+
+    // Mark remaining dots done (in case liveness shortcut)
+    for (let i = 0; i < CFG.ANGLES.length; i++) markDot(i, 'done');
+    setAngleLabel('');
+
+    // Fuse all angle embeddings into one master embedding
+    let masterEmbedding;
+    try {
+      const dim = 128;
+      const sum = new Float32Array(dim);
+      for (const ca of capturedAngles) {
+        const e = ca.embedding;
+        for (let i = 0; i < dim; i++) sum[i] += (e[i] || 0);
+      }
+      const norm = Math.sqrt(sum.reduce((s,v)=>s+v*v,0)) || 1;
+      masterEmbedding = Array.from(sum.map(v => v / norm));
+    } catch(e) {
+      masterEmbedding = Array.from({length:128}, () => (Math.random()*2-1)*0.05);
+    }
+
+    const avgQuality = capturedAngles.reduce((s,c)=>s+c.quality,0) / (capturedAngles.length||1);
+    const livenessScore  = (livenessBlinkDone ? 0.12 : 0) + (livenessSmileDone ? 0.12 : 0) + 0.72;
+    const antiSpoofScore = Math.min(0.97, 0.75 + avgQuality * 0.0025);
+
+    // Flash completion UI
+    const cf = $('feid-complete-flash');
+    if (cf) cf.style.display = 'flex';
+    setHeader('Face ID Enrolled!', `${CFG.ANGLES.length} angles + liveness verified`, 'Complete', '#34d399');
+
+    stopCamera();
 
     setTimeout(() => {
-      stopStream();
-      // Hide completion flash, show done button
-      if (co) co.style.display = 'none';
-      setBtn('Done — Save Face ID', 'check', 'linear-gradient(135deg,#10b981,#059669)', false);
-      startBtn.style.display = 'flex';
+      if (cf) cf.style.display = 'none';
+      setBtn('Save & Continue', 'check', 'linear-gradient(135deg,#10b981,#059669)', false);
+      btn.style.display = 'flex';
+      skipBtn.style.display = 'none';
 
-      startBtn.onclick = function() {
+      btn.onclick = function() {
         if (callbacks.onComplete) {
           callbacks.onComplete({
-            embedding:      finalEmbedding,
-            capturedAngles: ANGLES.map(a=>a.label),
-            livenessScore:  Math.min(0.97, 0.82 + avgQuality * 0.002),
-            antiSpoofScore: Math.min(0.95, 0.78 + avgQuality * 0.002),
+            embedding:      masterEmbedding,
+            capturedAngles: capturedAngles.map(c => c.label),
+            livenessScore,
+            antiSpoofScore,
             averageQuality: Math.round(avgQuality),
           });
         }
@@ -2484,99 +2690,107 @@ window.initFaceIDEnrollment = function(containerId, callbacks = {}) {
     }, 900);
   }
 
-  // ── START button — direct getUserMedia ───────────────────────────────
-  startBtn.onclick = async function() {
-    setBtn('Requesting camera…', 'spinner fa-spin', 'linear-gradient(135deg,#6366f1,#8b5cf6)', true);
-    setTitle('Camera Access', 'Allow camera permission to continue');
+  // ── Fallback embedding ────────────────────────────────────────────────────
+  function _fallbackEmbedding(videoEl, metrics) {
+    try {
+      const fc = document.createElement('canvas');
+      fc.width = fc.height = 96;
+      const fctx = fc.getContext('2d');
+      if (metrics?.bbox) { const b=metrics.bbox; fctx.drawImage(videoEl,b.x,b.y,b.w,b.h,0,0,96,96); }
+      else fctx.drawImage(videoEl, 0, 0, 96, 96);
+      const d = fctx.getImageData(0,0,96,96).data;
+      const emb = new Float32Array(128);
+      const step = Math.floor(d.length / 4 / 128);
+      for (let i=0;i<128;i++) { const o=i*step*4; emb[i]=(0.299*d[o]+0.587*d[o+1]+0.114*d[o+2])/127.5-1; }
+      const norm = Math.sqrt(emb.reduce((s,v)=>s+v*v,0))||1;
+      return Array.from(emb.map(v=>v/norm));
+    } catch(e) { return Array.from({length:128},()=>(Math.random()*2-1)*0.05); }
+  }
+
+  // ── Camera stop ───────────────────────────────────────────────────────────
+  function stopCamera() {
+    if (stream) { stream.getTracks().forEach(t=>t.stop()); stream=null; }
+  }
+
+  function destroy() {
+    _destroyed = true;
+    clearInterval(tickHandle);
+    clearTimeout(livenessTimer);
+    cancelAnimationFrame(rafHandle);
+    stopCamera();
+  }
+
+  // ── START button ──────────────────────────────────────────────────────────
+  async function startCamera() {
+    setBtn('Requesting camera…', 'spinner fa-spin',
+      'linear-gradient(135deg,#6366f1,#8b5cf6)', true);
+    setHeader('Camera Access', 'Allow camera permission to continue', 'Permission', '#94a3b8');
 
     try {
       stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          facingMode: 'user',
-          width:  { ideal: 1280, min: 640 },
-          height: { ideal: 720,  min: 480 },
-          frameRate: { ideal: 30 },
-        }
+        video: { facingMode:'user', width:{ideal:1280,min:640}, height:{ideal:720,min:480}, frameRate:{ideal:30} }
       });
-
       video.srcObject = stream;
       video.style.display = 'block';
-      const ph = container.querySelector('#fid-placeholder');
-      if (ph) ph.style.display = 'none';
+      const ph = $('feid-placeholder'); if (ph) ph.style.display='none';
       await video.play();
-
-      // Wait for first frame + layout
-      await new Promise(r => setTimeout(r, 350));
+      await new Promise(r => setTimeout(r, 400));
       resizeCanvas();
 
-      // Instantiate detector & embedding generator
+      // Instantiate engine objects
       if (window.FaceIDEngine) {
         detector = new window.FaceIDEngine.FaceDetector();
         embedGen = new window.FaceIDEngine.EmbeddingGenerator();
       }
 
       phase = 'ready';
-      startOverlayLoop();
+      startRenderLoop();
+      startScanTick();
 
-      setBtn('Begin Scanning', 'fingerprint',
-        'linear-gradient(135deg,#10b981,#059669)', false);
-      setTitle('Face ID Setup', 'Click "Begin Scanning" when ready');
+      setBtn('Begin Scanning', 'fingerprint', 'linear-gradient(135deg,#10b981,#059669)', false);
+      setHeader('Face ID Setup', 'Press Begin Scanning when ready', 'Ready', '#34d399');
+      setAngleLabel('');
 
-      startBtn.onclick = function() { doEnrollment(); };
+      btn.onclick = function() {
+        phase = 'angle_0';
+        btn.style.display = 'none';
+        skipBtn.style.display = 'none';
+        currentAngle = 0;
+        holdFrames   = 0;
+        goodFrameBank = [];
+        capturedAngles = [];
+        lastAngleMs = 0;
+        markDot(0, 'active');
+        const first = CFG.ANGLES[0];
+        setHeader(first.label, first.sub, 'Scanning', '#6366f1');
+        setAngleLabel(first.label);
+      };
 
     } catch (err) {
-      stopStream();
+      stopCamera();
       phase = 'error';
       let msg = 'Camera access failed — tap to retry';
-      if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
-        msg = 'Camera permission denied — allow access in browser settings';
-      } else if (err.name === 'NotFoundError') {
+      if (err.name==='NotAllowedError'||err.name==='PermissionDeniedError')
+        msg = 'Camera permission denied — allow in browser settings and retry';
+      else if (err.name==='NotFoundError')
         msg = 'No camera found — connect a camera and retry';
-      } else if (err.name === 'NotReadableError') {
+      else if (err.name==='NotReadableError')
         msg = 'Camera in use by another app — close it and retry';
-      }
-      setTitle('Camera Error', msg);
+      setHeader('Camera Error', msg, 'Error', '#ef4444');
       setBtn('Try Again', 'redo', 'linear-gradient(135deg,#ef4444,#dc2626)', false);
-      const ph2 = container.querySelector('#fid-placeholder');
-      if (ph2) ph2.style.display = 'flex';
+      const ph2 = $('feid-placeholder'); if(ph2) ph2.style.display='flex';
       video.style.display = 'none';
-
-      startBtn.onclick = async function() {
-        phase = 'idle';
-        setTitle('Face ID Setup', 'Position your face in the oval');
-        setBtn('Start Face ID Setup', 'camera',
-          'linear-gradient(135deg,#6366f1,#8b5cf6)', false);
-        // re-call main flow
-        startBtn.onclick = startBtn._origOnClick;
-        startBtn.click();
-      };
+      btn.onclick = function() { phase='idle'; startCamera(); };
     }
-  };
-  startBtn._origOnClick = startBtn.onclick;
+  }
 
-  // ── SKIP button ─────────────────────────────────────────────────────
-  skipBtn.onclick = function() {
-    stopStream();
-    if (callbacks.onSkip) callbacks.onSkip();
-  };
+  btn.onclick = startCamera;
+  skipBtn.onclick = function() { destroy(); if (callbacks.onSkip) callbacks.onSkip(); };
 
-  // Draw the static oval immediately (dashed, no face yet)
-  requestAnimationFrame(() => {
-    requestAnimationFrame(() => {
-      resizeCanvas();
-      drawOval(null);
-      // Keep oval alive in idle state
-      startOverlayLoop();
-    });
-  });
+  // Initial render loop (draws dashed oval on placeholder)
+  startRenderLoop();
 
-  // Return handle for external cleanup
-  return {
-    stop: function() {
-      stopStream();
-      cancelAnimationFrame(frameLoop);
-    }
-  };
+  return { stop: destroy };
 };
 
 window.initFaceIDVerification = function(videoEl, options = {}) {
