@@ -1355,18 +1355,23 @@ async function loadMembers() {
 
 function openAddMemberModal() {
   openModal(`
-  <h3 class="text-lg font-bold text-white mb-5">Add Household Member</h3>
+  <h3 class="text-lg font-bold text-white mb-5"><i class="fas fa-user-plus mr-2 text-indigo-400"></i>Add Household Member</h3>
   <div class="space-y-4">
-    <div><label class="text-xs text-gray-500 mb-1 block">Full Name *</label><input id="mm-name" class="input" placeholder="Riley Kim"></div>
-    <div><label class="text-xs text-gray-500 mb-1 block">Email *</label><input id="mm-email" type="email" class="input" placeholder="riley@email.com"></div>
-    <div><label class="text-xs text-gray-500 mb-1 block">Phone</label><input id="mm-phone" class="input" placeholder="+1 555 0101"></div>
+    <div><label class="text-xs text-gray-500 mb-1 block">Full Name *</label><input id="mm-name" class="input" placeholder="Riley Kim" maxlength="80" autocomplete="off"></div>
+    <div><label class="text-xs text-gray-500 mb-1 block">Email Address *</label><input id="mm-email" type="email" class="input" placeholder="riley@email.com" maxlength="254" autocomplete="off"></div>
+    <div><label class="text-xs text-gray-500 mb-1 block">Phone</label><input id="mm-phone" class="input" placeholder="+1 555 0101" maxlength="30"></div>
     <div><label class="text-xs text-gray-500 mb-1 block">Role</label>
-      <select id="mm-role" class="input"><option value="member">Member</option><option value="owner">Owner</option></select>
+      <select id="mm-role" class="input">
+        <option value="member">Member</option>
+        <option value="admin">Admin</option>
+        <option value="owner">Owner</option>
+      </select>
     </div>
+    <div id="mm-error" style="display:none;padding:8px 12px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.2);border-radius:8px;font-size:12px;color:#fca5a5"></div>
   </div>
   <div class="flex gap-3 mt-6">
     <button onclick="closeModal()" class="btn-ghost flex-1">Cancel</button>
-    <button onclick="saveMember()" class="btn-primary flex-1"><i class="fas fa-user-plus mr-1"></i> Add Member</button>
+    <button onclick="saveMember()" id="mm-save-btn" class="btn-primary flex-1"><i class="fas fa-user-plus mr-1"></i> Add Member</button>
   </div>`);
 }
 
@@ -1375,23 +1380,33 @@ async function saveMember() {
   const email = document.getElementById('mm-email')?.value.trim();
   const phone = document.getElementById('mm-phone')?.value.trim();
   const role  = document.getElementById('mm-role')?.value;
-  if (!name || !email) { toast('Name and email required', 'warn'); return; }
-  if (!isValidEmail(email)) { toast('Invalid email address', 'warn'); return; }
-  if (name.length > 80) { toast('Name too long (max 80 chars)', 'warn'); return; }
+  const errEl = document.getElementById('mm-error');
+  const btn   = document.getElementById('mm-save-btn');
+
+  const showErr = (msg) => { if (errEl) { errEl.textContent = msg; errEl.style.display = ''; } toast(msg, 'warn'); };
+
+  if (!name || !email) { showErr('Name and email are required.'); return; }
+  if (!isValidEmail(email)) { showErr('Please enter a valid email address.'); return; }
+  if (name.length > 80) { showErr('Name too long (max 80 chars).'); return; }
+  if (errEl) errEl.style.display = 'none';
+
+  if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-1"></i> Adding…'; }
+
   try {
-    const r = await axios.post(`${API}/api/home/users`, {
+    await axios.post(`${API}/api/home/users`, {
       home_id: currentHomeId,
       name, email,
       phone: phone || null,
-      role: ['owner','member','guest'].includes(role) ? role : 'member',
+      role: ['owner','member','admin'].includes(role) ? role : 'member',
     });
-    // Auto-enroll face placeholder so member shows up with enrolled state
-    await axios.post(`${API}/api/home/users/${r.data.user.id}/face`, { image_quality: 0.95 });
     closeModal();
-    toast('Member added — tap Enroll Face ID to capture their biometrics');
+    toast(`✓ ${name} added — tap "Enroll Face ID" on their card to capture biometrics`, 'success');
     loadMembers();
   } catch(e) {
-    toast(e.response?.data?.error || 'Failed to add member', 'error');
+    if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-user-plus mr-1"></i> Add Member'; }
+    const msg = e.response?.data?.error || 'Failed to add member';
+    showErr(msg);
+    toast(msg, 'error');
   }
 }
 
@@ -1470,27 +1485,31 @@ async function removeMember(userId) {
 // ═══════════════════════════════════════════════════════
 async function loadGuests() {
   const r = await axios.get(`${API}/api/home/guests?home_id=${currentHomeId}`).catch(()=>({data:{guests:[]}}));
-  const guests = r.data.guests || [];
+  // Backend already filters out revoked passes; only active/pending/expired shown
+  const guests = (r.data.guests || []).filter(g => g.status !== 'revoked');
   const locksR = await axios.get(`${API}/api/home/locks?home_id=${currentHomeId}`).catch(()=>({data:{locks:[]}}));
   const locks = locksR.data.locks || [];
+  const locksJson = JSON.stringify(locks).replace(/"/g,'&quot;');
   document.getElementById('tab-guests').innerHTML = `
   <div class="flex items-center justify-between mb-6">
     <h2 class="text-xl font-bold text-white">Guest Passes</h2>
-    <button onclick="openAddGuestModal(${JSON.stringify(locks).replace(/"/g,'&quot;')})" class="btn-primary"><i class="fas fa-ticket mr-2"></i>Create Guest Pass</button>
+    <button onclick="openAddGuestModal(${locksJson})" class="btn-primary"><i class="fas fa-ticket mr-2"></i>Create Guest Pass</button>
   </div>
   ${guests.length === 0 ? `
   <div class="card p-10 text-center">
     <i class="fas fa-ticket text-gray-700 text-5xl mb-4"></i>
-    <h3 class="text-lg font-bold text-white mb-2">No guest passes yet</h3>
+    <h3 class="text-lg font-bold text-white mb-2">No active guest passes</h3>
     <p class="text-gray-500 mb-4">Create a temporary pass for cleaners, dog walkers, or friends.</p>
-    <button onclick="openAddGuestModal(${JSON.stringify(locks).replace(/"/g,'&quot;')})" class="btn-primary">Create Guest Pass</button>
+    <button onclick="openAddGuestModal(${locksJson})" class="btn-primary">Create Guest Pass</button>
   </div>` :
   `<div class="space-y-3">
     ${guests.map(g => {
-      const now = new Date();
+      const nowTs = new Date();
       const validUntil = new Date(g.valid_until);
-      const expired = validUntil < now;
-      const daysLeft = Math.max(0, Math.ceil((validUntil - now) / 86400000));
+      const expired = validUntil < nowTs;
+      const daysLeft = Math.max(0, Math.ceil((validUntil - nowTs) / 86400000));
+      const statusLabel = expired ? 'expired' : g.status;
+      const statusBadge = g.status==='active' && !expired ? 'badge-green' : expired ? 'badge-red' : 'badge-yellow';
       return `
       <div class="card p-5 ${expired ? 'opacity-60' : ''}">
         <div class="flex items-center gap-4">
@@ -1500,17 +1519,17 @@ async function loadGuests() {
           <div class="flex-1 min-w-0">
             <div class="flex items-center gap-2 flex-wrap">
               <span class="font-bold text-white">${esc(g.name)}</span>
-              <span class="badge ${g.status==='active'?'badge-green':g.status==='revoked'?'badge-red':expired?'badge-red':'badge-yellow'}">${expired ? 'expired' : g.status}</span>
+              <span class="badge ${statusBadge}">${statusLabel}</span>
             </div>
-            <div class="text-xs text-gray-500 mt-0.5">${esc(g.email) || 'No email'} · ${esc(g.time_start)}–${esc(g.time_end)} · ${esc(g.days_allowed)}</div>
+            <div class="text-xs text-gray-500 mt-0.5">${esc(g.email) || 'No email'} · ${esc(g.time_start)||'00:00'}–${esc(g.time_end)||'23:59'} · ${esc(g.days_allowed)||'All days'}</div>
             <div class="text-xs text-gray-600">Valid: ${fmtDate(g.valid_from)} → ${fmtDate(g.valid_until)}${!expired ? ` <span class="text-indigo-400">(${daysLeft}d left)</span>` : ''}</div>
           </div>
           <div class="flex gap-2 flex-shrink-0">
-            ${g.status === 'pending' ? `<button onclick="activateGuest('${g.id}')" class="py-1.5 px-3 text-xs bg-green-500/15 text-green-400 hover:bg-green-500/25 rounded-lg border border-green-500/20">Activate</button>` : ''}
-            ${g.status !== 'revoked' ? `<button onclick="revokeGuest('${g.id}')" class="py-1.5 px-3 text-xs bg-red-500/10 text-red-400 hover:bg-red-500/20 rounded-lg border border-red-500/20">Revoke</button>` : ''}
+            ${g.status === 'pending' ? `<button onclick="activateGuest('${esc(g.id)}')" class="py-1.5 px-3 text-xs bg-green-500/15 text-green-400 hover:bg-green-500/25 rounded-lg border border-green-500/20"><i class="fas fa-check mr-1"></i>Activate</button>` : ''}
+            <button onclick="deleteGuest('${esc(g.id)}')" class="py-1.5 px-3 text-xs bg-red-500/10 text-red-400 hover:bg-red-500/20 rounded-lg border border-red-500/20"><i class="fas fa-trash mr-1"></i>Delete</button>
           </div>
         </div>
-        ${g.invite_token ? `<div class="mt-3 p-2 bg-gray-900 rounded-lg flex items-center gap-2 text-xs"><i class="fas fa-key text-indigo-400"></i><span class="text-gray-400">Token: </span><code class="text-indigo-300 font-mono">${esc(g.invite_token)}</code></div>` : ''}
+        ${g.invite_token ? `<div class="mt-3 p-2 bg-gray-900 rounded-lg flex items-center gap-2 text-xs"><i class="fas fa-key text-indigo-400"></i><span class="text-gray-400">Invite Token:</span><code class="text-indigo-300 font-mono select-all">${esc(g.invite_token)}</code></div>` : ''}
       </div>`}).join('')}
   </div>`}`;
 }
@@ -1578,14 +1597,24 @@ async function activateGuest(id) {
   loadGuests();
 }
 
-async function revokeGuest(id) {
+async function deleteGuest(id) {
   if (!id || !isValidId(id)) return;
-  if (!confirm('Revoke this guest pass?')) return;
+  if (!confirm('Permanently delete this guest pass? This cannot be undone.')) return;
   try {
     await axios.delete(`${API}/api/home/guests/${id}`);
-    toast('Guest pass revoked');
+    toast('Guest pass deleted', 'success');
     loadGuests();
-  } catch(e) { toast(e.response?.data?.error || 'Failed to revoke pass', 'error'); }
+  } catch(e) { toast(e.response?.data?.error || 'Failed to delete pass', 'error'); }
+}
+
+async function revokeGuest(id) {
+  if (!id || !isValidId(id)) return;
+  if (!confirm('Delete this guest pass? This action cannot be undone.')) return;
+  try {
+    await axios.delete(`${API}/api/home/guests/${id}`);
+    toast('Guest pass removed', 'success');
+    loadGuests();
+  } catch(e) { toast(e.response?.data?.error || 'Failed to remove pass', 'error'); }
 }
 
 // ═══════════════════════════════════════════════════════
@@ -1639,42 +1668,94 @@ async function loadDevices() {
 }
 
 function openAddDeviceModal() {
-  openModal(`
-  <h3 class="text-lg font-bold text-white mb-5">Register Trusted Device</h3>
-  <div class="space-y-4">
-    <div><label class="text-xs text-gray-500 mb-1 block">Device Name *</label><input id="dd-name" class="input" placeholder="Jordan's iPhone 15"></div>
-    <div class="grid grid-cols-2 gap-3">
-      <div><label class="text-xs text-gray-500 mb-1 block">Platform</label>
-        <select id="dd-platform" class="input"><option value="ios">iOS</option><option value="android">Android</option></select>
+  // Load members for the selector
+  axios.get(`${API}/api/home/members/${currentHomeId}`).then(r => {
+    const members = r.data.members || [];
+    const memberOpts = members.map(m => `<option value="${esc(m.id)}">${esc(m.name)} (${esc(m.role)})</option>`).join('');
+    openModal(`
+    <h3 class="text-lg font-bold text-white mb-5"><i class="fas fa-mobile-alt mr-2 text-indigo-400"></i>Register Trusted Device</h3>
+    <div class="space-y-4">
+      <div>
+        <label class="text-xs text-gray-500 mb-1 block">Member *</label>
+        <select id="dd-user" class="input">
+          <option value="">— Select member —</option>
+          ${memberOpts}
+        </select>
       </div>
-      <div><label class="text-xs text-gray-500 mb-1 block">Push Token (optional)</label><input id="dd-push" class="input" placeholder="FCM/APNs token"></div>
+      <div><label class="text-xs text-gray-500 mb-1 block">Device Name *</label>
+        <input id="dd-name" class="input" placeholder="Jordan's iPhone 15" maxlength="80" autocomplete="off">
+      </div>
+      <div class="grid grid-cols-2 gap-3">
+        <div><label class="text-xs text-gray-500 mb-1 block">Platform</label>
+          <select id="dd-platform" class="input">
+            <option value="ios">iOS (iPhone/iPad)</option>
+            <option value="android">Android</option>
+            <option value="web">Web / Browser</option>
+          </select>
+        </div>
+        <div><label class="text-xs text-gray-500 mb-1 block">Push Token (optional)</label>
+          <input id="dd-push" class="input" placeholder="FCM/APNs token" maxlength="500">
+        </div>
+      </div>
+      <div>
+        <label class="text-xs text-gray-500 mb-1 block">Device Fingerprint (optional)</label>
+        <input id="dd-fingerprint" class="input" placeholder="Browser fingerprint or device ID" maxlength="200">
+        <p class="text-xs text-gray-600 mt-1">Leave blank to auto-generate from browser. Used for proximity verification.</p>
+      </div>
+      <div class="p-3 bg-blue-500/10 border border-blue-500/20 rounded-xl text-xs text-blue-300">
+        <i class="fas fa-bluetooth mr-1"></i> A unique BLE UUID will be auto-assigned for proximity detection.
+        <button onclick="autofillFingerprint()" class="ml-2 underline cursor-pointer">Auto-detect fingerprint</button>
+      </div>
+      <div id="dd-error" style="display:none;padding:8px 12px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.2);border-radius:8px;font-size:12px;color:#fca5a5"></div>
     </div>
-    <div class="p-4 bg-blue-500/10 border border-blue-500/20 rounded-xl text-xs text-blue-300">
-      <i class="fas fa-info-circle mr-1"></i> A unique BLE UUID will be auto-generated for this device. Install the FaceAccess Home app to enable BLE broadcasting.
-    </div>
-  </div>
-  <div class="flex gap-3 mt-6">
-    <button onclick="closeModal()" class="btn-ghost flex-1">Cancel</button>
-    <button onclick="saveDevice()" class="btn-primary flex-1"><i class="fas fa-mobile-alt mr-1"></i> Register Device</button>
-  </div>`);
+    <div class="flex gap-3 mt-6">
+      <button onclick="closeModal()" class="btn-ghost flex-1">Cancel</button>
+      <button onclick="saveDevice()" id="dd-save-btn" class="btn-primary flex-1"><i class="fas fa-mobile-alt mr-1"></i> Register Device</button>
+    </div>`);
+  }).catch(() => {
+    toast('Failed to load members', 'error');
+  });
+}
+
+function autofillFingerprint() {
+  const fp = navigator.userAgent + '|' + screen.width + 'x' + screen.height + '|' + Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const hash = btoa(fp).replace(/[^a-zA-Z0-9]/g, '').substring(0, 32);
+  const el = document.getElementById('dd-fingerprint');
+  if (el) { el.value = hash; toast('Fingerprint detected', 'info'); }
 }
 
 async function saveDevice() {
+  const userId = document.getElementById('dd-user')?.value;
   const name = document.getElementById('dd-name')?.value.trim();
-  if (!name) { toast('Device name required', 'warn'); return; }
-  if (name.length > 80) { toast('Name too long (max 80 chars)', 'warn'); return; }
+  const errEl = document.getElementById('dd-error');
+  const btn = document.getElementById('dd-save-btn');
+  const showErr = (msg) => { if (errEl) { errEl.textContent = msg; errEl.style.display = ''; } toast(msg, 'warn'); };
+
+  if (!userId) { showErr('Please select a member.'); return; }
+  if (!name) { showErr('Device name is required.'); return; }
+  if (name.length > 80) { showErr('Name too long (max 80 chars).'); return; }
   const platform = document.getElementById('dd-platform')?.value;
-  if (!['ios','android'].includes(platform)) { toast('Invalid platform', 'warn'); return; }
+  if (!['ios','android','web'].includes(platform)) { showErr('Please select a valid platform.'); return; }
+  if (errEl) errEl.style.display = 'none';
+  if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-1"></i> Registering…'; }
   try {
     const r = await axios.post(`${API}/api/home/devices`, {
-      user_id: currentUserId, home_id: currentHomeId, name,
+      user_id: userId,
+      home_id: currentHomeId,
+      name,
       platform,
-      push_token: document.getElementById('dd-push')?.value.trim() || null
+      push_token: document.getElementById('dd-push')?.value.trim() || null,
+      device_fingerprint: document.getElementById('dd-fingerprint')?.value.trim() || null,
     });
     closeModal();
-    toast(`Device registered — BLE UUID: ${r.data.ble_uuid}`);
+    toast(`✓ Device registered — BLE UUID: ${r.data.ble_uuid || 'assigned'}`, 'success');
     loadDevices();
-  } catch(e) { toast(e.response?.data?.error || 'Failed to register device', 'error'); }
+  } catch(e) {
+    if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-mobile-alt mr-1"></i> Register Device'; }
+    const msg = e.response?.data?.error || 'Failed to register device';
+    showErr(msg);
+    toast(msg, 'error');
+  }
 }
 
 async function toggleDeviceTrust(id, trusted) {
@@ -1771,17 +1852,22 @@ async function loadCameras() {
 
 function openAddCameraModal(locks) {
   openModal(`
-  <h3 class="text-lg font-bold text-white mb-5">Add Camera</h3>
+  <h3 class="text-lg font-bold text-white mb-5"><i class="fas fa-camera mr-2 text-indigo-400"></i>Add Camera</h3>
   <div class="space-y-4">
-    <div><label class="text-xs text-gray-500 mb-1 block">Camera Name *</label><input id="cc-name" class="input" placeholder="Front Door Camera"></div>
+    <div><label class="text-xs text-gray-500 mb-1 block">Camera Name *</label>
+      <input id="cc-name" class="input" placeholder="Front Door Camera" maxlength="80">
+    </div>
     <div class="grid grid-cols-2 gap-3">
       <div><label class="text-xs text-gray-500 mb-1 block">Camera Type</label>
         <select id="cc-type" class="input" onchange="updateCameraURLHint(this.value)">
+          <option value="usb">USB Camera (local)</option>
+          <option value="laptop">Laptop / Built-in Webcam</option>
           <option value="rtsp">RTSP / IP Camera</option>
           <option value="ring">Ring Doorbell</option>
           <option value="nest">Google Nest</option>
           <option value="arlo">Arlo</option>
           <option value="webrtc">WebRTC</option>
+          <option value="ip">Generic IP Camera</option>
         </select>
       </div>
       <div><label class="text-xs text-gray-500 mb-1 block">Linked Lock</label>
@@ -1792,30 +1878,60 @@ function openAddCameraModal(locks) {
       </div>
     </div>
     <div>
-      <label class="text-xs text-gray-500 mb-1 block">Stream URL / API Key</label>
+      <label class="text-xs text-gray-500 mb-1 block">Stream URL / API Key / Device ID</label>
       <input id="cc-url" class="input" placeholder="rtsp://192.168.1.100:554/stream">
       <p id="cc-url-hint" class="text-xs text-gray-600 mt-1">RTSP stream URL from your IP camera</p>
     </div>
+    <div id="cc-error" style="display:none;padding:8px 12px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.2);border-radius:8px;font-size:12px;color:#fca5a5"></div>
   </div>
   <div class="flex gap-3 mt-6">
     <button onclick="closeModal()" class="btn-ghost flex-1">Cancel</button>
-    <button onclick="saveCamera()" class="btn-primary flex-1">Add Camera</button>
+    <button onclick="saveCamera()" id="cc-save-btn" class="btn-primary flex-1"><i class="fas fa-camera mr-1"></i> Add Camera</button>
   </div>`);
+  // Set initial hint
+  updateCameraURLHint('usb');
 }
 
 function updateCameraURLHint(type) {
-  const hints = { rtsp: 'RTSP stream URL (e.g. rtsp://192.168.1.100:554/stream)', ring: 'Your Ring API access token from ring.com/account', nest: 'Google OAuth token from Google Smart Device Management API', arlo: 'Arlo API key from my.arlo.com', webrtc: 'WebRTC SDP endpoint URL' };
+  const hints = {
+    usb:    'USB device index or path (e.g. /dev/video0 or 0). Leave blank for default camera.',
+    laptop: 'Leave blank to use the built-in webcam. Device index 0 for first camera.',
+    rtsp:   'RTSP stream URL (e.g. rtsp://192.168.1.100:554/stream)',
+    ring:   'Your Ring API access token from ring.com/account',
+    nest:   'Google OAuth token from Google Smart Device Management API',
+    arlo:   'Arlo API key from my.arlo.com',
+    webrtc: 'WebRTC SDP endpoint URL',
+    ip:     'HTTP/MJPEG stream URL (e.g. http://192.168.1.100/video)',
+  };
+  const placeholders = {
+    usb:    '/dev/video0  (or leave blank)',
+    laptop: 'Leave blank for default webcam',
+    rtsp:   'rtsp://192.168.1.100:554/stream',
+    ring:   'Ring API access token',
+    nest:   'Google OAuth token',
+    arlo:   'Arlo API key',
+    webrtc: 'WebRTC SDP endpoint',
+    ip:     'http://192.168.1.100/video',
+  };
   const h = document.getElementById('cc-url-hint');
+  const u = document.getElementById('cc-url');
   if (h) h.textContent = hints[type] || '';
+  if (u) u.placeholder = placeholders[type] || '';
 }
 
 async function saveCamera() {
   const name = document.getElementById('cc-name')?.value.trim();
-  if (!name) { toast('Camera name required', 'warn'); return; }
-  if (name.length > 80) { toast('Name too long (max 80 chars)', 'warn'); return; }
+  const errEl = document.getElementById('cc-error');
+  const btn = document.getElementById('cc-save-btn');
+  const showErr = (msg) => { if (errEl) { errEl.textContent = msg; errEl.style.display = ''; } toast(msg, 'warn'); };
+
+  if (!name) { showErr('Camera name is required.'); return; }
+  if (name.length > 80) { showErr('Name too long (max 80 chars).'); return; }
   const camType = document.getElementById('cc-type')?.value;
-  const validCamTypes = ['rtsp','ring','nest','arlo','webrtc'];
-  if (!validCamTypes.includes(camType)) { toast('Invalid camera type', 'warn'); return; }
+  const validCamTypes = ['rtsp','ring','nest','arlo','webrtc','usb','laptop','ip'];
+  if (!validCamTypes.includes(camType)) { showErr('Invalid camera type.'); return; }
+  if (errEl) errEl.style.display = 'none';
+  if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-1"></i> Adding…'; }
   try {
     await axios.post(`${API}/api/home/cameras`, {
       home_id: currentHomeId,
@@ -1825,9 +1941,14 @@ async function saveCamera() {
       camera_type: camType,
     });
     closeModal();
-    toast('Camera added');
+    toast('✓ Camera added successfully', 'success');
     loadCameras();
-  } catch(e) { toast(e.response?.data?.error || 'Failed to add camera', 'error'); }
+  } catch(e) {
+    if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-camera mr-1"></i> Add Camera'; }
+    const msg = e.response?.data?.error || 'Failed to add camera';
+    showErr(msg);
+    toast(msg, 'error');
+  }
 }
 
 async function deleteCam(id) {
@@ -1843,40 +1964,198 @@ async function deleteCam(id) {
 // ═══════════════════════════════════════════════════════
 //  AUTOMATIONS
 // ═══════════════════════════════════════════════════════
+
+const TRIGGER_LABELS = {
+  face_granted:   'Face Recognized (Access Granted)',
+  face_denied:    'Face Denied (Unknown/Low Confidence)',
+  face_unknown:   'Unknown Face Detected',
+  unusual_time:   'Access at Unusual Hour',
+  guest_entry:    'Guest Pass Used',
+  manual:         'Manual Trigger',
+  arrival:        'Family Member Arrives',
+  departure:      'Family Member Leaves',
+  time_schedule:  'Time / Schedule',
+  spoof_detected: 'Spoof Attack Detected',
+  low_trust:      'Low Trust Score',
+};
+const ACTION_LABELS = {
+  notify:  'Send Push Notification',
+  unlock:  'Unlock Door',
+  lock:    'Lock Door',
+  alert:   'Trigger Security Alert',
+  webhook: 'Call Webhook',
+  scene:   'Activate Scene',
+  log:     'Log to Audit Trail',
+};
+const TRIGGER_ICONS = {
+  face_granted:'fa-face-smile',face_denied:'fa-face-frown',face_unknown:'fa-question-circle',
+  unusual_time:'fa-clock',guest_entry:'fa-ticket',manual:'fa-hand-pointer',
+  arrival:'fa-arrow-right-to-bracket',departure:'fa-arrow-right-from-bracket',
+  time_schedule:'fa-calendar-clock',spoof_detected:'fa-skull',low_trust:'fa-triangle-exclamation',
+};
+const ACTION_ICONS = {
+  notify:'fa-bell',unlock:'fa-lock-open',lock:'fa-lock',alert:'fa-siren',
+  webhook:'fa-webhook',scene:'fa-lightbulb',log:'fa-list',
+};
+
 async function loadAutomations() {
   const r = await axios.get(`${API}/api/home/automations/${currentHomeId}`).catch(()=>({data:{automations:[]}}));
   const autos = r.data.automations || [];
-  document.getElementById('tab-automations').innerHTML = `
+  const el = document.getElementById('tab-automations');
+  el.innerHTML = `
   <div class="flex items-center justify-between mb-6">
-    <h2 class="text-xl font-bold text-white">Automations</h2>
-    <span class="badge badge-gray text-xs">Beta</span>
+    <h2 class="text-xl font-bold text-white">Automations <span class="badge badge-indigo text-xs ml-2">Rules Engine</span></h2>
+    <button onclick="openAddAutomationModal()" class="btn-primary"><i class="fas fa-bolt mr-2"></i>New Rule</button>
   </div>
   ${autos.length === 0 ? `
-  <div class="card p-10 text-center">
+  <div class="card p-8 text-center">
     <i class="fas fa-bolt text-gray-700 text-5xl mb-4"></i>
-    <h3 class="text-lg font-bold text-white mb-2">Smart Automations</h3>
-    <p class="text-gray-500 mb-2">Coming soon: Set rules like "Lock all doors at 11pm" or "Notify when guest arrives".</p>
-    <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-6 max-w-lg mx-auto text-left">
-      ${[['Auto-lock at bedtime','Lock all doors at 11pm every night','fa-moon'],['Arrival mode','Unlock front door when family member returns home','fa-home'],['Guest arrival alert','Notify when a guest pass is used','fa-bell'],['Away mode','Lock all doors and enable security when everyone leaves','fa-shield-alt']].map(([t,d,i])=>`
-      <div class="p-4 bg-gray-900 rounded-xl border border-gray-800 opacity-60">
-        <div class="flex items-center gap-2 mb-1"><i class="fas ${i} text-indigo-400"></i><span class="font-semibold text-white text-sm">${t}</span></div>
+    <h3 class="text-lg font-bold text-white mb-2">No automation rules yet</h3>
+    <p class="text-gray-500 mb-4">Create event-based rules to automate your home security.</p>
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-4 max-w-lg mx-auto text-left mb-6">
+      ${[
+        ['Auto-lock at bedtime','Lock all doors at 11 pm every night','fa-moon','time_schedule','lock'],
+        ['Alert on unknown face','Notify when an unknown face is detected','fa-bell','face_unknown','notify'],
+        ['Guest arrival alert','Log when a guest pass is activated','fa-ticket','guest_entry','log'],
+        ['Spoof attack alert','Trigger alert if spoof attack is detected','fa-skull','spoof_detected','alert'],
+      ].map(([t,d,i,trigger,action])=>`
+      <div onclick="openAddAutomationModal('${trigger}','${action}')" class="p-4 bg-gray-900 rounded-xl border border-gray-800 hover:border-indigo-500/40 transition-colors cursor-pointer group">
+        <div class="flex items-center gap-2 mb-1"><i class="fas ${i} text-indigo-400 group-hover:text-indigo-300"></i><span class="font-semibold text-white text-sm">${t}</span></div>
         <p class="text-xs text-gray-500">${d}</p>
       </div>`).join('')}
     </div>
+    <button onclick="openAddAutomationModal()" class="btn-primary">Create Automation Rule</button>
   </div>` :
-  `<div class="space-y-3">${autos.map(a => `
-  <div class="card p-4 flex items-center gap-4">
-    <div class="w-10 h-10 rounded-xl bg-indigo-500/15 flex items-center justify-center"><i class="fas fa-bolt text-indigo-400"></i></div>
-    <div class="flex-1"><div class="font-medium text-white">${esc(a.name)}</div><div class="text-xs text-gray-500">${esc(a.trigger_type)} → ${esc(a.action_type)}</div></div>
-    <button onclick="toggleAuto('${a.id}')" class="w-12 h-6 rounded-full ${a.enabled ? 'bg-indigo-500' : 'bg-gray-700'} relative transition-colors cursor-pointer border-0">
-      <div class="w-4 h-4 rounded-full bg-white absolute top-1 ${a.enabled ? 'right-1' : 'left-1'} transition-all"></div>
-    </button>
-  </div>`).join('')}</div>`}`;
+  `<div class="space-y-3">
+    ${autos.map(a => {
+      const trigLabel = TRIGGER_LABELS[a.trigger_type] || a.trigger_type;
+      const actLabel  = ACTION_LABELS[a.action_type]  || a.action_type;
+      const trigIcon  = TRIGGER_ICONS[a.trigger_type] || 'fa-bolt';
+      const actIcon   = ACTION_ICONS[a.action_type]   || 'fa-cog';
+      return `
+  <div class="card p-4">
+    <div class="flex items-center gap-4">
+      <div class="w-10 h-10 rounded-xl bg-indigo-500/15 flex items-center justify-center flex-shrink-0">
+        <i class="fas ${trigIcon} text-indigo-400"></i>
+      </div>
+      <div class="flex-1 min-w-0">
+        <div class="font-medium text-white">${esc(a.name)}</div>
+        <div class="text-xs text-gray-500 mt-0.5">
+          <span class="text-indigo-400"><i class="fas ${trigIcon} mr-1"></i>${trigLabel}</span>
+          <span class="text-gray-600 mx-2">→</span>
+          <span class="text-green-400"><i class="fas ${actIcon} mr-1"></i>${actLabel}</span>
+        </div>
+      </div>
+      <div class="flex items-center gap-3 flex-shrink-0">
+        <button onclick="toggleAuto('${esc(a.id)}')" title="${a.enabled ? 'Disable' : 'Enable'}"
+          class="w-12 h-6 rounded-full ${a.enabled ? 'bg-indigo-500' : 'bg-gray-700'} relative transition-colors cursor-pointer border-0 flex-shrink-0">
+          <div class="w-4 h-4 rounded-full bg-white absolute top-1 ${a.enabled ? 'right-1' : 'left-1'} transition-all"></div>
+        </button>
+        <button onclick="deleteAutomation('${esc(a.id)}')" class="py-1.5 px-3 text-xs bg-red-500/10 text-red-400 hover:bg-red-500/20 rounded-lg border border-red-500/20 transition-colors">
+          <i class="fas fa-trash"></i>
+        </button>
+      </div>
+    </div>
+    ${a.conditions && a.conditions !== '{}' ? `
+    <div class="mt-2 ml-14 text-xs text-gray-600 font-mono bg-gray-900 px-3 py-1.5 rounded-lg">
+      <i class="fas fa-filter mr-1 text-gray-500"></i>Conditions: ${esc(a.conditions)}
+    </div>` : ''}
+  </div>`}).join('')}
+  </div>`}`;
+}
+
+function openAddAutomationModal(defaultTrigger, defaultAction) {
+  const triggerOpts = Object.entries(TRIGGER_LABELS).map(([v,l]) =>
+    `<option value="${v}" ${v === (defaultTrigger||'face_granted') ? 'selected' : ''}>${l}</option>`
+  ).join('');
+  const actionOpts = Object.entries(ACTION_LABELS).map(([v,l]) =>
+    `<option value="${v}" ${v === (defaultAction||'notify') ? 'selected' : ''}>${l}</option>`
+  ).join('');
+
+  openModal(`
+  <h3 class="text-lg font-bold text-white mb-5"><i class="fas fa-bolt mr-2 text-indigo-400"></i>Create Automation Rule</h3>
+  <div class="space-y-4">
+    <div>
+      <label class="text-xs text-gray-500 mb-1 block">Rule Name *</label>
+      <input id="auto-name" class="input" placeholder="e.g. Alert on unknown face" maxlength="120" autocomplete="off">
+    </div>
+    <div class="grid grid-cols-1 gap-3">
+      <div>
+        <label class="text-xs text-gray-500 mb-1 block"><i class="fas fa-bolt text-indigo-400 mr-1"></i>Trigger — When this happens…</label>
+        <select id="auto-trigger" class="input">${triggerOpts}</select>
+      </div>
+      <div>
+        <label class="text-xs text-gray-500 mb-1 block"><i class="fas fa-cog text-green-400 mr-1"></i>Action — Do this…</label>
+        <select id="auto-action" class="input">${actionOpts}</select>
+      </div>
+    </div>
+    <div>
+      <label class="text-xs text-gray-500 mb-1 block">Condition (optional JSON)</label>
+      <input id="auto-condition" class="input font-mono text-xs" placeholder='{"min_hour": 22, "max_hour": 6}' maxlength="500">
+      <p class="text-xs text-gray-600 mt-1">Optional filter conditions, e.g. time range, trust threshold, lock ID</p>
+    </div>
+    <div id="auto-error" style="display:none;padding:8px 12px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.2);border-radius:8px;font-size:12px;color:#fca5a5"></div>
+  </div>
+  <div class="flex gap-3 mt-6">
+    <button onclick="closeModal()" class="btn-ghost flex-1">Cancel</button>
+    <button onclick="saveAutomation()" id="auto-save-btn" class="btn-primary flex-1"><i class="fas fa-bolt mr-1"></i> Create Rule</button>
+  </div>`);
+}
+
+async function saveAutomation() {
+  const name    = document.getElementById('auto-name')?.value.trim();
+  const trigger = document.getElementById('auto-trigger')?.value;
+  const action  = document.getElementById('auto-action')?.value;
+  const condStr = document.getElementById('auto-condition')?.value.trim();
+  const errEl   = document.getElementById('auto-error');
+  const btn     = document.getElementById('auto-save-btn');
+  const showErr = (msg) => { if (errEl) { errEl.textContent = msg; errEl.style.display = ''; } toast(msg, 'warn'); };
+
+  if (!name) { showErr('Rule name is required.'); return; }
+  if (name.length > 120) { showErr('Name too long (max 120 chars).'); return; }
+
+  let conditions = {};
+  if (condStr) {
+    try { conditions = JSON.parse(condStr); }
+    catch(e) { showErr('Condition must be valid JSON (e.g. {"min_hour": 22}).'); return; }
+  }
+  if (errEl) errEl.style.display = 'none';
+  if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-1"></i> Saving…'; }
+  try {
+    await axios.post(`${API}/api/home/automations`, {
+      home_id: currentHomeId,
+      name,
+      trigger_type: trigger,
+      action_type:  action,
+      conditions,
+    });
+    closeModal();
+    toast(`✓ Automation rule "${name}" created`, 'success');
+    loadAutomations();
+  } catch(e) {
+    if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-bolt mr-1"></i> Create Rule'; }
+    const msg = e.response?.data?.error || 'Failed to create automation';
+    showErr(msg);
+    toast(msg, 'error');
+  }
 }
 
 async function toggleAuto(id) {
-  await axios.put(`${API}/api/home/automations/${id}/toggle`);
+  try {
+    const r = await axios.put(`${API}/api/home/automations/${id}/toggle`);
+    toast(r.data.enabled ? 'Rule enabled' : 'Rule disabled', 'info');
+  } catch(e) { toast('Failed to toggle rule', 'error'); }
   loadAutomations();
+}
+
+async function deleteAutomation(id) {
+  if (!id || !isValidId(id)) return;
+  if (!confirm('Delete this automation rule?')) return;
+  try {
+    await axios.delete(`${API}/api/home/automations/${id}`);
+    toast('Automation rule deleted', 'success');
+    loadAutomations();
+  } catch(e) { toast(e.response?.data?.error || 'Failed to delete rule', 'error'); }
 }
 
 // ── Helpers ──────────────────────────────────────────

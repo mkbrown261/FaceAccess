@@ -1220,7 +1220,7 @@ app.post('/api/home/cameras', async (c) => {
   const camera_type = sanitize(body.camera_type, 20) || 'rtsp'
   const api_key     = body.api_key ? sanitize(body.api_key, 500) : null
   if (!home_id || !name) return bad(c, 'home_id and name required')
-  const validTypes = ['rtsp','ring','nest','arlo','webrtc','usb','ip']
+  const validTypes = ['rtsp','ring','nest','arlo','webrtc','usb','ip','laptop']
   if (!validTypes.includes(camera_type)) return bad(c, `camera_type must be one of: ${validTypes.join(', ')}`)
   const id = 'hcam-' + nanoid(8)
   await DB.prepare(`INSERT INTO home_cameras (id,home_id,lock_id,name,stream_url,camera_type,api_key,status,created_at)
@@ -1786,7 +1786,7 @@ app.post('/api/home/verifications/:id/respond', async (c) => {
 app.get('/api/home/guests', async (c) => {
   const { DB } = c.env
   const home_id = c.req.query('home_id')
-  let q = `SELECT gp.*, hu.name as created_by_name FROM guest_passes gp JOIN home_users hu ON gp.created_by=hu.id WHERE 1=1`
+  let q = `SELECT gp.*, hu.name as created_by_name FROM guest_passes gp LEFT JOIN home_users hu ON gp.created_by=hu.id WHERE gp.status != 'revoked'`
   const args: string[] = []
   if (home_id) { q += ' AND gp.home_id=?'; args.push(home_id) }
   q += ' ORDER BY gp.valid_until DESC'
@@ -1846,6 +1846,15 @@ app.put('/api/home/guests/:id/activate', async (c) => {
 })
 
 app.delete('/api/home/guests/:id', async (c) => {
+  const { DB } = c.env
+  const id = c.req.param('id')
+  // Hard-delete the guest pass so it disappears from all lists
+  await DB.prepare("DELETE FROM guest_passes WHERE id=?").bind(id).run()
+  return c.json({ message: 'Guest pass deleted' })
+})
+
+// PATCH: revoke without deleting (for audit trail if needed)
+app.put('/api/home/guests/:id/revoke', async (c) => {
   const { DB } = c.env
   await DB.prepare("UPDATE guest_passes SET status='revoked' WHERE id=?").bind(c.req.param('id')).run()
   return c.json({ message: 'Guest pass revoked' })
@@ -1936,9 +1945,105 @@ app.put('/api/home/automations/:id/toggle', async (c) => {
   return c.json({ enabled: !auto.enabled })
 })
 
-// ─────────────────────────────────────────────
-// Mobile App companion endpoint
-// ─────────────────────────────────────────────
+// POST /api/home/automations — create automation rule
+app.post('/api/home/automations', async (c) => {
+  const { DB } = c.env as Bindings
+  try {
+    const body = await c.req.json().catch(() => ({}))
+    const home_id      = sanitize(body.home_id, 30)
+    const name         = sanitize(body.name, 120)
+    const trigger_type = sanitize(body.trigger_type, 40) || 'face_granted'
+    const action_type  = sanitize(body.action_type, 40) || 'notify'
+    const conditions   = body.conditions && typeof body.conditions === 'object'
+      ? JSON.stringify(body.conditions)
+      : '{}'
+    const action_config = body.action_config && typeof body.action_config === 'object'
+      ? JSON.stringify(body.action_config)
+      : '{}'
+
+    if (!home_id || !name) return bad(c, 'home_id and name required')
+
+    const validTriggers = ['face_granted','face_denied','face_unknown','unusual_time','guest_entry','manual','arrival','departure','time_schedule','spoof_detected','low_trust']
+    const validActions  = ['notify','unlock','lock','alert','webhook','scene','log']
+    if (!validTriggers.includes(trigger_type)) return bad(c, `trigger_type must be one of: ${validTriggers.join(', ')}`)
+    if (!validActions.includes(action_type))   return bad(c, `action_type must be one of: ${validActions.join(', ')}`)
+
+    const id = 'auto-' + nanoid(8)
+    const ts = now()
+    await DB.prepare(`INSERT INTO home_automations (id,home_id,name,trigger_type,action_type,conditions,enabled,created_at)
+      VALUES (?,?,?,?,?,?,1,?)`)
+      .bind(id, home_id, name, trigger_type, action_type, conditions, ts).run()
+
+    const automation = await DB.prepare('SELECT * FROM home_automations WHERE id=?').bind(id).first()
+    return c.json({ automation, message: 'Automation rule created' }, 201)
+  } catch (err: any) {
+    return bad(c, 'Failed to create automation: ' + err.message)
+  }
+})
+
+// PUT /api/home/automations/:id — update automation rule
+app.put('/api/home/automations/:id', async (c) => {
+  const { DB } = c.env as Bindings
+  try {
+    const id   = c.req.param('id')
+    const body = await c.req.json().catch(() => ({}))
+    const name         = body.name         ? sanitize(body.name, 120)         : null
+    const trigger_type = body.trigger_type ? sanitize(body.trigger_type, 40)  : null
+    const action_type  = body.action_type  ? sanitize(body.action_type, 40)   : null
+    const conditions   = body.conditions && typeof body.conditions === 'object'
+      ? JSON.stringify(body.conditions) : null
+
+    await DB.prepare(`UPDATE home_automations SET
+      name=COALESCE(?,name),
+      trigger_type=COALESCE(?,trigger_type),
+      action_type=COALESCE(?,action_type),
+      conditions=COALESCE(?,conditions)
+      WHERE id=?`)
+      .bind(name, trigger_type, action_type, conditions, id).run()
+    return c.json({ message: 'Automation updated' })
+  } catch (err: any) {
+    return bad(c, err.message)
+  }
+})
+
+// DELETE /api/home/automations/:id — remove automation rule
+app.delete('/api/home/automations/:id', async (c) => {
+  const { DB } = c.env as Bindings
+  await DB.prepare('DELETE FROM home_automations WHERE id=?').bind(c.req.param('id')).run()
+  return c.json({ message: 'Automation deleted' })
+})
+
+// PUT /api/home/cameras/:id — update camera (status, name, stream_url)
+app.put('/api/home/cameras/:id', async (c) => {
+  const { DB } = c.env as Bindings
+  try {
+    const body = await c.req.json().catch(() => ({}))
+    const name       = body.name       ? sanitize(body.name, 120)       : null
+    const stream_url = body.stream_url ? sanitize(body.stream_url, 500) : null
+    const status     = body.status     ? sanitize(body.status, 20)      : null
+    const validStatuses = ['active', 'inactive', 'error']
+    if (status && !validStatuses.includes(status)) return bad(c, 'Invalid status')
+    await DB.prepare(`UPDATE home_cameras SET
+      name=COALESCE(?,name), stream_url=COALESCE(?,stream_url), status=COALESCE(?,status)
+      WHERE id=?`)
+      .bind(name, stream_url, status, c.req.param('id')).run()
+    return c.json({ message: 'Camera updated' })
+  } catch (err: any) {
+    return bad(c, err.message)
+  }
+})
+
+// GET /api/home/users/members/:home_id — list members for device selector
+app.get('/api/home/members/:home_id', async (c) => {
+  const { DB } = c.env as Bindings
+  const homeId = c.req.param('home_id')
+  const { results } = await DB.prepare(
+    `SELECT id, name, email, role FROM home_users WHERE home_id=? AND status='active' ORDER BY name`
+  ).bind(homeId).all()
+  return c.json({ members: results })
+})
+
+
 app.get('/api/mobile/pending/:user_id', async (c) => {
   const { DB } = c.env
   const { results } = await DB.prepare(`SELECT pv.*, d.name as door_name, d.location as door_location, d.security_level
