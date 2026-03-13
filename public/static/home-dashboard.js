@@ -1489,34 +1489,65 @@ async function enrollFace(userId) {
   // Wait for layout before sizing canvas
   await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
 
-  // Use unified FaceAccessCameraEngine; fallback to legacy initFaceIDEnrollment
-  const _enrollFn = window.FaceAccessCameraEngine
-    ? (id, cb) => window.FaceAccessCameraEngine.createEnrollmentSession({ containerId: id, autoStart: true, ...cb })
-    : window.initFaceIDEnrollment;
-
-  const ui = _enrollFn('enroll-modal-container', {
-    onComplete: async (result) => {
-      try {
-        await axios.post(`${API}/api/home/users/${userId}/face`, {
-          embedding:          result.embedding,
-          image_quality:      (result.averageQuality || result.quality || 70) / 100,
-          liveness_score:     result.livenessScore,
-          anti_spoof_score:   result.antiSpoofScore,
-          angles_captured:    result.capturedAngles || result.steps && result.steps.map(s => s.id) || [],
-          enrollment_version: '3.0',
-        });
-        toast(`Face ID enrolled — ${(result.capturedAngles || result.steps || []).length} steps ✓`, 'success');
-        setTimeout(() => { closeModal(); loadMembers(); }, 2000);
-      } catch(e) {
-        toast('Face ID enrolled ✓', 'success');
-        setTimeout(() => { closeModal(); loadMembers(); }, 1500);
-      }
-    },
-    onSkip: () => closeModal(),
-    onError: (err) => { toast('Enrollment error: ' + err.message, 'error'); closeModal(); }
-  });
-  _enrollUIRef = ui;  // store for cleanup on modal close
-  if (!ui) { toast('Failed to open Face ID UI', 'error'); modalOverlay.classList.add('hidden'); }
+  // Use unified FaceAccessCameraEngine v2.0; fallback to legacy initFaceIDEnrollment
+  if (window.FaceAccessCameraEngine) {
+    const ui = window.FaceAccessCameraEngine.createEnrollmentSession({
+      containerId:    'enroll-modal-container',
+      title:          'Face ID Enrollment',
+      autoStart:      true,
+      showRestartBtn: true,
+      showCancelBtn:  true,
+      onSkip: () => closeModal(),
+      onError: (err) => {
+        if (err && err.message === 'cancelled') { closeModal(); return; }
+        toast('Enrollment error: ' + (err && err.message || 'unknown'), 'error');
+      },
+      onComplete: async (result) => {
+        try {
+          await axios.post(`${API}/api/home/users/${userId}/face`, {
+            embedding:          result.embedding,
+            image_quality:      (result.averageQuality || result.quality || 70) / 100,
+            liveness_score:     result.livenessScore,
+            anti_spoof_score:   result.antiSpoofScore,
+            angles_captured:    result.capturedAngles || (result.steps && result.steps.map(s => s.id)) || [],
+            enrollment_version: '4.0',
+          });
+          toast(`Face ID enrolled — ${result.capturedSteps || (result.capturedAngles || []).length} steps captured ✓`, 'success');
+          setTimeout(() => { closeModal(); loadMembers(); }, 2000);
+        } catch(e) {
+          toast('Face ID enrolled ✓', 'success');
+          setTimeout(() => { closeModal(); loadMembers(); }, 1500);
+        }
+      },
+    });
+    _enrollUIRef = ui;
+    if (!ui) { toast('Failed to open Face ID UI', 'error'); modalOverlay.classList.add('hidden'); }
+  } else if (window.initFaceIDEnrollment) {
+    const ui = window.initFaceIDEnrollment('enroll-modal-container', {
+      onComplete: async (result) => {
+        try {
+          await axios.post(`${API}/api/home/users/${userId}/face`, {
+            embedding: result.embedding,
+            image_quality: (result.averageQuality || 70) / 100,
+            liveness_score: result.livenessScore,
+            anti_spoof_score: result.antiSpoofScore,
+            angles_captured: result.capturedAngles || [],
+            enrollment_version: '4.0',
+          });
+          toast('Face ID enrolled ✓', 'success');
+          setTimeout(() => { closeModal(); loadMembers(); }, 2000);
+        } catch(e) {
+          toast('Face ID enrolled ✓', 'success');
+          setTimeout(() => { closeModal(); loadMembers(); }, 1500);
+        }
+      },
+      onSkip: () => closeModal(),
+    });
+    _enrollUIRef = ui;
+  } else {
+    toast('Face ID engine not loaded — reload the page', 'error');
+    modalOverlay.classList.add('hidden');
+  }
 }
 
 async function deleteFace(userId) {

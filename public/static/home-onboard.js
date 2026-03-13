@@ -185,37 +185,60 @@ function launchFaceIDEnrollment() {
   // Update instruction
   updateFaceStepUI('ready');
 
-  // Use FaceAccessCameraEngine if available, fallback to legacy engine
-  const _obEnrollFn = window.FaceAccessCameraEngine
-    ? (id, cb) => window.FaceAccessCameraEngine.createEnrollmentSession({ containerId: id, autoStart: true, ...cb })
-    : window.initFaceIDEnrollment;
-
-  obFaceIDUI = _obEnrollFn('ob-faceid-container', {
-    onComplete: async (result) => {
-      // Normalize result fields from both engine formats
-      result.averageQuality = result.averageQuality || result.quality || 70;
-      result.capturedAngles = result.capturedAngles || (result.steps && result.steps.map(s => s.id)) || [];
-      obFaceResult = result;
-      obFaceRegistered = true;
-      updateFaceStepUI('complete', result);
-      // Auto-advance after 2.5 seconds
-      setTimeout(() => {
-        if (obFaceRegistered) goStep(4);
-      }, 2500);
-    },
-    onError: (err) => {
-      console.error('[FaceID]', err);
-      updateFaceStepUI('error', null, err);
-    },
-    onSkip: () => {
-      // Show upload fallback
-      const fb = document.getElementById('ob-face-fallback');
-      if (fb) fb.style.display = 'block';
-      const cont = document.getElementById('ob-faceid-container');
-      if (cont) cont.style.display = 'none';
-      updateFaceStepUI('fallback');
-    }
-  });
+  // Use FaceAccessCameraEngine v2.0 if available, fallback to legacy engine
+  if (window.FaceAccessCameraEngine) {
+    obFaceIDUI = window.FaceAccessCameraEngine.createEnrollmentSession({
+      containerId:    'ob-faceid-container',
+      title:          'Face ID Setup',
+      autoStart:      true,
+      showRestartBtn: true,
+      showCancelBtn:  true,
+      onSkip: () => {
+        // Show upload fallback
+        const fb = document.getElementById('ob-face-fallback');
+        if (fb) fb.style.display = 'block';
+        const cont = document.getElementById('ob-faceid-container');
+        if (cont) cont.style.display = 'none';
+        updateFaceStepUI('fallback');
+      },
+      onError: (err) => {
+        if (err && err.message === 'cancelled') return;
+        console.error('[FaceID]', err);
+        updateFaceStepUI('error', null, err);
+      },
+      onComplete: async (result) => {
+        result.averageQuality = result.averageQuality || result.quality || 70;
+        result.capturedAngles = result.capturedAngles || (result.steps && result.steps.map(s => s.id)) || [];
+        obFaceResult = result;
+        obFaceRegistered = true;
+        updateFaceStepUI('complete', result);
+        // Auto-advance after 2.5 seconds
+        setTimeout(() => { if (obFaceRegistered) goStep(4); }, 2500);
+      },
+    });
+  } else if (window.initFaceIDEnrollment) {
+    obFaceIDUI = window.initFaceIDEnrollment('ob-faceid-container', {
+      onComplete: async (result) => {
+        result.averageQuality = result.averageQuality || result.quality || 70;
+        result.capturedAngles = result.capturedAngles || [];
+        obFaceResult = result;
+        obFaceRegistered = true;
+        updateFaceStepUI('complete', result);
+        setTimeout(() => { if (obFaceRegistered) goStep(4); }, 2500);
+      },
+      onError: (err) => { console.error('[FaceID]', err); updateFaceStepUI('error', null, err); },
+      onSkip: () => {
+        const fb = document.getElementById('ob-face-fallback');
+        if (fb) fb.style.display = 'block';
+        const cont = document.getElementById('ob-faceid-container');
+        if (cont) cont.style.display = 'none';
+        updateFaceStepUI('fallback');
+      }
+    });
+  } else {
+    console.warn('[Onboard] No biometric engine available');
+    updateFaceStepUI('error', null, { message: 'Biometric engine not loaded' });
+  }
 }
 
 function updateFaceStepUI(state, result = null, err = null) {

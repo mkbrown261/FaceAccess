@@ -339,7 +339,7 @@ function loadRecognize() {
           <i class="fas fa-eye text-indigo-400 text-lg"></i>
           <div>
             <h3 class="font-semibold text-white text-sm">Face ID Scanner</h3>
-            <p class="text-xs text-gray-500">Powered by FaceAccessCameraEngine v1.0</p>
+            <p class="text-xs text-gray-500">Powered by FaceAccessCameraEngine v2.0</p>
           </div>
           <div id="rec-engine-status" class="ml-auto flex items-center gap-1.5 text-xs">
             <div class="w-1.5 h-1.5 rounded-full bg-gray-500"></div>
@@ -433,8 +433,11 @@ function _mountRecFaceEngine() {
   if (es) es.innerHTML = '<div class="w-1.5 h-1.5 rounded-full bg-indigo-400"></div><span class="text-indigo-400">Scanning…</span>'
 
   _recFaceSession = window.FaceAccessCameraEngine.createVerificationSession({
-    containerId: 'rec-faceid-mount',
-    autoStart: true,
+    containerId:    'rec-faceid-mount',
+    title:          'Face ID Scanner',
+    autoStart:      true,
+    showRestartBtn: true,
+    showCancelBtn:  false,
     onFaceFound: function() {
       if (es) es.innerHTML = '<div class="w-1.5 h-1.5 rounded-full bg-yellow-400"></div><span class="text-yellow-400">Face found — hold still</span>'
     },
@@ -462,15 +465,16 @@ function _mountRecFaceEngine() {
         <div class="w-12 h-12 rounded-full bg-green-500/10 border border-green-500/20 flex items-center justify-center mx-auto mb-3">
           <i class="fas fa-check text-green-400 text-xl"></i>
         </div>
-        <p class="text-green-400 font-semibold text-sm mb-1">Biometric Scan Complete!</p>
-        <p class="text-gray-400 text-xs">Quality: ${result.quality}% · Liveness: ${Math.round(result.livenessScore*100)}% · ${result.capturedAngles && result.capturedAngles.length || 0} steps</p>`
+        <p class="text-green-400 font-semibold text-sm mb-1">✓ Biometric Scan Complete!</p>
+        <p class="text-gray-400 text-xs">Quality: ${result.quality}% · Liveness: ${Math.round(result.livenessScore*100)}% · ${result.capturedSteps || (result.capturedAngles && result.capturedAngles.length) || 0} steps captured</p>`
 
       if (es) es.innerHTML = '<div class="w-1.5 h-1.5 rounded-full bg-green-400"></div><span class="text-green-400">Scan Ready</span>'
       toast('Biometric scan complete — select a door and click Identify!', 'success')
     },
     onError: function(err) {
+      if (err && err.message === 'cancelled') return
       if (es) es.innerHTML = '<div class="w-1.5 h-1.5 rounded-full bg-red-400"></div><span class="text-red-400">Error</span>'
-      toast('Camera error: ' + err.message, 'error')
+      toast('Camera error: ' + (err && err.message || 'unknown'), 'error')
     }
   })
 }
@@ -842,8 +846,12 @@ function openRegisterFaceModal(userId, userName) {
     }
 
     _enrollFaceSession = window.FaceAccessCameraEngine.createEnrollmentSession({
-      containerId: 'enroll-faceid-mount',
-      autoStart: true,
+      containerId:    'enroll-faceid-mount',
+      title:          'Face ID Enrollment',
+      autoStart:      true,
+      showRestartBtn: true,
+      showCancelBtn:  true,
+      onSkip: function() { closeModal() },
       onComplete: async function(result) {
         const statusEl = document.getElementById('enroll-status')
         if (statusEl) {

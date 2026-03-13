@@ -657,35 +657,63 @@ async function enrollMyFace() {
     // Wait two frames for layout
     await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
 
-    // Use FaceAccessCameraEngine if available, fallback to legacy engine
-    const _mobEnrollFn = window.FaceAccessCameraEngine
-      ? (id, cb) => window.FaceAccessCameraEngine.createEnrollmentSession({ containerId: id, autoStart: true, ...cb })
-      : window.initFaceIDEnrollment;
-
-    _mobEnrollFn('mob-enroll-container', {
-      onComplete: async (result) => {
-        try {
-          // Normalize result fields
-          const enc = result.embedding;
-          await axios.post(`${API}/api/home/users/${hmUserId}/face`, {
-            embedding: enc,
-            image_quality: (result.averageQuality || result.quality || 70) / 100,
-            liveness_score: result.livenessScore,
-            anti_spoof_score: result.antiSpoofScore,
-            angles_captured: result.capturedAngles || (result.steps && result.steps.map(s => s.id)) || [],
-            enrollment_version: '3.0',
-          });
-          const _stepCount = (result.capturedAngles || result.steps || []).length;
-          hmToast(`Face ID enrolled — ${_stepCount} steps ✓`);
-          setTimeout(() => { mobCloseModal(); renderProfileTab(document.getElementById('hm-content')); }, 2000);
-        } catch(e) {
-          hmToast('Face ID enrollment complete ✓');
-          setTimeout(() => { mobCloseModal(); renderProfileTab(document.getElementById('hm-content')); }, 1500);
-        }
-      },
-      onError: (err) => hmToast(err.message || 'Enrollment failed', 'error'),
-      onSkip: () => mobCloseModal(),
-    });
+    // Use FaceAccessCameraEngine v2.0 if available, fallback to legacy engine
+    if (window.FaceAccessCameraEngine) {
+      window.FaceAccessCameraEngine.createEnrollmentSession({
+        containerId:    'mob-enroll-container',
+        title:          'Face ID Enrollment',
+        autoStart:      true,
+        showRestartBtn: true,
+        showCancelBtn:  true,
+        onSkip:  () => mobCloseModal(),
+        onError: (err) => {
+          if (err && err.message === 'cancelled') { mobCloseModal(); return; }
+          hmToast(err.message || 'Enrollment failed', 'error');
+        },
+        onComplete: async (result) => {
+          try {
+            await axios.post(`${API}/api/home/users/${hmUserId}/face`, {
+              embedding:          result.embedding,
+              image_quality:      (result.averageQuality || result.quality || 70) / 100,
+              liveness_score:     result.livenessScore,
+              anti_spoof_score:   result.antiSpoofScore,
+              angles_captured:    result.capturedAngles || (result.steps && result.steps.map(s => s.id)) || [],
+              enrollment_version: '4.0',
+            });
+            const _stepCount = result.capturedSteps || (result.capturedAngles || []).length;
+            hmToast(`Face ID enrolled — ${_stepCount} steps captured ✓`);
+            setTimeout(() => { mobCloseModal(); renderProfileTab(document.getElementById('hm-content')); }, 2000);
+          } catch(e) {
+            hmToast('Face ID enrollment complete ✓');
+            setTimeout(() => { mobCloseModal(); renderProfileTab(document.getElementById('hm-content')); }, 1500);
+          }
+        },
+      });
+    } else if (window.initFaceIDEnrollment) {
+      window.initFaceIDEnrollment('mob-enroll-container', {
+        onComplete: async (result) => {
+          try {
+            await axios.post(`${API}/api/home/users/${hmUserId}/face`, {
+              embedding: result.embedding,
+              image_quality: (result.averageQuality || 70) / 100,
+              liveness_score: result.livenessScore,
+              anti_spoof_score: result.antiSpoofScore,
+              angles_captured: result.capturedAngles || [],
+              enrollment_version: '4.0',
+            });
+            hmToast('Face ID enrolled ✓');
+            setTimeout(() => { mobCloseModal(); renderProfileTab(document.getElementById('hm-content')); }, 2000);
+          } catch(e) {
+            hmToast('Face ID enrollment complete ✓');
+            setTimeout(() => { mobCloseModal(); renderProfileTab(document.getElementById('hm-content')); }, 1500);
+          }
+        },
+        onError: (err) => hmToast(err.message || 'Enrollment failed', 'error'),
+        onSkip:  () => mobCloseModal(),
+      });
+    } else {
+      hmToast('Face ID engine not loaded — reload the page', 'error');
+    }
   } else {
     // Fallback: simple API call (no camera)
     try {
