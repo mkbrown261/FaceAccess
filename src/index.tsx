@@ -2767,6 +2767,7 @@ select.input option { background: #1a1a2e; }
 </div>
 
 <script src="/static/auth.js"></script>
+<script src="/static/facecamera-engine.js"></script>
 <script src="/static/faceid-engine.js"></script>
 <script src="/static/app.js"></script>
 </body>
@@ -2836,6 +2837,7 @@ body { font-family: system-ui, sans-serif; background: #0a0a14; color: #e2e8f0; 
   </div>
 </div>
 
+<script src="/static/facecamera-engine.js"></script>
 <script src="/static/mobile.js"></script>
 </body>
 </html>`
@@ -3468,6 +3470,7 @@ select.input option{background:#0f0f1e}
 </div>
 
 <script src="/static/auth.js"></script>
+<script src="/static/facecamera-engine.js"></script>
 <script src="/static/faceid-engine.js"></script>
 <script src="/static/arcface-engine.js"></script>
 <script src="/static/home-dashboard.js"></script>
@@ -3732,6 +3735,7 @@ body{font-family:system-ui,sans-serif;background:#070712;color:#e2e8f0;min-heigh
 </div>
 
 <script src="/static/auth.js"></script>
+<script src="/static/facecamera-engine.js"></script>
 <script src="/static/faceid-engine.js"></script>
 <script src="/static/home-onboard.js"></script>
 </body>
@@ -3874,6 +3878,7 @@ body{font-family:system-ui,sans-serif;background:#07071a;color:#e2e8f0;max-width
 </div>
 
 <script src="/static/auth.js"></script>
+<script src="/static/facecamera-engine.js"></script>
 <script src="/static/faceid-engine.js"></script>
 <script src="/static/home-mobile.js"></script>
 </body>
@@ -5717,6 +5722,7 @@ body{font-family:'Inter',system-ui,sans-serif;background:#060612;color:#e2e8f0;m
 <div class="toast" id="toast"><span id="toast-icon"></span><span id="toast-msg"></span></div>
 
 <script src="https://cdn.jsdelivr.net/npm/axios@1.6.0/dist/axios.min.js"></script>
+<script src="/static/facecamera-engine.js"></script>
 <script src="/static/faceid-engine.js"></script>
 <script src="/static/dev-lab.js"></script>
 </body>

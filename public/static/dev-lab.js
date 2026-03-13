@@ -162,22 +162,22 @@ async function startCamera(panel = 'enroll') {
   const scanLine  = document.getElementById(isAuth ? 'auth-scan-line' : 'scan-line');
 
   try {
-    // Stop previous stream if any
-    if (isAuth && _authStream) { _authStream.getTracks().forEach(t => t.stop()); }
-    if (!isAuth && _enrollStream) { _enrollStream.getTracks().forEach(t => t.stop()); }
+    // Stop previous stream via unified engine
+    if (isAuth && _authStream) { window.FaceAccessCameraEngine ? window.FaceAccessCameraEngine.stopCamera(videoEl) : _authStream.getTracks().forEach(t => t.stop()); }
+    if (!isAuth && _enrollStream) { window.FaceAccessCameraEngine ? window.FaceAccessCameraEngine.stopCamera(videoEl) : _enrollStream.getTracks().forEach(t => t.stop()); }
 
-    const constraints = {
-      video: {
-        facingMode: _camFacingMode,
-        width: { ideal: 640 },
-        height: { ideal: 480 },
-      },
-      audio: false,
-    };
-
-    const stream = await navigator.mediaDevices.getUserMedia(constraints);
-    videoEl.srcObject = stream;
-    await videoEl.play();
+    let stream;
+    if (window.FaceAccessCameraEngine) {
+      // Use unified engine — supports webcam, USB, RTSP
+      const rtspUrl = _camSrc === 'rtsp' ? document.getElementById('rtsp-url-input') && document.getElementById('rtsp-url-input').value : null;
+      stream = await window.FaceAccessCameraEngine.openCamera({
+        videoEl, facingMode: _camFacingMode, rtspUrl: rtspUrl || undefined
+      });
+    } else {
+      stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: _camFacingMode, width: { ideal: 640 }, height: { ideal: 480 } }, audio: false });
+      videoEl.srcObject = stream;
+      await videoEl.play();
+    }
 
     if (isAuth) { _authStream = stream; _authVideo = videoEl; }
     else        { _enrollStream = stream; _enrollVideo = videoEl; }
@@ -251,17 +251,31 @@ function startMetricsLoop(videoEl) {
   const ctx = canvas.getContext('2d');
   _frameLoop = setInterval(() => {
     if (!videoEl || videoEl.readyState < 2) return;
-    canvas.width  = videoEl.videoWidth  || 640;
-    canvas.height = videoEl.videoHeight || 480;
-    ctx.drawImage(videoEl, 0, 0);
-    const frame = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    const metrics = analyzeFrame(frame, canvas.width, canvas.height);
-    document.getElementById('met-bright').textContent  = metrics.brightness.toFixed(0);
-    document.getElementById('met-sharp').textContent   = metrics.sharpness.toFixed(0);
-    document.getElementById('met-spoof').textContent   = pct(metrics.antiSpoof);
-    document.getElementById('met-quality').textContent = pct(metrics.quality);
-    // Draw face overlay
-    drawFaceOverlay(ctx, canvas.width, canvas.height, metrics);
+    let metrics;
+    if (window.FaceAccessCameraEngine) {
+      // Use unified engine analyzer
+      metrics = window.FaceAccessCameraEngine.analyzeFrame(videoEl, canvas, ctx);
+    } else {
+      canvas.width  = videoEl.videoWidth  || 640;
+      canvas.height = videoEl.videoHeight || 480;
+      ctx.drawImage(videoEl, 0, 0);
+      const frame = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      metrics = analyzeFrame(frame, canvas.width, canvas.height);
+    }
+    const _bright = typeof metrics.brightness === 'number' ? metrics.brightness : (metrics.brightness || 0);
+    const _sharp  = typeof metrics.sharpness  === 'number' ? metrics.sharpness  : (metrics.sharpness  || 0);
+    const _spoof  = metrics.antiSpoof && typeof metrics.antiSpoof === 'object' ? metrics.antiSpoof.score : (metrics.antiSpoof || 0);
+    const _qual   = typeof metrics.quality === 'number' ? metrics.quality / 100 : (metrics.quality || 0);
+    document.getElementById('met-bright').textContent  = _bright.toFixed(0);
+    document.getElementById('met-sharp').textContent   = _sharp.toFixed(0);
+    document.getElementById('met-spoof').textContent   = pct(_spoof);
+    document.getElementById('met-quality').textContent = pct(_qual);
+    // Draw face overlay via unified engine
+    if (window.FaceAccessCameraEngine && metrics.detected !== undefined) {
+      window.FaceAccessCameraEngine.drawOverlay(canvas, metrics, { state: 'scanning' });
+    } else {
+      drawFaceOverlay(ctx, canvas.width, canvas.height, metrics);
+    }
   }, 200);
 }
 
@@ -418,22 +432,31 @@ async function captureEnrollFrame() {
   canvas.height = _enrollVideo.videoHeight || 480;
   ctx.drawImage(_enrollVideo, 0, 0);
 
-  const frame = ctx.getImageData(0, 0, canvas.width, canvas.height);
-  const metrics = analyzeFrame(frame, canvas.width, canvas.height);
+  // Use unified engine for frame analysis + embedding
+  let metrics, embedding;
+  if (window.FaceAccessCameraEngine) {
+    metrics   = window.FaceAccessCameraEngine.analyzeFrame(_enrollVideo, canvas, ctx);
+    embedding = window.FaceAccessCameraEngine.getEmbedding(_enrollVideo, canvas, ctx);
+  } else {
+    canvas.width = _enrollVideo.videoWidth || 640;
+    canvas.height = _enrollVideo.videoHeight || 480;
+    ctx.drawImage(_enrollVideo, 0, 0);
+    const frame = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    metrics   = analyzeFrame(frame, canvas.width, canvas.height);
+    embedding = generateEmbeddingFromFrame(frame, canvas.width, canvas.height);
+  }
 
-  if (metrics.quality < 0.2) {
+  const qualVal = typeof metrics.quality === 'number' && metrics.quality > 1 ? metrics.quality / 100 : (metrics.quality || 0);
+  if (qualVal < 0.2) {
     toast('Frame quality too low — improve lighting', 'warn');
     return;
   }
-
-  // Generate embedding from frame
-  const embedding = generateEmbeddingFromFrame(frame, canvas.width, canvas.height);
 
   try {
     const r = await axios.post(`${API}/api/devlab/enroll/${_enrollProfile}`, {
       embedding,
       angle_label: angle.label,
-      quality_score: metrics.quality,
+      quality_score: typeof metrics.quality === 'number' && metrics.quality > 1 ? metrics.quality / 100 : (metrics.quality || 0),
       frame_index: _activeAngle,
     });
 
@@ -448,7 +471,7 @@ async function captureEnrollFrame() {
 
     renderAngleDots();
     document.getElementById('enroll-status').innerHTML =
-      `<span style="color:#10b981"><i class="fas fa-check"></i> Captured: ${angle.label} (quality ${pct(metrics.quality)})</span>`;
+      `<span style="color:#10b981"><i class="fas fa-check"></i> Captured: ${angle.label} (quality ${pct(qualVal)})</span>`;
     toast(`Angle "${angle.label}" captured`, 'success');
     debugLog('Frame enrolled', { angle: angle.label, quality: metrics.quality, embedding_count: r.data.embedding_count });
 
@@ -494,12 +517,18 @@ async function autoEnroll() {
 
       const canvas = document.getElementById('cam-canvas');
       const ctx = canvas.getContext('2d');
-      canvas.width = _enrollVideo.videoWidth || 640;
-      canvas.height = _enrollVideo.videoHeight || 480;
-      ctx.drawImage(_enrollVideo, 0, 0);
-      const frame = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      const metrics = analyzeFrame(frame, canvas.width, canvas.height);
-      const embedding = generateEmbeddingFromFrame(frame, canvas.width, canvas.height);
+      let metrics, embedding;
+      if (window.FaceAccessCameraEngine) {
+        metrics   = window.FaceAccessCameraEngine.analyzeFrame(_enrollVideo, canvas, ctx);
+        embedding = window.FaceAccessCameraEngine.getEmbedding(_enrollVideo, canvas, ctx);
+      } else {
+        canvas.width = _enrollVideo.videoWidth || 640;
+        canvas.height = _enrollVideo.videoHeight || 480;
+        ctx.drawImage(_enrollVideo, 0, 0);
+        const frame = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        metrics   = analyzeFrame(frame, canvas.width, canvas.height);
+        embedding = generateEmbeddingFromFrame(frame, canvas.width, canvas.height);
+      }
 
       await axios.post(`${API}/api/devlab/enroll/${_enrollProfile}`, {
         embedding,
@@ -545,7 +574,13 @@ async function clearEnrollment() {
 }
 
 // ── Embedding Generator ────────────────────────────────────────────────────
-function generateEmbeddingFromFrame(imageData, w, h) {
+function generateEmbeddingFromFrame(imageData, w, h, videoEl) {
+  // Use unified engine when available (pass through videoEl for direct embedding)
+  if (videoEl && window.FaceAccessCameraEngine) {
+    const tmpCanvas = document.createElement('canvas');
+    const tmpCtx = tmpCanvas.getContext('2d');
+    return window.FaceAccessCameraEngine.getEmbedding(videoEl, tmpCanvas, tmpCtx);
+  }
   // Extract 128-dimensional feature vector from frame pixel data
   // (In production this would be a real neural net; here we sample regions)
   const data = imageData.data;
@@ -594,15 +629,23 @@ async function runAuthTest() {
       // Capture from live camera
       const canvas = document.getElementById('auth-canvas');
       const ctx = canvas.getContext('2d');
-      canvas.width = _authVideo.videoWidth || 640;
-      canvas.height = _authVideo.videoHeight || 480;
-      ctx.drawImage(_authVideo, 0, 0);
-      const frame = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      const metrics = analyzeFrame(frame, canvas.width, canvas.height);
-      embedding = generateEmbeddingFromFrame(frame, canvas.width, canvas.height);
-      liveness_score   = Math.min(1, metrics.antiSpoof + 0.05);
-      anti_spoof_score = metrics.antiSpoof;
-      debugLog('Frame captured for auth', { quality: metrics.quality, antiSpoof: metrics.antiSpoof });
+      let authMetrics;
+      if (window.FaceAccessCameraEngine) {
+        authMetrics      = window.FaceAccessCameraEngine.analyzeFrame(_authVideo, canvas, ctx);
+        embedding        = window.FaceAccessCameraEngine.getEmbedding(_authVideo, canvas, ctx);
+      } else {
+        canvas.width = _authVideo.videoWidth || 640;
+        canvas.height = _authVideo.videoHeight || 480;
+        ctx.drawImage(_authVideo, 0, 0);
+        const frame = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        authMetrics  = analyzeFrame(frame, canvas.width, canvas.height);
+        embedding    = generateEmbeddingFromFrame(frame, canvas.width, canvas.height);
+      }
+      const _spoofScore = authMetrics.antiSpoof && typeof authMetrics.antiSpoof === 'object' ? authMetrics.antiSpoof.score : (authMetrics.antiSpoof || 0);
+      liveness_score   = Math.min(1, _spoofScore + 0.05);
+      anti_spoof_score = _spoofScore;
+      debugLog('Frame captured for auth', { quality: authMetrics.quality, antiSpoof: _spoofScore });
+
     } else if (mode === 'camera' && !_authStream) {
       toast('Start camera first or switch to Demo mode', 'warn');
       return;

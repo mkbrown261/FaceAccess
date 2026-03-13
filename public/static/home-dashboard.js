@@ -728,15 +728,19 @@ async function recogStartCamera() {
   if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i>Opening...'; }
 
   try {
-    if (_recogStream) { _recogStream.getTracks().forEach(t => t.stop()); }
-    _recogStream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } }
-    });
-
     const v = document.getElementById('rec-video');
-    v.srcObject = _recogStream;
-    await new Promise((res, rej) => { v.onloadedmetadata = res; setTimeout(() => rej(new Error('timeout')), 8000); });
-    await v.play();
+    if (_recogStream) {
+      if (window.FaceAccessCameraEngine) { window.FaceAccessCameraEngine.stopCamera(v); }
+      else { _recogStream.getTracks().forEach(t => t.stop()); }
+    }
+    if (window.FaceAccessCameraEngine) {
+      _recogStream = await window.FaceAccessCameraEngine.openCamera({ videoEl: v, facingMode: 'user' });
+    } else {
+      _recogStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } } });
+      v.srcObject = _recogStream;
+      await new Promise((res, rej) => { v.onloadedmetadata = res; setTimeout(() => rej(new Error('timeout')), 8000); });
+      await v.play();
+    }
 
     document.getElementById('rec-placeholder').style.display = 'none';
 
@@ -744,12 +748,14 @@ async function recogStartCamera() {
     if (vbtn) { vbtn.disabled = false; vbtn.style.opacity = '1'; }
     if (badge){ badge.style.background = 'rgba(99,102,241,0.15)'; badge.style.color = '#818cf8'; badge.style.borderColor = 'rgba(99,102,241,0.3)'; badge.textContent = '● Camera Active'; }
 
-    // Start frame analysis for HUD
-    if (!window.FaceIDEngine) {
-      toast('FaceID engine loading...', 'warn');
-    } else {
+    // Start frame analysis via unified engine
+    if (window.FaceAccessCameraEngine) {
+      _startRecogHUDLoop(v);
+    } else if (window.FaceIDEngine) {
       _recogDetector = new window.FaceIDEngine.FaceDetector();
       _startRecogHUDLoop(v);
+    } else {
+      console.warn('[Home] FaceAccessCameraEngine not loaded');
     }
 
   } catch(e) {
@@ -759,7 +765,12 @@ async function recogStartCamera() {
 }
 
 function recogStopCamera() {
-  if (_recogStream)       { _recogStream.getTracks().forEach(t => t.stop()); _recogStream = null; }
+  const _recogVid = document.getElementById('rec-video');
+  if (_recogStream) {
+    if (window.FaceAccessCameraEngine && _recogVid) { window.FaceAccessCameraEngine.stopCamera(_recogVid); }
+    else { _recogStream.getTracks().forEach(t => t.stop()); }
+    _recogStream = null;
+  }
   if (_recogDetectorLoop) { cancelAnimationFrame(_recogDetectorLoop); _recogDetectorLoop = null; }
   _recogLiveMetrics = null;
   const btn = document.getElementById('rec-start-btn');
@@ -793,9 +804,16 @@ function _startRecogHUDLoop(video) {
   const qPct     = document.getElementById('rec-quality-pct');
   const spoofAlert = document.getElementById('rec-spoof-alert');
 
+  const hiddenC = document.createElement('canvas');
+  const hiddenCx = hiddenC.getContext('2d');
   const loop = () => {
-    if (!_recogDetector || !_recogStream) return;
-    const m = _recogDetector.analyze(video);
+    if (!_recogStream) return;
+    let m;
+    if (window.FaceAccessCameraEngine) {
+      m = window.FaceAccessCameraEngine.analyzeFrame(video, hiddenC, hiddenCx);
+    } else if (_recogDetector) {
+      m = _recogDetector.analyze(video);
+    } else { return; }
     _recogLiveMetrics = m;
 
     if (m && m.detected) {
@@ -1471,20 +1489,23 @@ async function enrollFace(userId) {
   // Wait for layout before sizing canvas
   await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
 
-  const ui = window.initFaceIDEnrollment('enroll-modal-container', {
+  // Use unified FaceAccessCameraEngine; fallback to legacy initFaceIDEnrollment
+  const _enrollFn = window.FaceAccessCameraEngine
+    ? (id, cb) => window.FaceAccessCameraEngine.createEnrollmentSession({ containerId: id, autoStart: true, ...cb })
+    : window.initFaceIDEnrollment;
+
+  const ui = _enrollFn('enroll-modal-container', {
     onComplete: async (result) => {
       try {
-        const store = new window.FaceIDEngine.SecureEmbeddingStore();
-        const enc   = await store.encrypt(result.embedding);
         await axios.post(`${API}/api/home/users/${userId}/face`, {
-          embedding:          enc,
-          image_quality:      result.averageQuality / 100,
+          embedding:          result.embedding,
+          image_quality:      (result.averageQuality || result.quality || 70) / 100,
           liveness_score:     result.livenessScore,
           anti_spoof_score:   result.antiSpoofScore,
-          angles_captured:    result.capturedAngles,
-          enrollment_version: '2.0',
+          angles_captured:    result.capturedAngles || result.steps && result.steps.map(s => s.id) || [],
+          enrollment_version: '3.0',
         });
-        toast(`Face ID enrolled — ${result.capturedAngles.length} angles ✓`, 'success');
+        toast(`Face ID enrolled — ${(result.capturedAngles || result.steps || []).length} steps ✓`, 'success');
         setTimeout(() => { closeModal(); loadMembers(); }, 2000);
       } catch(e) {
         toast('Face ID enrolled ✓', 'success');
@@ -1492,6 +1513,7 @@ async function enrollFace(userId) {
       }
     },
     onSkip: () => closeModal(),
+    onError: (err) => { toast('Enrollment error: ' + err.message, 'error'); closeModal(); }
   });
   _enrollUIRef = ui;  // store for cleanup on modal close
   if (!ui) { toast('Failed to open Face ID UI', 'error'); modalOverlay.classList.add('hidden'); }

@@ -166,8 +166,8 @@ async function saveCamera() {
  */
 function launchFaceIDEnrollment() {
   // Make sure the FaceID engine is loaded
-  if (!window.FaceIDEngine) {
-    console.warn('[Onboard] FaceID engine not loaded, retrying...');
+  if (!window.FaceAccessCameraEngine && !window.FaceIDEngine) {
+    console.warn('[Onboard] Biometric engine not loaded, retrying...');
     setTimeout(launchFaceIDEnrollment, 500);
     return;
   }
@@ -185,8 +185,16 @@ function launchFaceIDEnrollment() {
   // Update instruction
   updateFaceStepUI('ready');
 
-  obFaceIDUI = window.initFaceIDEnrollment('ob-faceid-container', {
+  // Use FaceAccessCameraEngine if available, fallback to legacy engine
+  const _obEnrollFn = window.FaceAccessCameraEngine
+    ? (id, cb) => window.FaceAccessCameraEngine.createEnrollmentSession({ containerId: id, autoStart: true, ...cb })
+    : window.initFaceIDEnrollment;
+
+  obFaceIDUI = _obEnrollFn('ob-faceid-container', {
     onComplete: async (result) => {
+      // Normalize result fields from both engine formats
+      result.averageQuality = result.averageQuality || result.quality || 70;
+      result.capturedAngles = result.capturedAngles || (result.steps && result.steps.map(s => s.id)) || [];
       obFaceResult = result;
       obFaceRegistered = true;
       updateFaceStepUI('complete', result);

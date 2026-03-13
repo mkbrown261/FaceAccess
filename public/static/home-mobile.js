@@ -627,7 +627,7 @@ async function enrollMyFace() {
   if (!hmUserId) { hmToast('Please sign in first', 'warn'); return; }
 
   // If FaceID engine is available, use the real enrollment flow
-  if (window.FaceIDEngine && window.initFaceIDEnrollment) {
+  if (window.FaceAccessCameraEngine || (window.FaceIDEngine && window.initFaceIDEnrollment)) {
     const overlay = document.getElementById('mob-modal-overlay');
     const content = document.getElementById('mob-modal-content');
     if (!overlay || !content) {
@@ -657,20 +657,26 @@ async function enrollMyFace() {
     // Wait two frames for layout
     await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
 
-    window.initFaceIDEnrollment('mob-enroll-container', {
+    // Use FaceAccessCameraEngine if available, fallback to legacy engine
+    const _mobEnrollFn = window.FaceAccessCameraEngine
+      ? (id, cb) => window.FaceAccessCameraEngine.createEnrollmentSession({ containerId: id, autoStart: true, ...cb })
+      : window.initFaceIDEnrollment;
+
+    _mobEnrollFn('mob-enroll-container', {
       onComplete: async (result) => {
         try {
-          const store = new window.FaceIDEngine.SecureEmbeddingStore();
-          const enc = await store.encrypt(result.embedding);
+          // Normalize result fields
+          const enc = result.embedding;
           await axios.post(`${API}/api/home/users/${hmUserId}/face`, {
             embedding: enc,
-            image_quality: result.averageQuality / 100,
+            image_quality: (result.averageQuality || result.quality || 70) / 100,
             liveness_score: result.livenessScore,
             anti_spoof_score: result.antiSpoofScore,
-            angles_captured: result.capturedAngles,
-            enrollment_version: '2.0',
+            angles_captured: result.capturedAngles || (result.steps && result.steps.map(s => s.id)) || [],
+            enrollment_version: '3.0',
           });
-          hmToast(`Face ID enrolled — ${result.capturedAngles.length} angles ✓`);
+          const _stepCount = (result.capturedAngles || result.steps || []).length;
+          hmToast(`Face ID enrolled — ${_stepCount} steps ✓`);
           setTimeout(() => { mobCloseModal(); renderProfileTab(document.getElementById('hm-content')); }, 2000);
         } catch(e) {
           hmToast('Face ID enrollment complete ✓');

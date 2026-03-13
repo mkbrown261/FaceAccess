@@ -315,8 +315,7 @@ async function loadLiveMonitor() {
   } catch(e) { el.innerHTML = `<div class="text-red-400 p-4">Error: ${e.message}</div>` }
 }
 
-// ─── FACE RECOGNITION TEST ───────────────────────────────────
-// ─── FACE ID TEST (Real Engine) ──────────────────────────────
+// ─── FACE RECOGNITION TEST (Unified FaceAccessCameraEngine) ────────────────
 let _recFaceSession = null
 
 function loadRecognize() {
@@ -340,7 +339,7 @@ function loadRecognize() {
           <i class="fas fa-eye text-indigo-400 text-lg"></i>
           <div>
             <h3 class="font-semibold text-white text-sm">Face ID Scanner</h3>
-            <p class="text-xs text-gray-500">Powered by FaceID Engine v4.0</p>
+            <p class="text-xs text-gray-500">Powered by FaceAccessCameraEngine v1.0</p>
           </div>
           <div id="rec-engine-status" class="ml-auto flex items-center gap-1.5 text-xs">
             <div class="w-1.5 h-1.5 rounded-full bg-gray-500"></div>
@@ -364,7 +363,7 @@ function loadRecognize() {
             <i class="fas fa-camera text-indigo-400 text-xl"></i>
           </div>
           <p class="text-white font-medium text-sm mb-1">Ready to Scan</p>
-          <p class="text-gray-400 text-xs">Click "Start Face ID Setup" in the scanner, complete the 5-angle scan, then click Identify</p>
+          <p class="text-gray-400 text-xs">Camera opens automatically. Hold still, then follow head-movement prompts. Click Identify when complete.</p>
         </div>
 
         <div id="rec-result-card" class="hidden"></div>
@@ -414,13 +413,15 @@ let _recCapturedAntiSpoof = null
 let _recCapturedQuality   = null
 
 function _mountRecFaceEngine() {
-  if (!window.initFaceIDEnrollment) {
-    const mount = document.getElementById('rec-faceid-mount')
-    if (mount) mount.innerHTML = `
+  const mount = document.getElementById('rec-faceid-mount')
+  if (!mount) return
+
+  if (!window.FaceAccessCameraEngine) {
+    mount.innerHTML = `
       <div class="p-8 text-center">
         <i class="fas fa-exclamation-triangle text-yellow-400 text-3xl mb-3"></i>
-        <p class="text-yellow-300 text-sm font-medium">FaceID Engine not available</p>
-        <p class="text-gray-500 text-xs mt-1">Reload the page to initialize the engine</p>
+        <p class="text-yellow-300 text-sm font-medium">FaceAccessCameraEngine not loaded</p>
+        <p class="text-gray-500 text-xs mt-1">Reload the page to initialize the biometric engine</p>
       </div>`
     return
   }
@@ -428,12 +429,30 @@ function _mountRecFaceEngine() {
   _recCapturedEmbedding = null
   if (_recFaceSession) { try { _recFaceSession.stop() } catch(e){} _recFaceSession = null }
 
-  _recFaceSession = window.initFaceIDEnrollment('rec-faceid-mount', {
+  const es = document.getElementById('rec-engine-status')
+  if (es) es.innerHTML = '<div class="w-1.5 h-1.5 rounded-full bg-indigo-400"></div><span class="text-indigo-400">Scanning…</span>'
+
+  _recFaceSession = window.FaceAccessCameraEngine.createVerificationSession({
+    containerId: 'rec-faceid-mount',
+    autoStart: true,
+    onFaceFound: function() {
+      if (es) es.innerHTML = '<div class="w-1.5 h-1.5 rounded-full bg-yellow-400"></div><span class="text-yellow-400">Face found — hold still</span>'
+    },
+    onProgress: function(step, total, stepDef) {
+      if (es) es.innerHTML = `<div class="w-1.5 h-1.5 rounded-full bg-indigo-400"></div><span class="text-indigo-400">Step ${step+1}/${total}: ${stepDef && stepDef.label || ''}</span>`
+      const sb = document.getElementById('rec-status-box')
+      if (sb) sb.innerHTML = `
+        <div class="w-12 h-12 rounded-full bg-indigo-500/10 border border-indigo-500/20 flex items-center justify-center mx-auto mb-3">
+          <i class="fas fa-sync fa-spin text-indigo-400 text-xl"></i>
+        </div>
+        <p class="text-indigo-300 font-medium text-sm mb-1">Step ${step+1} of ${total}</p>
+        <p class="text-gray-400 text-xs">${stepDef && stepDef.instruction || ''}</p>`
+    },
     onComplete: function(result) {
       _recCapturedEmbedding = result.embedding
       _recCapturedLiveness  = result.livenessScore
       _recCapturedAntiSpoof = result.antiSpoofScore
-      _recCapturedQuality   = result.averageQuality
+      _recCapturedQuality   = result.quality
 
       const btn = document.getElementById('rec-identify-btn')
       if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-fingerprint mr-2"></i> Identify Face' }
@@ -443,24 +462,19 @@ function _mountRecFaceEngine() {
         <div class="w-12 h-12 rounded-full bg-green-500/10 border border-green-500/20 flex items-center justify-center mx-auto mb-3">
           <i class="fas fa-check text-green-400 text-xl"></i>
         </div>
-        <p class="text-green-400 font-semibold text-sm mb-1">Face Scan Complete!</p>
-        <p class="text-gray-400 text-xs">Quality: ${result.averageQuality}% · Liveness: ${Math.round(result.livenessScore*100)}% · ${result.capturedAngles?.length||0} angles</p>`
+        <p class="text-green-400 font-semibold text-sm mb-1">Biometric Scan Complete!</p>
+        <p class="text-gray-400 text-xs">Quality: ${result.quality}% · Liveness: ${Math.round(result.livenessScore*100)}% · ${result.capturedAngles && result.capturedAngles.length || 0} steps</p>`
 
-      const es = document.getElementById('rec-engine-status')
       if (es) es.innerHTML = '<div class="w-1.5 h-1.5 rounded-full bg-green-400"></div><span class="text-green-400">Scan Ready</span>'
-
-      toast('Face scan complete — select a door and click Identify!', 'success')
+      toast('Biometric scan complete — select a door and click Identify!', 'success')
     },
-    onSkip: function() {
-      _mountRecFaceEngine()
-      const es = document.getElementById('rec-engine-status')
-      if (es) es.innerHTML = '<div class="w-1.5 h-1.5 rounded-full bg-gray-500"></div><span class="text-gray-500">Ready</span>'
+    onError: function(err) {
+      if (es) es.innerHTML = '<div class="w-1.5 h-1.5 rounded-full bg-red-400"></div><span class="text-red-400">Error</span>'
+      toast('Camera error: ' + err.message, 'error')
     }
   })
-
-  const es = document.getElementById('rec-engine-status')
-  if (es) es.innerHTML = '<div class="w-1.5 h-1.5 rounded-full bg-indigo-400 pulse"></div><span class="text-indigo-400">Scanning…</span>'
 }
+
 
 async function runFaceRecognition() {
   const btn = document.getElementById('rec-identify-btn')
@@ -816,18 +830,20 @@ function openRegisterFaceModal(userId, userName) {
 
   // Wait for modal DOM to render, then mount FaceID engine
   setTimeout(() => {
-    if (!window.initFaceIDEnrollment) {
+    if (!window.FaceAccessCameraEngine) {
       const mount = document.getElementById('enroll-faceid-mount')
       if (mount) mount.innerHTML = `
         <div class="p-6 text-center">
           <i class="fas fa-exclamation-triangle text-yellow-400 text-2xl mb-2"></i>
-          <p class="text-yellow-300 text-sm">FaceID Engine not available</p>
+          <p class="text-yellow-300 text-sm">FaceAccessCameraEngine not loaded</p>
           <p class="text-gray-500 text-xs mt-1">Reload the page</p>
         </div>`
       return
     }
 
-    _enrollFaceSession = window.initFaceIDEnrollment('enroll-faceid-mount', {
+    _enrollFaceSession = window.FaceAccessCameraEngine.createEnrollmentSession({
+      containerId: 'enroll-faceid-mount',
+      autoStart: true,
       onComplete: async function(result) {
         const statusEl = document.getElementById('enroll-status')
         if (statusEl) {
