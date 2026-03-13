@@ -1,15 +1,79 @@
-# FaceAccess — AI-Enhanced Facial Recognition Access Control System v4.0
+# FaceAccess — AI-Enhanced Facial Recognition Access Control System v4.1
 
 ## Project Overview
-A complete facial recognition-based access control system with a **multi-model biometric pipeline** (ArcFace + InsightFace + FaceNet), AI Trust Engine v4, predictive behavioral analysis, and real-time anomaly detection. Enterprise-grade security for both corporate and home environments.
+A complete facial recognition-based access control system with a **multi-model biometric pipeline** (ArcFace + InsightFace + FaceNet), AI Trust Engine v4, predictive behavioral analysis, real-time anomaly detection, and a **dedicated internal Developer Testing Lab**.
 
 **Production:** [https://faceaccess.pages.dev](https://faceaccess.pages.dev)  
 **Home Dashboard:** [https://faceaccess.pages.dev/home/dashboard](https://faceaccess.pages.dev/home/dashboard)  
-**Mobile App:** [https://faceaccess.pages.dev/home/mobile](https://faceaccess.pages.dev/home/mobile)
+**Mobile App:** [https://faceaccess.pages.dev/home/mobile](https://faceaccess.pages.dev/home/mobile)  
+**🔬 Dev Lab (NEW):** [https://faceaccess.pages.dev/dev-lab](https://faceaccess.pages.dev/dev-lab)
 
 ---
 
 ## ✅ Completed Features
+
+### 🔬 Developer Testing Lab (v1.0 — NEW at `/dev-lab`)
+Internal sandbox environment for validating biometric pipeline accuracy, enrollment quality, and trust engine logic — fully isolated from production data.
+
+**Six integrated panels:**
+
+1. **Face Enrollment Panel**
+   - USB webcam / laptop camera / optional RTSP stream connection
+   - Start/stop/switch camera controls with real-time feed
+   - Live quality metrics: brightness, sharpness, anti-spoof score
+   - 7-angle progress dots (center, left, right, up, down, left_up, right_up)
+   - One-click capture per angle or **Auto-Enroll** (captures all 7 angles automatically)
+   - Embedding generation via frame pixel analysis (128-dim L2-normalized vector)
+   - Clear embeddings per profile
+
+2. **Authentication Test Panel**
+   - Three test modes: **Live Camera**, **Demo (simulated)**, **Manual**
+   - Simulated lock selector (Lab-Door-01/02, Lab-Entrance, Server-Room)
+   - BLE proximity + Wi-Fi match toggles
+   - Full pipeline simulation: cosine similarity → multi-model scoring → trust calculation
+   - Debug mode toggle for raw pipeline values
+
+3. **Lock Simulation**
+   - Animated **Access Granted — Door Unlocked** (green unlock + pulse glow)
+   - **Access Denied** shake animation (red pulse)
+   - Pending approval state indicator
+
+4. **Confidence Visualization Panel**
+   - Three doughnut rings: Identity Confidence, Liveness, Trust Score
+   - 8-metric score bars: ArcFace, InsightFace, FaceNet, Combined, Final, Liveness, Anti-Spoof, Proximity
+   - Full breakdown table with visual bars per metric
+   - Confidence history line chart (last 20 tests)
+   - Pipeline trace: stage badges (edge → arcface → insightface → fusion → trust) + latency
+
+5. **Security Log Panel**
+   - Real-time table: timestamp, result badge, matched user, similarity, combined confidence, trust tier/score, latency, lock, test mode
+   - Stats bar: total, granted, denied, avg confidence, avg latency
+   - Filter by result (granted/denied/pending)
+   - Clear all logs
+
+6. **Dev Controls Panel**
+   - Reset lab (clear embeddings + logs, keep profiles)
+   - Delete all test profiles
+   - Debug mode (raw model values in debug console)
+   - Pipeline config display (all thresholds)
+   - Debug console (monospace live output)
+   - Lab statistics dashboard
+
+**Dev Lab API endpoints (10 routes under `/api/devlab/`):**
+```
+GET/POST     /api/devlab/profiles         — CRUD test profiles (name, email, role, device ID)
+GET          /api/devlab/profiles/:id     — Single profile
+DELETE       /api/devlab/profiles/:id     — Delete profile + embeddings
+POST         /api/devlab/enroll/:id       — Store face embedding (64-512 floats)
+GET          /api/devlab/enroll/:id       — List embeddings for profile
+DELETE       /api/devlab/enroll/:id       — Clear all embeddings for profile
+POST         /api/devlab/authenticate     — Full auth pipeline simulation
+GET/DELETE   /api/devlab/logs             — Security log (filter by decision)
+GET          /api/devlab/stats            — Aggregate lab statistics
+DELETE       /api/devlab/reset            — Full lab reset
+```
+
+**DB tables:** `devlab_profiles`, `devlab_embeddings`, `devlab_test_log`, `devlab_sessions`
 
 ### Multi-Model Biometric Pipeline (v4.0 — Latest)
 - **Tiered Recognition Pipeline**: Face detection → Alignment → ArcFace primary → Cosine check → If borderline → InsightFace secondary → FaceNet tertiary
