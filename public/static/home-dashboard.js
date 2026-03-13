@@ -1496,7 +1496,6 @@ async function enrollFace(userId) {
   _enrollUIRef = ui;  // store for cleanup on modal close
   if (!ui) { toast('Failed to open Face ID UI', 'error'); modalOverlay.classList.add('hidden'); }
 }
-}
 
 async function deleteFace(userId) {
   if (!userId || !isValidId(userId)) return;

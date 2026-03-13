@@ -882,21 +882,25 @@ async function checkAnomalyAlerts(el) {
 }
 
 // Override renderHomeTab to also inject AI notifications
-const _origRenderHomeTab = renderHomeTab;
-async function renderHomeTab(el) {
-  await _origRenderHomeTab(el);
-  // Inject AI predictive notification and anomaly alerts
-  await Promise.allSettled([
-    renderPredictiveNotifications(el),
-    checkAnomalyAlerts(el),
-  ]);
-}
+(function() {
+  const _origRenderHomeTab = renderHomeTab;
+  renderHomeTab = async function(el) {
+    await _origRenderHomeTab(el);
+    // Inject AI predictive notification and anomaly alerts
+    await Promise.allSettled([
+      renderPredictiveNotifications(el),
+      checkAnomalyAlerts(el),
+    ]);
+  };
+})();
 
 // Override renderProfileTab to also inject trust card
-const _origRenderProfileTab = renderProfileTab;
-async function renderProfileTab(el) {
-  await _origRenderProfileTab(el);
-  await renderTrustCard(el);
-}
+(function() {
+  const _origRenderProfileTab = renderProfileTab;
+  renderProfileTab = async function(el) {
+    await _origRenderProfileTab(el);
+    await renderTrustCard(el);
+  };
+})();
 
 window.addEventListener('DOMContentLoaded', init);
