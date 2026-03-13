@@ -1,19 +1,100 @@
 // ══════════════════════════════════════════════════════
-//  FaceAccess Home — Mobile App JS
+//  FaceAccess Home — Mobile App JS  v2.0 (production)
 // ══════════════════════════════════════════════════════
 
 const API = '';
 let hmUserId = null;
 let hmHomeId = null;
+let hmAccount = null;
 let hmPollTimer = null;
 let hmCurrentTab = 'home';
 
 // ── Bootstrap ─────────────────────────────────────────
 async function init() {
+  // Require auth
+  if (typeof FA_AUTH !== 'undefined') {
+    const account = await FA_AUTH.verifySession('mobile') || await FA_AUTH.verifySession('home');
+    if (!account) {
+      showMobAuthWall();
+      return;
+    }
+    hmAccount = account;
+  }
   await loadUser();
   hmTab('home');
   // Poll for pending approvals every 8 seconds
   hmPollTimer = setInterval(checkPendingApprovals, 8000);
+}
+
+function showMobAuthWall() {
+  const wall = document.getElementById('mob-auth-wall');
+  if (wall) wall.style.display = 'block';
+}
+
+function mobShowTab(tab) {
+  const isLogin = tab === 'login';
+  document.getElementById('mob-form-login').style.display  = isLogin ? '' : 'none';
+  document.getElementById('mob-form-register').style.display = isLogin ? 'none' : '';
+  document.getElementById('mob-tab-login').style.background  = isLogin ? 'linear-gradient(135deg,#6366f1,#8b5cf6)' : 'transparent';
+  document.getElementById('mob-tab-login').style.color       = isLogin ? '#fff' : 'rgba(255,255,255,.4)';
+  document.getElementById('mob-tab-register').style.background = !isLogin ? 'linear-gradient(135deg,#6366f1,#8b5cf6)' : 'transparent';
+  document.getElementById('mob-tab-register').style.color      = !isLogin ? '#fff' : 'rgba(255,255,255,.4)';
+}
+
+async function mobDoLogin() {
+  const email = document.getElementById('mob-login-email')?.value.trim();
+  const pw    = document.getElementById('mob-login-pw')?.value;
+  const errEl = document.getElementById('mob-login-err');
+  const btn   = document.getElementById('mob-login-btn');
+  if (!email || !pw) { errEl.textContent='Email and password required'; errEl.style.display=''; return; }
+  errEl.style.display='none';
+  btn.disabled=true; btn.innerHTML='<i class="fas fa-spinner fa-spin" style="margin-right:6px"></i>Signing in…';
+  try {
+    const data = await FA_AUTH.loginMobile(email, pw);
+    hmAccount = data.account;
+    document.getElementById('mob-auth-wall').style.display = 'none';
+    await loadUser();
+    hmTab('home');
+    hmPollTimer = setInterval(checkPendingApprovals, 8000);
+  } catch(e) {
+    errEl.textContent = e.response?.data?.error || 'Invalid email or password';
+    errEl.style.display = '';
+    btn.disabled=false; btn.innerHTML='<i class="fas fa-sign-in-alt" style="margin-right:6px"></i>Sign In';
+  }
+}
+
+async function mobDoRegister() {
+  const first = document.getElementById('mob-reg-first')?.value.trim();
+  const last  = document.getElementById('mob-reg-last')?.value.trim();
+  const email = document.getElementById('mob-reg-email')?.value.trim();
+  const phone = document.getElementById('mob-reg-phone')?.value.trim();
+  const pw    = document.getElementById('mob-reg-pw')?.value;
+  const errEl = document.getElementById('mob-reg-err');
+  const btn   = document.getElementById('mob-reg-btn');
+  if (!first||!last) { errEl.textContent='First and last name required'; errEl.style.display=''; return; }
+  if (!FA_AUTH.validEmail(email)) { errEl.textContent='Invalid email address'; errEl.style.display=''; return; }
+  if (phone && !FA_AUTH.validPhone(phone)) { errEl.textContent='Invalid phone number'; errEl.style.display=''; return; }
+  if (!FA_AUTH.validPassword(pw)) { errEl.textContent='Password must be 8+ chars with letters and numbers'; errEl.style.display=''; return; }
+  errEl.style.display='none';
+  btn.disabled=true; btn.innerHTML='<i class="fas fa-spinner fa-spin" style="margin-right:6px"></i>Creating…';
+  try {
+    const data = await FA_AUTH.registerMobile({ first_name:first, last_name:last, email, phone:phone||null, password:pw });
+    hmAccount = data.account;
+    document.getElementById('mob-auth-wall').style.display='none';
+    await loadUser();
+    hmTab('home');
+    hmPollTimer = setInterval(checkPendingApprovals, 8000);
+  } catch(e) {
+    errEl.textContent = e.response?.data?.error || 'Registration failed';
+    errEl.style.display='';
+    btn.disabled=false; btn.innerHTML='<i class="fas fa-user-plus" style="margin-right:6px"></i>Create Account';
+  }
+}
+
+async function mobLogout() {
+  if (!confirm('Sign out?')) return;
+  if (typeof FA_AUTH !== 'undefined') await FA_AUTH.logout('mobile');
+  window.location.reload();
 }
 
 async function loadUser() {
@@ -21,7 +102,12 @@ async function loadUser() {
     const r = await axios.get(`${API}/api/home/users`);
     const users = r.data.users || [];
     if (users.length > 0) {
-      const owner = users.find(u => u.role === 'owner') || users[0];
+      // Try to match logged-in account email
+      let owner = null;
+      if (hmAccount?.email) {
+        owner = users.find(u => u.email === hmAccount.email);
+      }
+      if (!owner) owner = users.find(u => u.role === 'owner') || users[0];
       hmUserId = owner.id;
       hmHomeId = owner.home_id;
       const nameEl = document.getElementById('hm-home-name');
@@ -410,7 +496,21 @@ async function renderProfileTab(el) {
       user = (r.data.users || []).find(u => u.id === hmUserId) || r.data.users?.[0];
     } catch {}
   }
-  const u = user || { name: 'Jordan Kim', email: 'jordan@home.demo', phone: '+1-555-0100', role: 'owner', face_registered: 1, avatar_color: '#6366f1' };
+  // If still no user, show signed-in account info
+  if (!user && hmAccount) {
+    user = {
+      name: `${hmAccount.first_name} ${hmAccount.last_name}`,
+      email: hmAccount.email,
+      phone: hmAccount.phone || '',
+      role: 'owner',
+      face_registered: 0,
+      avatar_color: '#6366f1'
+    };
+  }
+  if (!user) {
+    el.innerHTML = '<div class="card p-6 text-center text-gray-500">No profile found. Please set up your home first.</div>';
+    return;
+  }
 
   let devicesHTML = '<div class="text-gray-600 text-xs">Loading...</div>';
   try {
@@ -428,16 +528,16 @@ async function renderProfileTab(el) {
       </div>`).join('');
   } catch {}
 
-  const initials = u.name.split(' ').map(n=>n[0]).join('').slice(0,2);
+  const initials = user.name.split(' ').map(n=>n[0]).join('').slice(0,2);
   el.innerHTML = `
   <!-- Profile header -->
   <div class="card p-6 mb-4 text-center">
-    <div class="w-20 h-20 rounded-3xl mx-auto mb-3 flex items-center justify-center text-2xl font-black" style="background:${u.avatar_color||'#6366f1'}25;color:${u.avatar_color||'#818cf8'}">${initials}</div>
-    <div class="text-xl font-bold text-white">${u.name}</div>
-    <div class="text-sm text-gray-400">${u.email}</div>
+    <div class="w-20 h-20 rounded-3xl mx-auto mb-3 flex items-center justify-center text-2xl font-black" style="background:${user.avatar_color||'#6366f1'}25;color:${user.avatar_color||'#818cf8'}">${initials}</div>
+    <div class="text-xl font-bold text-white">${user.name}</div>
+    <div class="text-sm text-gray-400">${user.email}</div>
     <div class="flex items-center justify-center gap-2 mt-2">
-      <span class="px-3 py-1 rounded-full text-xs font-bold bg-indigo-500/20 text-indigo-300 capitalize">${u.role}</span>
-      ${u.face_registered ? '<span class="px-3 py-1 rounded-full text-xs font-bold bg-green-500/20 text-green-300"><i class="fas fa-face-smile mr-1"></i>Face Enrolled</span>' : '<span class="px-3 py-1 rounded-full text-xs font-bold bg-red-500/20 text-red-300">No Face</span>'}
+      <span class="px-3 py-1 rounded-full text-xs font-bold bg-indigo-500/20 text-indigo-300 capitalize">${user.role}</span>
+      ${user.face_registered ? '<span class="px-3 py-1 rounded-full text-xs font-bold bg-green-500/20 text-green-300"><i class="fas fa-face-smile mr-1"></i>Face Enrolled</span>' : '<span class="px-3 py-1 rounded-full text-xs font-bold bg-red-500/20 text-red-300">No Face</span>'}
     </div>
   </div>
 
@@ -447,9 +547,9 @@ async function renderProfileTab(el) {
     <div class="space-y-3">
       <div class="flex items-center justify-between p-3 bg-gray-900 rounded-xl">
         <div class="text-sm text-gray-300">Face enrollment</div>
-        <span class="text-xs font-bold ${u.face_registered ? 'text-green-400' : 'text-red-400'}">${u.face_registered ? '✓ Active' : '✗ Not enrolled'}</span>
+        <span class="text-xs font-bold ${user.face_registered ? 'text-green-400' : 'text-red-400'}">${user.face_registered ? '✓ Active' : '✗ Not enrolled'}</span>
       </div>
-      ${!u.face_registered ? `
+      ${!user.face_registered ? `
       <button onclick="enrollMyFace()" class="w-full py-3 rounded-xl bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 font-semibold text-sm">
         <i class="fas fa-camera mr-2"></i> Enroll Face Now
       </button>` : `
@@ -492,6 +592,11 @@ async function renderProfileTab(el) {
     <a href="/home/onboard" class="flex items-center gap-3 p-4 border-b border-gray-900 hover:bg-gray-900/50 transition-colors">
       <i class="fas fa-plus text-green-400 w-5 text-center"></i>
       <span class="text-sm text-gray-300">Add Another Home</span>
+      <i class="fas fa-chevron-right text-gray-700 ml-auto text-xs"></i>
+    </a>
+    <a href="#" onclick="mobLogout();return false;" class="flex items-center gap-3 p-4 border-b border-gray-900 hover:bg-gray-900/50 transition-colors">
+      <i class="fas fa-sign-out-alt text-red-400 w-5 text-center"></i>
+      <span class="text-sm text-red-400">Sign Out</span>
       <i class="fas fa-chevron-right text-gray-700 ml-auto text-xs"></i>
     </a>
     <a href="/home" class="flex items-center gap-3 p-4 hover:bg-gray-900/50 transition-colors">

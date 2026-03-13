@@ -1530,5 +1530,94 @@ function updateClock() {
 setInterval(updateClock, 1000)
 updateClock()
 
+// ─── Auth Wall (Business) ─────────────────────────────────────
+function bizShowTab(tab) {
+  const isLogin = tab === 'login';
+  document.getElementById('biz-form-login').style.display    = isLogin ? '' : 'none';
+  document.getElementById('biz-form-register').style.display = isLogin ? 'none' : '';
+  const tl = document.getElementById('biz-tab-login');
+  const tr = document.getElementById('biz-tab-register');
+  tl.style.background = isLogin ? 'linear-gradient(135deg,#6366f1,#8b5cf6)' : 'transparent';
+  tl.style.color      = isLogin ? '#fff' : 'rgba(255,255,255,0.4)';
+  tr.style.background = !isLogin ? 'linear-gradient(135deg,#6366f1,#8b5cf6)' : 'transparent';
+  tr.style.color      = !isLogin ? '#fff' : 'rgba(255,255,255,0.4)';
+}
+
+function bizTogglePw(id) {
+  const el = document.getElementById(id);
+  if (el) el.type = el.type === 'password' ? 'text' : 'password';
+}
+
+async function bizDoLogin() {
+  const email = document.getElementById('biz-login-email')?.value.trim();
+  const pw    = document.getElementById('biz-login-pw')?.value;
+  const errEl = document.getElementById('biz-login-err');
+  const btn   = document.getElementById('biz-login-btn');
+  if (!email || !pw) { errEl.textContent='Email and password required'; errEl.style.display=''; return; }
+  if (!FA_AUTH.validEmail(email)) { errEl.textContent='Invalid email format'; errEl.style.display=''; return; }
+  errEl.style.display = 'none';
+  btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i>Signing in…';
+  try {
+    const data = await FA_AUTH.loginBusiness(email, pw);
+    bizEnterDashboard(data.account);
+  } catch(e) {
+    errEl.textContent = e.response?.data?.error || 'Login failed. Please check your credentials.';
+    errEl.style.display = '';
+    btn.disabled = false; btn.innerHTML = '<i class="fas fa-sign-in-alt mr-2"></i>Sign In';
+  }
+}
+
+async function bizDoRegister() {
+  const first  = document.getElementById('biz-reg-first')?.value.trim();
+  const last   = document.getElementById('biz-reg-last')?.value.trim();
+  const email  = document.getElementById('biz-reg-email')?.value.trim();
+  const phone  = document.getElementById('biz-reg-phone')?.value.trim();
+  const role   = document.getElementById('biz-reg-role')?.value;
+  const pw     = document.getElementById('biz-reg-pw')?.value;
+  const org    = document.getElementById('biz-reg-org')?.value.trim();
+  const errEl  = document.getElementById('biz-reg-err');
+  const btn    = document.getElementById('biz-reg-btn');
+  if (!first || !last)              { errEl.textContent='First and last name required'; errEl.style.display=''; return; }
+  if (!FA_AUTH.validEmail(email))   { errEl.textContent='Invalid email address'; errEl.style.display=''; return; }
+  if (phone && !FA_AUTH.validPhone(phone)) { errEl.textContent='Invalid phone number format'; errEl.style.display=''; return; }
+  if (!FA_AUTH.validPassword(pw))   { errEl.textContent='Password must be 8+ characters with letters and numbers'; errEl.style.display=''; return; }
+  errEl.style.display = 'none';
+  btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i>Creating…';
+  try {
+    const data = await FA_AUTH.registerBusiness({ first_name:first, last_name:last, email, phone:phone||null, password:pw, role, org_name:org||null });
+    bizEnterDashboard(data.account);
+  } catch(e) {
+    errEl.textContent = e.response?.data?.error || 'Registration failed.';
+    errEl.style.display = '';
+    btn.disabled = false; btn.innerHTML = '<i class="fas fa-user-plus mr-2"></i>Create Account';
+  }
+}
+
+function bizEnterDashboard(account) {
+  document.getElementById('biz-user-name').textContent  = `${account.first_name} ${account.last_name}`;
+  document.getElementById('biz-user-email').textContent = account.email;
+  document.getElementById('auth-wall').style.display = 'none';
+  showPage('dashboard');
+}
+
+async function bizLogout() {
+  await FA_AUTH.logout('business');
+  document.getElementById('biz-user-name').textContent  = '—';
+  document.getElementById('biz-user-email').textContent = '—';
+  document.getElementById('biz-login-email').value = '';
+  document.getElementById('biz-login-pw').value = '';
+  document.getElementById('auth-wall').style.display = 'flex';
+}
+
 // ─── Init ─────────────────────────────────────────────────────
-showPage('dashboard')
+(async () => {
+  // Check existing session
+  const account = await FA_AUTH.verifySession('business');
+  if (account) {
+    bizEnterDashboard(account);
+  } else {
+    // Show auth wall — check URL for ?login=1 hint
+    document.getElementById('auth-wall').style.display = 'flex';
+  }
+})();
+

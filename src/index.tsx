@@ -420,6 +420,332 @@ async function updateTrustProfile(
 }
 
 // ─────────────────────────────────────────────
+// AUTH SYSTEM — password hashing, sessions, guards
+// ─────────────────────────────────────────────
+
+/** PBKDF2 password hash using Web Crypto (CF Workers compatible) */
+async function hashPassword(password: string): Promise<string> {
+  const enc = new TextEncoder()
+  const salt = nanoid(16)
+  const keyMat = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveBits'])
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', salt: enc.encode(salt), iterations: 100000, hash: 'SHA-256' },
+    keyMat, 256
+  )
+  const hashHex = Array.from(new Uint8Array(bits)).map(b => b.toString(16).padStart(2,'0')).join('')
+  return `pbkdf2:${salt}:${hashHex}`
+}
+
+async function verifyPassword(password: string, stored: string): Promise<boolean> {
+  try {
+    const parts = stored.split(':')
+    if (parts.length !== 3 || parts[0] !== 'pbkdf2') return false
+    const [, salt, storedHash] = parts
+    const enc = new TextEncoder()
+    const keyMat = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveBits'])
+    const bits = await crypto.subtle.deriveBits(
+      { name: 'PBKDF2', salt: enc.encode(salt), iterations: 100000, hash: 'SHA-256' },
+      keyMat, 256
+    )
+    const hash = Array.from(new Uint8Array(bits)).map(b => b.toString(16).padStart(2,'0')).join('')
+    return hash === storedHash
+  } catch { return false }
+}
+
+/** Generate a secure session token */
+function makeSessionToken(): string {
+  const b = new Uint8Array(32)
+  crypto.getRandomValues(b)
+  return Array.from(b).map(x => x.toString(16).padStart(2,'0')).join('')
+}
+
+/** Validate phone number format */
+function isPhone(p: unknown): boolean {
+  if (typeof p !== 'string') return false
+  return /^\+?[\d\s\-\(\)]{7,20}$/.test(p.trim())
+}
+
+/** Validate password strength: min 8 chars, at least 1 letter + 1 number */
+function isStrongPassword(p: string): boolean {
+  return p.length >= 8 && /[a-zA-Z]/.test(p) && /[0-9]/.test(p)
+}
+
+/** Log an auth event */
+async function logAuthEvent(DB: D1Database, data: {
+  account_id?: string, account_type?: string, email?: string,
+  event_type: string, ip?: string, ua?: string, metadata?: Record<string,unknown>
+}) {
+  await DB.prepare(`INSERT INTO auth_audit_log (id,account_id,account_type,email,event_type,ip_address,user_agent,metadata,created_at)
+    VALUES (?,?,?,?,?,?,?,?,?)`)
+    .bind('aal-'+nanoid(10), data.account_id||null, data.account_type||null, data.email||null,
+      data.event_type, data.ip||null, data.ua||null, JSON.stringify(data.metadata||{}), now())
+    .run()
+}
+
+/** Get session from Authorization header or cookie */
+async function getSession(c: any): Promise<{account: any, session: any} | null> {
+  const { DB } = c.env as Bindings
+  const authHeader = c.req.header('Authorization') || ''
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null
+  if (!token) return null
+  const session = await DB.prepare(
+    `SELECT * FROM auth_sessions WHERE id=? AND expires_at > datetime('now')`
+  ).bind(token).first() as any
+  if (!session) return null
+  // Update last_active
+  await DB.prepare(`UPDATE auth_sessions SET last_active=? WHERE id=?`).bind(now(), token).run()
+  // Get account
+  let account: any = null
+  if (session.account_type === 'business') {
+    account = await DB.prepare(`SELECT * FROM business_accounts WHERE id=? AND status='active'`).bind(session.account_id).first()
+  } else {
+    account = await DB.prepare(`SELECT * FROM home_accounts WHERE id=? AND status='active'`).bind(session.account_id).first()
+  }
+  if (!account) return null
+  return { account, session }
+}
+
+/** Require auth middleware — returns 401 if not authenticated */
+async function requireAuth(c: any, next: any) {
+  const sess = await getSession(c)
+  if (!sess) return c.json({ error: 'Authentication required', code: 'AUTH_REQUIRED' }, 401)
+  c.set('session', sess)
+  await next()
+}
+
+// ─────────────────────────────────────────────
+// AUTH API — Business
+// ─────────────────────────────────────────────
+
+// POST /api/auth/business/register
+app.post('/api/auth/business/register', async (c) => {
+  const { DB } = c.env as Bindings
+  const ip = c.req.header('CF-Connecting-IP') || c.req.header('X-Forwarded-For') || 'unknown'
+  const ua = c.req.header('User-Agent') || ''
+  try {
+    const body = await c.req.json().catch(() => ({}))
+    const first_name = sanitize(body.first_name, 80)
+    const last_name  = sanitize(body.last_name, 80)
+    const email      = typeof body.email === 'string' ? body.email.toLowerCase().trim() : ''
+    const phone      = sanitize(body.phone, 30) || null
+    const password   = typeof body.password === 'string' ? body.password : ''
+    const org_name   = sanitize(body.org_name, 120) || null
+    const role       = ['superadmin','admin','operator','viewer'].includes(body.role) ? body.role : 'admin'
+
+    if (!first_name || !last_name) return bad(c, 'First name and last name are required')
+    if (!isEmail(email))            return bad(c, 'Invalid email address')
+    if (phone && !isPhone(phone))   return bad(c, 'Invalid phone number format')
+    if (!isStrongPassword(password)) return bad(c, 'Password must be at least 8 characters with letters and numbers')
+
+    const existing = await DB.prepare('SELECT id FROM business_accounts WHERE email=?').bind(email).first()
+    if (existing) return bad(c, 'An account with this email already exists')
+
+    const id = 'biz-' + nanoid(10)
+    const password_hash = await hashPassword(password)
+    await DB.prepare(`INSERT INTO business_accounts (id,first_name,last_name,email,phone,password_hash,role,org_name,status,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,'active',?,?)`)
+      .bind(id, first_name, last_name, email, phone, password_hash, role, org_name, now(), now()).run()
+
+    const token = makeSessionToken()
+    const expires = new Date(Date.now() + 30*24*60*60*1000).toISOString().replace('T',' ').split('.')[0]
+    await DB.prepare(`INSERT INTO auth_sessions (id,account_id,account_type,ip_address,user_agent,expires_at,created_at)
+      VALUES (?,?,?,?,?,?,?)`)
+      .bind(token, id, 'business', ip, ua, expires, now()).run()
+
+    await logAuthEvent(DB, { account_id: id, account_type: 'business', email, event_type: 'register', ip, ua })
+
+    return c.json({
+      message: 'Account created',
+      token,
+      account: { id, first_name, last_name, email, phone, role, org_name, account_type: 'business' }
+    }, 201)
+  } catch (err: any) {
+    return bad(c, 'Registration failed: ' + err.message)
+  }
+})
+
+// POST /api/auth/business/login
+app.post('/api/auth/business/login', async (c) => {
+  const { DB } = c.env as Bindings
+  const ip = c.req.header('CF-Connecting-IP') || c.req.header('X-Forwarded-For') || 'unknown'
+  const ua = c.req.header('User-Agent') || ''
+  try {
+    const body = await c.req.json().catch(() => ({}))
+    const email    = typeof body.email === 'string' ? body.email.toLowerCase().trim() : ''
+    const password = typeof body.password === 'string' ? body.password : ''
+    if (!isEmail(email) || !password) return bad(c, 'Email and password are required')
+
+    const account = await DB.prepare(`SELECT * FROM business_accounts WHERE email=? AND status='active'`).bind(email).first() as any
+    if (!account) {
+      await logAuthEvent(DB, { email, account_type: 'business', event_type: 'login_failed', ip, ua, metadata: { reason: 'account_not_found' } })
+      return c.json({ error: 'Invalid email or password' }, 401)
+    }
+    const valid = await verifyPassword(password, account.password_hash)
+    if (!valid) {
+      await logAuthEvent(DB, { account_id: account.id, email, account_type: 'business', event_type: 'login_failed', ip, ua, metadata: { reason: 'wrong_password' } })
+      return c.json({ error: 'Invalid email or password' }, 401)
+    }
+
+    const token = makeSessionToken()
+    const expires = new Date(Date.now() + 30*24*60*60*1000).toISOString().replace('T',' ').split('.')[0]
+    await DB.prepare(`INSERT INTO auth_sessions (id,account_id,account_type,ip_address,user_agent,expires_at,created_at)
+      VALUES (?,?,?,?,?,?,?)`)
+      .bind(token, account.id, 'business', ip, ua, expires, now()).run()
+    await DB.prepare(`UPDATE business_accounts SET last_login=?,login_count=login_count+1,updated_at=? WHERE id=?`)
+      .bind(now(), now(), account.id).run()
+    await logAuthEvent(DB, { account_id: account.id, email, account_type: 'business', event_type: 'login_success', ip, ua })
+
+    return c.json({
+      message: 'Login successful',
+      token,
+      account: { id: account.id, first_name: account.first_name, last_name: account.last_name,
+        email: account.email, phone: account.phone, role: account.role, org_name: account.org_name, account_type: 'business' }
+    })
+  } catch (err: any) {
+    return bad(c, 'Login failed: ' + err.message)
+  }
+})
+
+// GET /api/auth/me — get current session account
+app.get('/api/auth/me', async (c) => {
+  const sess = await getSession(c)
+  if (!sess) return c.json({ error: 'Not authenticated', code: 'AUTH_REQUIRED' }, 401)
+  const { account, session } = sess
+  const { password_hash, ...safeAccount } = account as any
+  return c.json({ account: { ...safeAccount, account_type: session.account_type }, session_expires: session.expires_at })
+})
+
+// POST /api/auth/logout
+app.post('/api/auth/logout', async (c) => {
+  const { DB } = c.env as Bindings
+  const authHeader = c.req.header('Authorization') || ''
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null
+  if (token) {
+    const sess = await DB.prepare('SELECT * FROM auth_sessions WHERE id=?').bind(token).first() as any
+    if (sess) {
+      await DB.prepare('DELETE FROM auth_sessions WHERE id=?').bind(token).run()
+      await logAuthEvent(DB, { account_id: sess.account_id, account_type: sess.account_type, event_type: 'logout' })
+    }
+  }
+  return c.json({ message: 'Logged out' })
+})
+
+// ─────────────────────────────────────────────
+// AUTH API — Home / Mobile
+// ─────────────────────────────────────────────
+
+// POST /api/auth/home/register
+app.post('/api/auth/home/register', async (c) => {
+  const { DB } = c.env as Bindings
+  const ip = c.req.header('CF-Connecting-IP') || c.req.header('X-Forwarded-For') || 'unknown'
+  const ua = c.req.header('User-Agent') || ''
+  try {
+    const body = await c.req.json().catch(() => ({}))
+    const first_name   = sanitize(body.first_name, 80)
+    const last_name    = sanitize(body.last_name, 80)
+    const email        = typeof body.email === 'string' ? body.email.toLowerCase().trim() : ''
+    const phone        = sanitize(body.phone, 30) || null
+    const password     = typeof body.password === 'string' ? body.password : ''
+    const account_type = body.account_type === 'mobile' ? 'mobile' : 'home'
+
+    if (!first_name || !last_name) return bad(c, 'First name and last name are required')
+    if (!isEmail(email))            return bad(c, 'Invalid email address')
+    if (phone && !isPhone(phone))   return bad(c, 'Invalid phone number format')
+    if (!isStrongPassword(password)) return bad(c, 'Password must be at least 8 characters with letters and numbers')
+
+    const existing = await DB.prepare('SELECT id FROM home_accounts WHERE email=?').bind(email).first()
+    if (existing) return bad(c, 'An account with this email already exists')
+
+    const id = 'ha-' + nanoid(10)
+    const password_hash = await hashPassword(password)
+    await DB.prepare(`INSERT INTO home_accounts (id,first_name,last_name,email,phone,password_hash,account_type,status,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,'active',?,?)`)
+      .bind(id, first_name, last_name, email, phone, password_hash, account_type, now(), now()).run()
+
+    // Also create a home_users record for this account owner
+    const huId = 'hu-' + nanoid(8)
+    const full_name = `${first_name} ${last_name}`.trim()
+    await DB.prepare(`INSERT OR IGNORE INTO home_users (id,home_id,account_id,name,email,phone,role,status,avatar_color,created_at)
+      VALUES (?,?,?,?,?,?,'owner','active',?,?)`)
+      .bind(huId, 'pending-setup', id, full_name, email, phone,
+        '#'+Math.floor(Math.random()*0xFFFFFF).toString(16).padStart(6,'0'), now()).run()
+
+    const token = makeSessionToken()
+    const expires = new Date(Date.now() + 30*24*60*60*1000).toISOString().replace('T',' ').split('.')[0]
+    await DB.prepare(`INSERT INTO auth_sessions (id,account_id,account_type,ip_address,user_agent,expires_at,created_at)
+      VALUES (?,?,?,?,?,?,?)`)
+      .bind(token, id, account_type, ip, ua, expires, now()).run()
+    await logAuthEvent(DB, { account_id: id, account_type, email, event_type: 'register', ip, ua })
+
+    return c.json({
+      message: 'Account created',
+      token,
+      account: { id, first_name, last_name, email, phone, account_type }
+    }, 201)
+  } catch (err: any) {
+    return bad(c, 'Registration failed: ' + err.message)
+  }
+})
+
+// POST /api/auth/home/login
+app.post('/api/auth/home/login', async (c) => {
+  const { DB } = c.env as Bindings
+  const ip = c.req.header('CF-Connecting-IP') || c.req.header('X-Forwarded-For') || 'unknown'
+  const ua = c.req.header('User-Agent') || ''
+  try {
+    const body = await c.req.json().catch(() => ({}))
+    const email    = typeof body.email === 'string' ? body.email.toLowerCase().trim() : ''
+    const password = typeof body.password === 'string' ? body.password : ''
+    if (!isEmail(email) || !password) return bad(c, 'Email and password are required')
+
+    const account = await DB.prepare(`SELECT * FROM home_accounts WHERE email=? AND status='active'`).bind(email).first() as any
+    if (!account) {
+      await logAuthEvent(DB, { email, account_type: 'home', event_type: 'login_failed', ip, ua, metadata: { reason: 'account_not_found' } })
+      return c.json({ error: 'Invalid email or password' }, 401)
+    }
+    const valid = await verifyPassword(password, account.password_hash)
+    if (!valid) {
+      await logAuthEvent(DB, { account_id: account.id, email, account_type: account.account_type, event_type: 'login_failed', ip, ua })
+      return c.json({ error: 'Invalid email or password' }, 401)
+    }
+
+    const token = makeSessionToken()
+    const expires = new Date(Date.now() + 30*24*60*60*1000).toISOString().replace('T',' ').split('.')[0]
+    await DB.prepare(`INSERT INTO auth_sessions (id,account_id,account_type,ip_address,user_agent,expires_at,created_at)
+      VALUES (?,?,?,?,?,?,?)`)
+      .bind(token, account.id, account.account_type, ip, ua, expires, now()).run()
+    await DB.prepare(`UPDATE home_accounts SET last_login=?,login_count=login_count+1,updated_at=? WHERE id=?`)
+      .bind(now(), now(), account.id).run()
+    await logAuthEvent(DB, { account_id: account.id, email, account_type: account.account_type, event_type: 'login_success', ip, ua })
+
+    // Get linked homes
+    const homes = await DB.prepare(`SELECT h.* FROM homes h
+      JOIN home_account_homes hah ON h.id=hah.home_id WHERE hah.account_id=? LIMIT 10`)
+      .bind(account.id).all()
+
+    return c.json({
+      message: 'Login successful',
+      token,
+      account: { id: account.id, first_name: account.first_name, last_name: account.last_name,
+        email: account.email, phone: account.phone, account_type: account.account_type },
+      homes: homes.results || []
+    })
+  } catch (err: any) {
+    return bad(c, 'Login failed: ' + err.message)
+  }
+})
+
+// GET /api/auth/audit — auth event log (requires business auth)
+app.get('/api/auth/audit', async (c) => {
+  const { DB } = c.env as Bindings
+  const limit = parseIntParam(c.req.query('limit'), 50, 200)
+  const { results } = await DB.prepare(
+    `SELECT * FROM auth_audit_log ORDER BY created_at DESC LIMIT ?`
+  ).bind(limit).all()
+  return c.json({ events: results })
+})
+
+// ─────────────────────────────────────────────
 // API: USERS
 // ─────────────────────────────────────────────
 app.get('/api/users', async (c) => {
@@ -2171,6 +2497,123 @@ select.input option { background: #1a1a2e; }
 </head>
 <body class="h-full flex">
 
+<!-- ═══ AUTH WALL — hidden once logged in ════════════ -->
+<div id="auth-wall" style="position:fixed;inset:0;z-index:9999;background:#0a0a14;display:flex;align-items:center;justify-content:center;padding:16px;">
+  <div style="width:100%;max-width:440px;">
+    <!-- Logo -->
+    <div style="text-align:center;margin-bottom:32px;">
+      <div style="width:60px;height:60px;border-radius:16px;background:linear-gradient(135deg,#6366f1,#8b5cf6);display:inline-flex;align-items:center;justify-content:center;margin-bottom:12px;box-shadow:0 8px 32px rgba(99,102,241,0.4)">
+        <i class="fas fa-eye" style="color:white;font-size:24px"></i>
+      </div>
+      <h1 style="font-size:24px;font-weight:800;color:#fff;margin:0">FaceAccess Business</h1>
+      <p style="color:rgba(255,255,255,0.4);font-size:13px;margin:4px 0 0">Enterprise Facial Recognition Access Control</p>
+    </div>
+
+    <!-- Tab switcher -->
+    <div style="display:flex;background:#13131f;border-radius:12px;padding:4px;margin-bottom:24px;border:1px solid #1e1e30">
+      <button id="biz-tab-login" onclick="bizShowTab('login')"
+        style="flex:1;padding:8px;border:none;border-radius:8px;cursor:pointer;font-weight:600;font-size:13px;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;transition:all .2s">
+        Sign In
+      </button>
+      <button id="biz-tab-register" onclick="bizShowTab('register')"
+        style="flex:1;padding:8px;border:none;border-radius:8px;cursor:pointer;font-weight:600;font-size:13px;background:transparent;color:rgba(255,255,255,0.4);transition:all .2s">
+        Create Account
+      </button>
+    </div>
+
+    <!-- Login Form -->
+    <div id="biz-form-login">
+      <div style="background:#13131f;border:1px solid #1e1e30;border-radius:16px;padding:24px;">
+        <div style="margin-bottom:16px">
+          <label style="font-size:11px;color:rgba(255,255,255,0.4);text-transform:uppercase;letter-spacing:.05em;display:block;margin-bottom:6px">Email Address</label>
+          <input id="biz-login-email" type="email" placeholder="admin@company.com" autocomplete="email"
+            style="width:100%;background:#0a0a14;border:1px solid #2d2d4a;border-radius:8px;padding:11px 14px;color:#e2e8f0;font-size:14px;outline:none;box-sizing:border-box"
+            onkeydown="if(event.key==='Enter')bizDoLogin()">
+        </div>
+        <div style="margin-bottom:16px">
+          <label style="font-size:11px;color:rgba(255,255,255,0.4);text-transform:uppercase;letter-spacing:.05em;display:block;margin-bottom:6px">Password</label>
+          <div style="position:relative">
+            <input id="biz-login-pw" type="password" placeholder="••••••••" autocomplete="current-password"
+              style="width:100%;background:#0a0a14;border:1px solid #2d2d4a;border-radius:8px;padding:11px 42px 11px 14px;color:#e2e8f0;font-size:14px;outline:none;box-sizing:border-box"
+              onkeydown="if(event.key==='Enter')bizDoLogin()">
+            <button onclick="bizTogglePw('biz-login-pw')" style="position:absolute;right:12px;top:50%;transform:translateY(-50%);background:none;border:none;color:rgba(255,255,255,0.3);cursor:pointer">
+              <i class="fas fa-eye" id="biz-login-pw-icon"></i>
+            </button>
+          </div>
+        </div>
+        <div id="biz-login-err" style="display:none;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.2);border-radius:8px;padding:10px 14px;font-size:12px;color:#fca5a5;margin-bottom:14px"></div>
+        <button id="biz-login-btn" onclick="bizDoLogin()"
+          style="width:100%;padding:12px;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;border:none;border-radius:10px;font-weight:700;font-size:14px;cursor:pointer;transition:all .2s">
+          <i class="fas fa-sign-in-alt mr-2"></i>Sign In
+        </button>
+        <p style="text-align:center;margin-top:14px;font-size:12px;color:rgba(255,255,255,0.3)">
+          QA credentials: <code style="color:#a5b4fc">qa@faceaccess.biz</code> / <code style="color:#a5b4fc">QAtest2024</code>
+        </p>
+      </div>
+    </div>
+
+    <!-- Register Form -->
+    <div id="biz-form-register" style="display:none">
+      <div style="background:#13131f;border:1px solid #1e1e30;border-radius:16px;padding:24px;">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px">
+          <div>
+            <label style="font-size:11px;color:rgba(255,255,255,0.4);text-transform:uppercase;letter-spacing:.05em;display:block;margin-bottom:6px">First Name *</label>
+            <input id="biz-reg-first" class="auth-input" placeholder="Alex" maxlength="80">
+          </div>
+          <div>
+            <label style="font-size:11px;color:rgba(255,255,255,0.4);text-transform:uppercase;letter-spacing:.05em;display:block;margin-bottom:6px">Last Name *</label>
+            <input id="biz-reg-last" class="auth-input" placeholder="Smith" maxlength="80">
+          </div>
+        </div>
+        <div style="margin-bottom:14px">
+          <label style="font-size:11px;color:rgba(255,255,255,0.4);text-transform:uppercase;letter-spacing:.05em;display:block;margin-bottom:6px">Email Address *</label>
+          <input id="biz-reg-email" type="email" class="auth-input" placeholder="alex@company.com" maxlength="254">
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px">
+          <div>
+            <label style="font-size:11px;color:rgba(255,255,255,0.4);text-transform:uppercase;letter-spacing:.05em;display:block;margin-bottom:6px">Phone</label>
+            <input id="biz-reg-phone" type="tel" class="auth-input" placeholder="+1 555 0100" maxlength="30">
+          </div>
+          <div>
+            <label style="font-size:11px;color:rgba(255,255,255,0.4);text-transform:uppercase;letter-spacing:.05em;display:block;margin-bottom:6px">Role</label>
+            <select id="biz-reg-role" class="auth-input">
+              <option value="admin">Admin</option>
+              <option value="operator">Operator</option>
+              <option value="viewer">Viewer</option>
+            </select>
+          </div>
+        </div>
+        <div style="margin-bottom:14px">
+          <label style="font-size:11px;color:rgba(255,255,255,0.4);text-transform:uppercase;letter-spacing:.05em;display:block;margin-bottom:6px">Organization (optional)</label>
+          <input id="biz-reg-org" class="auth-input" placeholder="Acme Corp" maxlength="120">
+        </div>
+        <div style="margin-bottom:16px">
+          <label style="font-size:11px;color:rgba(255,255,255,0.4);text-transform:uppercase;letter-spacing:.05em;display:block;margin-bottom:6px">Password * <span style="color:rgba(255,255,255,0.2);font-size:10px">(min 8 chars, letters + numbers)</span></label>
+          <div style="position:relative">
+            <input id="biz-reg-pw" type="password" class="auth-input" placeholder="••••••••" maxlength="128">
+            <button onclick="bizTogglePw('biz-reg-pw')" style="position:absolute;right:12px;top:50%;transform:translateY(-50%);background:none;border:none;color:rgba(255,255,255,0.3);cursor:pointer">
+              <i class="fas fa-eye"></i>
+            </button>
+          </div>
+        </div>
+        <div id="biz-reg-err" style="display:none;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.2);border-radius:8px;padding:10px 14px;font-size:12px;color:#fca5a5;margin-bottom:14px"></div>
+        <button id="biz-reg-btn" onclick="bizDoRegister()"
+          style="width:100%;padding:12px;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;border:none;border-radius:10px;font-weight:700;font-size:14px;cursor:pointer">
+          <i class="fas fa-user-plus mr-2"></i>Create Account
+        </button>
+      </div>
+    </div>
+  </div>
+</div><!-- end auth-wall -->
+
+<style>
+.auth-input {
+  width:100%;background:#0a0a14;border:1px solid #2d2d4a;border-radius:8px;
+  padding:11px 14px;color:#e2e8f0;font-size:14px;outline:none;box-sizing:border-box;
+}
+.auth-input:focus { border-color:#6366f1; }
+</style>
+
 <!-- Sidebar -->
 <aside class="sidebar w-64 flex-shrink-0 flex flex-col h-screen sticky top-0">
   <div class="p-5 border-b border-gray-800">
@@ -2242,11 +2685,14 @@ select.input option { background: #1a1a2e; }
         <i class="fas fa-user text-white text-xs"></i>
       </div>
       <div class="text-sm">
-        <div class="font-medium text-white">Admin</div>
-        <div class="text-xs text-gray-500">sarah.chen@acme.com</div>
+        <div id="biz-user-name" class="font-medium text-white">—</div>
+        <div id="biz-user-email" class="text-xs text-gray-500">—</div>
       </div>
       <div class="ml-auto w-2 h-2 rounded-full bg-green-500"></div>
     </div>
+    <button onclick="bizLogout()" class="w-full mt-3 text-xs text-red-400 hover:text-red-300 text-left flex items-center gap-2 py-1">
+      <i class="fas fa-sign-out-alt"></i> Sign Out
+    </button>
   </div>
 </aside>
 
@@ -2320,6 +2766,7 @@ select.input option { background: #1a1a2e; }
   </div>
 </div>
 
+<script src="/static/auth.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>`
@@ -2449,11 +2896,11 @@ nav a:hover { color: #e2e8f0; }
       <a href="#how-it-works">How it works</a>
       <a href="#features">Features</a>
       <a href="#pricing">Pricing</a>
-      <a href="/home/dashboard" class="text-indigo-400">Dashboard →</a>
+      <a href="/home/dashboard" class="text-indigo-400" onclick="homeCheckAuth(event)">Dashboard →</a>
     </div>
     <div class="flex items-center gap-3">
-      <a href="/home/dashboard" class="btn-outline text-sm py-2.5 px-5">Sign In</a>
-      <a href="/home/onboard" class="btn-cta text-sm py-2.5 px-5"><i class="fas fa-rocket"></i> Get Started Free</a>
+      <button onclick="homeShowAuth('login')" class="btn-outline text-sm py-2.5 px-5">Sign In</button>
+      <button onclick="homeShowAuth('register')" class="btn-cta text-sm py-2.5 px-5"><i class="fas fa-rocket"></i> Get Started Free</button>
     </div>
   </div>
 </nav>
@@ -2700,6 +3147,128 @@ nav a:hover { color: #e2e8f0; }
   </div>
 </footer>
 <style>@keyframes scan{0%{top:0}100%{top:100%}} .pulse{animation:pulse2 2s infinite} @keyframes pulse2{0%,100%{opacity:1}50%{opacity:.4}}</style>
+
+<!-- Home Auth Modal -->
+<div id="home-auth-overlay" style="display:none;position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.85);backdrop-filter:blur(8px);align-items:center;justify-content:center;padding:16px">
+  <div style="width:100%;max-width:440px;background:#0f0f1e;border:1px solid #1a1a2e;border-radius:20px;padding:28px;position:relative">
+    <button onclick="homeCloseAuth()" style="position:absolute;top:16px;right:16px;background:transparent;border:none;color:rgba(255,255,255,.4);font-size:20px;cursor:pointer">×</button>
+    <div style="text-align:center;margin-bottom:24px">
+      <div style="width:52px;height:52px;border-radius:14px;background:linear-gradient(135deg,#6366f1,#8b5cf6);display:inline-flex;align-items:center;justify-content:center;margin-bottom:10px">
+        <i class="fas fa-house-lock" style="color:#fff;font-size:20px"></i>
+      </div>
+      <h2 style="font-size:20px;font-weight:800;color:#fff;margin:0">FaceAccess Home</h2>
+    </div>
+    <div style="display:flex;background:#07071a;border-radius:10px;padding:3px;margin-bottom:20px;border:1px solid #1a1a2e">
+      <button id="home-tab-login" onclick="homeAuthTab('login')" style="flex:1;padding:7px;border:none;border-radius:7px;cursor:pointer;font-weight:600;font-size:13px;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;transition:all .2s">Sign In</button>
+      <button id="home-tab-register" onclick="homeAuthTab('register')" style="flex:1;padding:7px;border:none;border-radius:7px;cursor:pointer;font-weight:600;font-size:13px;background:transparent;color:rgba(255,255,255,.4);transition:all .2s">Create Account</button>
+    </div>
+    <!-- Login -->
+    <div id="home-form-login">
+      <div style="margin-bottom:12px"><label style="font-size:11px;color:rgba(255,255,255,.4);display:block;margin-bottom:5px;text-transform:uppercase;letter-spacing:.05em">Email</label>
+        <input id="home-login-email" type="email" placeholder="you@example.com" autocomplete="email" style="width:100%;background:#07071a;border:1px solid #1e1e35;border-radius:8px;padding:10px 13px;color:#e2e8f0;font-size:14px;outline:none;box-sizing:border-box" onkeydown="if(event.key==='Enter')homeDoLogin()"></div>
+      <div style="margin-bottom:12px"><label style="font-size:11px;color:rgba(255,255,255,.4);display:block;margin-bottom:5px;text-transform:uppercase;letter-spacing:.05em">Password</label>
+        <input id="home-login-pw" type="password" placeholder="••••••••" autocomplete="current-password" style="width:100%;background:#07071a;border:1px solid #1e1e35;border-radius:8px;padding:10px 13px;color:#e2e8f0;font-size:14px;outline:none;box-sizing:border-box" onkeydown="if(event.key==='Enter')homeDoLogin()"></div>
+      <div id="home-login-err" style="display:none;background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.2);border-radius:8px;padding:10px;font-size:12px;color:#fca5a5;margin-bottom:12px"></div>
+      <button id="home-login-btn" onclick="homeDoLogin()" style="width:100%;padding:11px;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;border:none;border-radius:10px;font-weight:700;font-size:14px;cursor:pointer"><i class="fas fa-sign-in-alt" style="margin-right:6px"></i>Sign In</button>
+      <p style="text-align:center;margin-top:10px;font-size:11px;color:rgba(255,255,255,.3)">QA: <code style="color:#a5b4fc">home@facehome.test</code> / <code style="color:#a5b4fc">Test1234</code></p>
+    </div>
+    <!-- Register -->
+    <div id="home-form-register" style="display:none">
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px">
+        <div><label style="font-size:11px;color:rgba(255,255,255,.4);display:block;margin-bottom:5px;text-transform:uppercase;letter-spacing:.05em">First Name *</label>
+          <input id="home-reg-first" placeholder="Alex" style="width:100%;background:#07071a;border:1px solid #1e1e35;border-radius:8px;padding:10px 12px;color:#e2e8f0;font-size:14px;outline:none;box-sizing:border-box"></div>
+        <div><label style="font-size:11px;color:rgba(255,255,255,.4);display:block;margin-bottom:5px;text-transform:uppercase;letter-spacing:.05em">Last Name *</label>
+          <input id="home-reg-last" placeholder="Smith" style="width:100%;background:#07071a;border:1px solid #1e1e35;border-radius:8px;padding:10px 12px;color:#e2e8f0;font-size:14px;outline:none;box-sizing:border-box"></div>
+      </div>
+      <div style="margin-bottom:12px"><label style="font-size:11px;color:rgba(255,255,255,.4);display:block;margin-bottom:5px;text-transform:uppercase;letter-spacing:.05em">Email *</label>
+        <input id="home-reg-email" type="email" placeholder="you@example.com" style="width:100%;background:#07071a;border:1px solid #1e1e35;border-radius:8px;padding:10px 12px;color:#e2e8f0;font-size:14px;outline:none;box-sizing:border-box"></div>
+      <div style="margin-bottom:12px"><label style="font-size:11px;color:rgba(255,255,255,.4);display:block;margin-bottom:5px;text-transform:uppercase;letter-spacing:.05em">Phone</label>
+        <input id="home-reg-phone" type="tel" placeholder="+1 555 0100" style="width:100%;background:#07071a;border:1px solid #1e1e35;border-radius:8px;padding:10px 12px;color:#e2e8f0;font-size:14px;outline:none;box-sizing:border-box"></div>
+      <div style="margin-bottom:14px"><label style="font-size:11px;color:rgba(255,255,255,.4);display:block;margin-bottom:5px;text-transform:uppercase;letter-spacing:.05em">Password * <span style="color:rgba(255,255,255,.2);font-size:10px">(8+ chars)</span></label>
+        <input id="home-reg-pw" type="password" placeholder="••••••••" style="width:100%;background:#07071a;border:1px solid #1e1e35;border-radius:8px;padding:10px 12px;color:#e2e8f0;font-size:14px;outline:none;box-sizing:border-box"></div>
+      <div id="home-reg-err" style="display:none;background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.2);border-radius:8px;padding:10px;font-size:12px;color:#fca5a5;margin-bottom:12px"></div>
+      <button id="home-reg-btn" onclick="homeDoRegister()" style="width:100%;padding:11px;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;border:none;border-radius:10px;font-weight:700;font-size:14px;cursor:pointer"><i class="fas fa-user-plus" style="margin-right:6px"></i>Create Account</button>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/axios@1.6.0/dist/axios.min.js"></script>
+<script src="/static/auth.js"></script>
+<script>
+function homeShowAuth(tab) {
+  document.getElementById('home-auth-overlay').style.display = 'flex';
+  homeAuthTab(tab || 'login');
+  // auto-open if ?login=1 in URL
+}
+function homeCloseAuth() {
+  document.getElementById('home-auth-overlay').style.display = 'none';
+}
+function homeAuthTab(tab) {
+  const isLogin = tab === 'login';
+  document.getElementById('home-form-login').style.display = isLogin ? '' : 'none';
+  document.getElementById('home-form-register').style.display = isLogin ? 'none' : '';
+  document.getElementById('home-tab-login').style.background = isLogin ? 'linear-gradient(135deg,#6366f1,#8b5cf6)' : 'transparent';
+  document.getElementById('home-tab-login').style.color = isLogin ? '#fff' : 'rgba(255,255,255,.4)';
+  document.getElementById('home-tab-register').style.background = !isLogin ? 'linear-gradient(135deg,#6366f1,#8b5cf6)' : 'transparent';
+  document.getElementById('home-tab-register').style.color = !isLogin ? '#fff' : 'rgba(255,255,255,.4)';
+}
+async function homeDoLogin() {
+  const email = document.getElementById('home-login-email').value.trim();
+  const pw = document.getElementById('home-login-pw').value;
+  const errEl = document.getElementById('home-login-err');
+  const btn = document.getElementById('home-login-btn');
+  if (!email || !pw) { errEl.textContent='Email and password required'; errEl.style.display=''; return; }
+  errEl.style.display='none'; btn.disabled=true;
+  btn.innerHTML='<i class="fas fa-spinner fa-spin" style="margin-right:6px"></i>Signing in…';
+  try {
+    await FA_AUTH.loginHome(email, pw);
+    window.location.href = '/home/dashboard';
+  } catch(e) {
+    errEl.textContent = e.response?.data?.error || 'Invalid email or password';
+    errEl.style.display='';
+    btn.disabled=false; btn.innerHTML='<i class="fas fa-sign-in-alt" style="margin-right:6px"></i>Sign In';
+  }
+}
+async function homeDoRegister() {
+  const first = document.getElementById('home-reg-first').value.trim();
+  const last = document.getElementById('home-reg-last').value.trim();
+  const email = document.getElementById('home-reg-email').value.trim();
+  const phone = document.getElementById('home-reg-phone').value.trim();
+  const pw = document.getElementById('home-reg-pw').value;
+  const errEl = document.getElementById('home-reg-err');
+  const btn = document.getElementById('home-reg-btn');
+  if (!first||!last) { errEl.textContent='First and last name required'; errEl.style.display=''; return; }
+  if (!FA_AUTH.validEmail(email)) { errEl.textContent='Invalid email'; errEl.style.display=''; return; }
+  if (phone && !FA_AUTH.validPhone(phone)) { errEl.textContent='Invalid phone'; errEl.style.display=''; return; }
+  if (!FA_AUTH.validPassword(pw)) { errEl.textContent='Password: 8+ chars with letters and numbers'; errEl.style.display=''; return; }
+  errEl.style.display='none'; btn.disabled=true;
+  btn.innerHTML='<i class="fas fa-spinner fa-spin" style="margin-right:6px"></i>Creating…';
+  try {
+    await FA_AUTH.registerHome({ first_name:first, last_name:last, email, phone:phone||null, password:pw });
+    window.location.href = '/home/onboard';
+  } catch(e) {
+    errEl.textContent = e.response?.data?.error || 'Registration failed';
+    errEl.style.display='';
+    btn.disabled=false; btn.innerHTML='<i class="fas fa-user-plus" style="margin-right:6px"></i>Create Account';
+  }
+}
+async function homeCheckAuth(e) {
+  const account = await FA_AUTH.verifySession('home');
+  if (!account) { e.preventDefault(); homeShowAuth('login'); }
+}
+// Auto-open if ?login=1
+(async () => {
+  if (new URLSearchParams(location.search).get('login')) homeShowAuth('login');
+  else {
+    const account = await FA_AUTH.verifySession('home');
+    if (account) {
+      // Already logged in — show dashboard link prominently
+      const dashLink = document.querySelector('a[href="/home/dashboard"]');
+      if (dashLink) dashLink.textContent = '→ Go to Dashboard';
+    }
+  }
+})();
+</script>
 </body>
 </html>`
 }
@@ -2776,7 +3345,7 @@ select.input option{background:#0f0f1e}
       </div>
       <div>
         <div class="font-bold text-white text-sm leading-tight">FaceAccess <span class="text-indigo-400">Home</span></div>
-        <div class="text-xs text-gray-600">Kim Residence</div>
+        <div class="text-xs text-gray-600" id="dash-home-name">My Home</div>
       </div>
     </div>
   </div>
@@ -2841,13 +3410,18 @@ select.input option{background:#0f0f1e}
 
   <div class="p-4 border-t border-gray-900">
     <div class="flex items-center gap-3">
-      <div class="member-avatar" style="background:#6366f120;color:#818cf8">JK</div>
+      <div class="w-8 h-8 rounded-full bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center">
+        <i class="fas fa-user text-white text-xs"></i>
+      </div>
       <div class="text-sm">
-        <div class="font-medium text-white">Jordan Kim</div>
-        <div class="text-xs text-gray-600">Owner · Pro plan</div>
+        <div id="dash-user-name" class="font-medium text-white">—</div>
+        <div id="dash-user-email" class="text-xs text-gray-600">—</div>
       </div>
       <div class="ml-auto w-2 h-2 rounded-full bg-green-500"></div>
     </div>
+    <button onclick="homeLogout()" class="w-full mt-3 text-xs text-red-400 hover:text-red-300 text-left flex items-center gap-2 py-1">
+      <i class="fas fa-sign-out-alt"></i> Sign Out
+    </button>
   </div>
 </aside>
 
@@ -2892,6 +3466,7 @@ select.input option{background:#0f0f1e}
   <div id="modal-content" class="modal" onclick="event.stopPropagation()"></div>
 </div>
 
+<script src="/static/auth.js"></script>
 <script src="/static/faceid-engine.js"></script>
 <script src="/static/arcface-engine.js"></script>
 <script src="/static/home-dashboard.js"></script>
@@ -3155,6 +3730,7 @@ body{font-family:system-ui,sans-serif;background:#070712;color:#e2e8f0;min-heigh
   </div>
 </div>
 
+<script src="/static/auth.js"></script>
 <script src="/static/faceid-engine.js"></script>
 <script src="/static/home-onboard.js"></script>
 </body>
@@ -3205,7 +3781,7 @@ body{font-family:system-ui,sans-serif;background:#07071a;color:#e2e8f0;max-width
       </div>
       <div>
         <div class="font-bold text-white text-sm">FaceAccess <span class="text-indigo-400">Home</span></div>
-        <div class="text-xs text-gray-500" id="hm-home-name">Kim Residence</div>
+        <div class="text-xs text-gray-500" id="hm-home-name">My Home</div>
       </div>
       <div class="ml-auto flex items-center gap-2">
         <div class="w-1.5 h-1.5 rounded-full bg-green-400 pulse"></div>
@@ -3225,6 +3801,73 @@ body{font-family:system-ui,sans-serif;background:#07071a;color:#e2e8f0;max-width
   <div class="flex-1 p-4 space-y-4" id="hm-content"></div>
 </div>
 
+<!-- Mobile Auth Wall -->
+<div id="mob-auth-wall" style="display:none;position:fixed;inset:0;z-index:9999;background:#07071a;overflow-y:auto;padding:24px 16px">
+  <div style="max-width:400px;margin:0 auto;padding-top:40px">
+    <div style="text-align:center;margin-bottom:32px">
+      <div style="width:56px;height:56px;border-radius:16px;background:linear-gradient(135deg,#6366f1,#8b5cf6);display:inline-flex;align-items:center;justify-content:center;margin-bottom:12px;box-shadow:0 8px 32px rgba(99,102,241,.4)">
+        <i class="fas fa-house-lock" style="color:#fff;font-size:20px"></i>
+      </div>
+      <h1 style="font-size:22px;font-weight:800;color:#fff;margin:0">FaceAccess Home</h1>
+      <p style="color:rgba(255,255,255,.4);font-size:13px;margin:6px 0 0">Mobile Companion</p>
+    </div>
+    <div style="display:flex;background:#0f0f1e;border-radius:12px;padding:4px;margin-bottom:20px;border:1px solid #1a1a2e">
+      <button id="mob-tab-login" onclick="mobShowTab('login')" style="flex:1;padding:8px;border:none;border-radius:8px;cursor:pointer;font-weight:600;font-size:13px;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;transition:all .2s">Sign In</button>
+      <button id="mob-tab-register" onclick="mobShowTab('register')" style="flex:1;padding:8px;border:none;border-radius:8px;cursor:pointer;font-weight:600;font-size:13px;background:transparent;color:rgba(255,255,255,.4);transition:all .2s">Register</button>
+    </div>
+    <!-- Login -->
+    <div id="mob-form-login" style="background:#0f0f1e;border:1px solid #1a1a2e;border-radius:16px;padding:20px">
+      <div style="margin-bottom:14px">
+        <label style="font-size:11px;color:rgba(255,255,255,.4);text-transform:uppercase;letter-spacing:.05em;display:block;margin-bottom:6px">Email</label>
+        <input id="mob-login-email" type="email" placeholder="you@example.com" autocomplete="email"
+          style="width:100%;background:#07071a;border:1px solid #1e1e35;border-radius:8px;padding:11px 14px;color:#e2e8f0;font-size:14px;outline:none;box-sizing:border-box">
+      </div>
+      <div style="margin-bottom:14px">
+        <label style="font-size:11px;color:rgba(255,255,255,.4);text-transform:uppercase;letter-spacing:.05em;display:block;margin-bottom:6px">Password</label>
+        <input id="mob-login-pw" type="password" placeholder="••••••••" autocomplete="current-password"
+          style="width:100%;background:#07071a;border:1px solid #1e1e35;border-radius:8px;padding:11px 14px;color:#e2e8f0;font-size:14px;outline:none;box-sizing:border-box">
+      </div>
+      <div id="mob-login-err" style="display:none;background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.2);border-radius:8px;padding:10px 14px;font-size:12px;color:#fca5a5;margin-bottom:12px"></div>
+      <button id="mob-login-btn" onclick="mobDoLogin()" style="width:100%;padding:12px;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;border:none;border-radius:10px;font-weight:700;font-size:14px;cursor:pointer">
+        <i class="fas fa-sign-in-alt" style="margin-right:6px"></i>Sign In
+      </button>
+      <p style="text-align:center;margin-top:12px;font-size:11px;color:rgba(255,255,255,.3)">
+        QA: <code style="color:#a5b4fc">mobile@facehome.test</code> / <code style="color:#a5b4fc">Test1234</code>
+      </p>
+    </div>
+    <!-- Register -->
+    <div id="mob-form-register" style="display:none;background:#0f0f1e;border:1px solid #1a1a2e;border-radius:16px;padding:20px">
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px">
+        <div>
+          <label style="font-size:11px;color:rgba(255,255,255,.4);display:block;margin-bottom:5px">First Name *</label>
+          <input id="mob-reg-first" placeholder="Alex" style="width:100%;background:#07071a;border:1px solid #1e1e35;border-radius:8px;padding:10px 12px;color:#e2e8f0;font-size:14px;outline:none;box-sizing:border-box">
+        </div>
+        <div>
+          <label style="font-size:11px;color:rgba(255,255,255,.4);display:block;margin-bottom:5px">Last Name *</label>
+          <input id="mob-reg-last" placeholder="Smith" style="width:100%;background:#07071a;border:1px solid #1e1e35;border-radius:8px;padding:10px 12px;color:#e2e8f0;font-size:14px;outline:none;box-sizing:border-box">
+        </div>
+      </div>
+      <div style="margin-bottom:12px">
+        <label style="font-size:11px;color:rgba(255,255,255,.4);display:block;margin-bottom:5px">Email *</label>
+        <input id="mob-reg-email" type="email" placeholder="you@example.com" style="width:100%;background:#07071a;border:1px solid #1e1e35;border-radius:8px;padding:10px 12px;color:#e2e8f0;font-size:14px;outline:none;box-sizing:border-box">
+      </div>
+      <div style="margin-bottom:12px">
+        <label style="font-size:11px;color:rgba(255,255,255,.4);display:block;margin-bottom:5px">Phone</label>
+        <input id="mob-reg-phone" type="tel" placeholder="+1 555 0100" style="width:100%;background:#07071a;border:1px solid #1e1e35;border-radius:8px;padding:10px 12px;color:#e2e8f0;font-size:14px;outline:none;box-sizing:border-box">
+      </div>
+      <div style="margin-bottom:16px">
+        <label style="font-size:11px;color:rgba(255,255,255,.4);display:block;margin-bottom:5px">Password * <span style="color:rgba(255,255,255,.2);font-size:10px">(8+ chars, letters+numbers)</span></label>
+        <input id="mob-reg-pw" type="password" placeholder="••••••••" style="width:100%;background:#07071a;border:1px solid #1e1e35;border-radius:8px;padding:10px 12px;color:#e2e8f0;font-size:14px;outline:none;box-sizing:border-box">
+      </div>
+      <div id="mob-reg-err" style="display:none;background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.2);border-radius:8px;padding:10px 14px;font-size:12px;color:#fca5a5;margin-bottom:12px"></div>
+      <button id="mob-reg-btn" onclick="mobDoRegister()" style="width:100%;padding:12px;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;border:none;border-radius:10px;font-weight:700;font-size:14px;cursor:pointer">
+        <i class="fas fa-user-plus" style="margin-right:6px"></i>Create Account
+      </button>
+    </div>
+  </div>
+</div>
+
+<script src="/static/auth.js"></script>
 <script src="/static/home-mobile.js"></script>
 </body>
 </html>`

@@ -1,5 +1,5 @@
 // ══════════════════════════════════════════════════════
-//  FaceAccess Home — Dashboard JS  v2.1 (hardened)
+//  FaceAccess Home — Dashboard JS  v3.0 (production)
 // ══════════════════════════════════════════════════════
 
 'use strict';
@@ -7,6 +7,7 @@
 const API = '';
 let currentHomeId = null;
 let currentUserId = null;
+let currentAccount = null;
 let refreshTimer = null;
 let activityChart = null;
 
@@ -30,7 +31,24 @@ function isValidId(id)    { return /^[a-zA-Z0-9_\-]+$/.test(id); }
 async function init() {
   clockTick();
   setInterval(clockTick, 1000);
-  await loadDemoHome();
+
+  // Check existing home session
+  if (typeof FA_AUTH !== 'undefined') {
+    const account = await FA_AUTH.verifySession('home');
+    if (account) {
+      currentAccount = account;
+      await loadUserHome(account);
+      renderUserInSidebar(account);
+    } else {
+      // Not authenticated — redirect to home landing with login prompt
+      window.location.href = '/home?login=1';
+      return;
+    }
+  } else {
+    // FA_AUTH not available - fallback: try to load homes
+    await loadUserHome(null);
+  }
+
   showTab('overview');
   setInterval(() => {
     if (document.getElementById('tab-overview') && !document.getElementById('tab-overview').classList.contains('hidden')) {
@@ -44,56 +62,32 @@ function clockTick() {
   if (el) el.textContent = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
 
-async function loadDemoHome() {
-  // Try to get first available home or create demo
+// ── Render logged-in user in sidebar ─────────────────
+function renderUserInSidebar(account) {
+  const nameEl = document.getElementById('dash-user-name');
+  const emailEl = document.getElementById('dash-user-email');
+  if (nameEl) nameEl.textContent = `${account.first_name} ${account.last_name}`;
+  if (emailEl) emailEl.textContent = account.email;
+}
+
+// ── Load the user's home (no auto-seeding) ───────────
+async function loadUserHome(account) {
   try {
     const r = await axios.get(`${API}/api/home/homes`);
-    if (r.data.homes && r.data.homes.length > 0) {
-      currentHomeId = r.data.homes[0].id;
-      currentUserId = r.data.homes[0].owner_id;
+    const homes = r.data.homes || [];
+    if (homes.length > 0) {
+      currentHomeId = homes[0].id;
+      currentUserId = homes[0].owner_id;
+      const nameEl = document.getElementById('dash-home-name');
+      if (nameEl) nameEl.textContent = homes[0].name || 'My Home';
     } else {
-      // Create demo home
-      const ur = await axios.post(`${API}/api/home/users`, { name: 'Jordan Kim', email: 'jordan@facehome.demo', phone: '+1-555-0100', role: 'owner' });
-      currentUserId = ur.data.user.id;
-      const hr = await axios.post(`${API}/api/home/homes`, { owner_id: currentUserId, name: 'Kim Residence', address: '142 Maple Street, Austin TX' });
-      currentHomeId = hr.data.home.id;
-      await seedDemoHomeData();
+      // No home yet — prompt onboarding
+      const nameEl = document.getElementById('dash-home-name');
+      if (nameEl) nameEl.textContent = 'No home set up';
     }
   } catch (e) {
     console.error('Home load error', e);
   }
-}
-
-async function seedDemoHomeData() {
-  if (!currentHomeId || !currentUserId) return;
-  try {
-    // Add member
-    await axios.post(`${API}/api/home/users`, { home_id: currentHomeId, name: 'Riley Kim', email: 'riley@facehome.demo', phone: '+1-555-0101', role: 'member' });
-    await axios.post(`${API}/api/home/users`, { home_id: currentHomeId, name: 'Casey Kim', email: 'casey@facehome.demo', phone: '+1-555-0102', role: 'member' });
-    // Locks
-    const l1 = await axios.post(`${API}/api/home/locks`, { home_id: currentHomeId, name: 'Front Door', location: 'Main entrance', lock_type: 'api', brand: 'august' });
-    const l2 = await axios.post(`${API}/api/home/locks`, { home_id: currentHomeId, name: 'Back Door', location: 'Rear entrance', lock_type: 'api', brand: 'schlage' });
-    const l3 = await axios.post(`${API}/api/home/locks`, { home_id: currentHomeId, name: 'Garage', location: 'Side garage door', lock_type: 'relay', brand: 'generic' });
-    // Cameras
-    await axios.post(`${API}/api/home/cameras`, { home_id: currentHomeId, lock_id: l1.data.lock.id, name: 'Front Door Camera', stream_url: 'rtsp://192.168.1.100:554/stream', camera_type: 'rtsp' });
-    await axios.post(`${API}/api/home/cameras`, { home_id: currentHomeId, lock_id: l2.data.lock.id, name: 'Back Door Camera', stream_url: 'rtsp://192.168.1.101:554/stream', camera_type: 'rtsp' });
-    // Devices
-    const usersR = await axios.get(`${API}/api/home/users?home_id=${currentHomeId}`);
-    for (const u of usersR.data.users) {
-      await axios.post(`${API}/api/home/devices`, { user_id: u.id, home_id: currentHomeId, name: `${u.name.split(' ')[0]}'s iPhone`, platform: 'ios' });
-      // Register face
-      await axios.post(`${API}/api/home/users/${u.id}/face`, { image_quality: 0.96 });
-    }
-    // Guest pass
-    const now = new Date();
-    const until = new Date(now.getTime() + 7 * 86400000).toISOString().replace('T',' ').split('.')[0];
-    await axios.post(`${API}/api/home/guests`, {
-      home_id: currentHomeId, created_by: currentUserId, name: 'House Cleaner',
-      email: 'cleaner@service.com', lock_ids: [l1.data.lock.id],
-      valid_from: now.toISOString().replace('T',' ').split('.')[0], valid_until: until,
-      time_start: '09:00', time_end: '17:00', days_allowed: 'mon,wed,fri'
-    });
-  } catch (e) { /* ignore seed errors */ }
 }
 
 // ── Tab Navigation ────────────────────────────────────
@@ -2682,6 +2676,15 @@ function renderHeatmap(heatmapData) {
   }
   html += '</table></div>';
   return html;
+}
+
+// ── Home Logout ───────────────────────────────────────
+async function homeLogout() {
+  if (!confirm('Sign out of FaceAccess Home?')) return;
+  if (typeof FA_AUTH !== 'undefined') {
+    await FA_AUTH.logout('home');
+  }
+  window.location.href = '/home?login=1';
 }
 
 // Start
