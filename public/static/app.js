@@ -21,6 +21,10 @@ function showPage(page) {
   if (dashboardRefreshInterval) { clearInterval(dashboardRefreshInterval); dashboardRefreshInterval = null }
   if (liveRefreshInterval) { clearInterval(liveRefreshInterval); liveRefreshInterval = null }
   if (cameraStream) { cameraStream.getTracks().forEach(t => t.stop()); cameraStream = null }
+  // Stop face ID sessions when navigating away
+  if (page !== 'recognize' && typeof _recFaceSession !== 'undefined' && _recFaceSession) {
+    try { _recFaceSession.stop() } catch(e){} _recFaceSession = null
+  }
 
   if (page === 'dashboard') { loadDashboard(); dashboardRefreshInterval = setInterval(loadDashboard, 15000) }
   else if (page === 'live') { loadLiveMonitor(); liveRefreshInterval = setInterval(loadLiveMonitor, 5000) }
@@ -56,6 +60,12 @@ function closeModal(e) {
   if (!e || e.target === document.getElementById('modal-overlay')) {
     document.getElementById('modal-overlay').classList.add('hidden')
     if (cameraStream) { cameraStream.getTracks().forEach(t => t.stop()); cameraStream = null }
+    // Stop any face enrollment sessions
+    if (window._enrollFaceSession) { try { window._enrollFaceSession.stop() } catch(ee){} window._enrollFaceSession = null }
+    if (typeof _enrollFaceSession !== 'undefined' && _enrollFaceSession) {
+      try { _enrollFaceSession.stop() } catch(ee){} 
+      _enrollFaceSession = null
+    }
   }
 }
 
@@ -306,79 +316,214 @@ async function loadLiveMonitor() {
 }
 
 // ─── FACE RECOGNITION TEST ───────────────────────────────────
+// ─── FACE ID TEST (Real Engine) ──────────────────────────────
+let _recFaceSession = null
+
 function loadRecognize() {
   const el = document.getElementById('page-recognize')
+
+  // Stop any existing session
+  if (_recFaceSession) { try { _recFaceSession.stop() } catch(e){} _recFaceSession = null }
+  _recCapturedEmbedding = null
+
   el.innerHTML = `
-  <div class="max-w-2xl mx-auto">
+  <div class="max-w-3xl mx-auto">
     <div class="mb-6">
-      <h2 class="text-xl font-bold text-white">Face Recognition Test Console</h2>
-      <p class="text-gray-400 text-sm mt-1">Test real-time face identification against the access database</p>
+      <h2 class="text-xl font-bold text-white">Face ID Test Console</h2>
+      <p class="text-gray-400 text-sm mt-1">Live face recognition against your access database using the real biometric engine</p>
     </div>
 
-    <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
-      <!-- Camera panel -->
-      <div class="card p-5">
-        <h3 class="font-semibold text-white mb-4 flex items-center gap-2">
-          <i class="fas fa-camera text-indigo-400"></i> Camera Feed
-        </h3>
-        <div class="face-scanner mb-4">
-          <video id="rec-video" autoplay muted playsinline class="w-full h-full object-cover rounded-full"></video>
-          <div class="ring"></div>
-          <div class="scan-line" id="rec-scanline" style="display:none"></div>
-          <div id="rec-placeholder" class="absolute inset-0 flex items-center justify-center bg-gray-900 rounded-full">
-            <div class="text-center">
-              <i class="fas fa-user-circle text-gray-600 text-5xl"></i>
-              <p class="text-xs text-gray-500 mt-2">Position face here</p>
-            </div>
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+      <!-- FaceID Engine Panel -->
+      <div class="card p-0 overflow-hidden">
+        <div class="px-5 pt-4 pb-3 border-b border-gray-800 flex items-center gap-3">
+          <i class="fas fa-eye text-indigo-400 text-lg"></i>
+          <div>
+            <h3 class="font-semibold text-white text-sm">Face ID Scanner</h3>
+            <p class="text-xs text-gray-500">Powered by FaceID Engine v4.0</p>
+          </div>
+          <div id="rec-engine-status" class="ml-auto flex items-center gap-1.5 text-xs">
+            <div class="w-1.5 h-1.5 rounded-full bg-gray-500"></div>
+            <span class="text-gray-500">Ready</span>
           </div>
         </div>
-        <button onclick="startCamera('rec-video','rec-placeholder','rec-scanline')" class="btn-ghost w-full mb-2">
-          <i class="fas fa-camera mr-2"></i> Start Camera
-        </button>
-        <button onclick="captureAndRecognize()" class="btn-primary w-full" id="rec-btn">
-          <i class="fas fa-face-grin-wide mr-2"></i> Identify Face
-        </button>
+        <div id="rec-faceid-mount" class="bg-black"></div>
       </div>
 
-      <!-- Result panel -->
-      <div class="card p-5">
-        <h3 class="font-semibold text-white mb-4 flex items-center gap-2">
-          <i class="fas fa-id-card text-indigo-400"></i> Recognition Result
-        </h3>
-        <div id="rec-result">
-          <!-- Door selector -->
-          <div class="mb-4">
-            <label class="text-xs text-gray-400 mb-1 block">Test at Door</label>
-            <select id="rec-door" class="input"></select>
-          </div>
-          <div class="mt-4 p-4 rounded-xl bg-gray-800/40 border border-gray-700/40 text-center">
-            <i class="fas fa-question-circle text-gray-600 text-3xl mb-3"></i>
-            <p class="text-gray-400 text-sm">Capture a face to see recognition results</p>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Demo mode notice -->
-    <div class="mt-6 p-4 rounded-xl bg-indigo-500/10 border border-indigo-500/20">
-      <div class="flex items-start gap-3">
-        <i class="fas fa-info-circle text-indigo-400 mt-0.5"></i>
+      <!-- Result Panel -->
+      <div class="card p-5 flex flex-col gap-4">
         <div>
-          <div class="text-sm font-medium text-indigo-300">Demo Mode Active</div>
-          <div class="text-xs text-gray-400 mt-1">Without a real FaceNet model, the system simulates recognition results.
-          In production, replace the embedding generation with a TensorFlow.js or ONNX model running in the browser,
-          or send frames to a dedicated AI inference endpoint.</div>
+          <label class="text-xs text-gray-400 mb-1.5 block font-medium">Test at Door</label>
+          <select id="rec-door" class="input">
+            <option value="">Loading doors…</option>
+          </select>
         </div>
+
+        <div id="rec-status-box" class="p-4 rounded-xl bg-gray-800/40 border border-gray-700/40 text-center">
+          <div class="w-12 h-12 rounded-full bg-indigo-500/10 border border-indigo-500/20 flex items-center justify-center mx-auto mb-3">
+            <i class="fas fa-camera text-indigo-400 text-xl"></i>
+          </div>
+          <p class="text-white font-medium text-sm mb-1">Ready to Scan</p>
+          <p class="text-gray-400 text-xs">Click "Start Face ID Setup" in the scanner, complete the 5-angle scan, then click Identify</p>
+        </div>
+
+        <div id="rec-result-card" class="hidden"></div>
+
+        <button onclick="runFaceRecognition()" id="rec-identify-btn" class="btn-primary w-full" disabled>
+          <i class="fas fa-fingerprint mr-2"></i> Identify Face
+        </button>
+
+        <div class="p-3 rounded-lg bg-gray-800/30 border border-gray-700/30">
+          <div class="text-xs font-medium text-gray-400 mb-2 flex items-center gap-1.5">
+            <i class="fas fa-info-circle text-indigo-400"></i> How it works
+          </div>
+          <ol class="text-xs text-gray-500 space-y-1 list-decimal pl-4">
+            <li>Allow camera — click "Start Face ID Setup"</li>
+            <li>Complete the 5-angle biometric scan</li>
+            <li>Select a door above, then click "Identify Face"</li>
+            <li>Engine matches your embedding against enrolled users</li>
+          </ol>
+        </div>
+      </div>
+    </div>
+
+    <div class="mt-6 card p-5">
+      <h3 class="font-semibold text-white mb-3 flex items-center gap-2">
+        <i class="fas fa-history text-indigo-400"></i> Test History
+      </h3>
+      <div id="rec-history" class="space-y-2 max-h-56 overflow-y-auto">
+        <p class="text-gray-500 text-sm text-center py-4">No tests run yet</p>
       </div>
     </div>
   </div>`
 
-  // Load doors for selector
+  // Load doors
   axios.get(`${API}/doors`).then(r => {
     const sel = document.getElementById('rec-door')
-    if (sel) sel.innerHTML = r.data.doors.map(d => `<option value="${d.id}">${d.name} (${d.security_level})</option>`).join('')
-  })
+    if (sel) sel.innerHTML = '<option value="">— Select Door —</option>' +
+      r.data.doors.map(d => `<option value="${d.id}">${d.name} — ${d.security_level}</option>`).join('')
+  }).catch(() => {})
+
+  // Mount engine
+  _mountRecFaceEngine()
 }
+
+let _recCapturedEmbedding = null
+let _recCapturedLiveness  = null
+let _recCapturedAntiSpoof = null
+let _recCapturedQuality   = null
+
+function _mountRecFaceEngine() {
+  if (!window.initFaceIDEnrollment) {
+    const mount = document.getElementById('rec-faceid-mount')
+    if (mount) mount.innerHTML = `
+      <div class="p-8 text-center">
+        <i class="fas fa-exclamation-triangle text-yellow-400 text-3xl mb-3"></i>
+        <p class="text-yellow-300 text-sm font-medium">FaceID Engine not available</p>
+        <p class="text-gray-500 text-xs mt-1">Reload the page to initialize the engine</p>
+      </div>`
+    return
+  }
+
+  _recCapturedEmbedding = null
+  if (_recFaceSession) { try { _recFaceSession.stop() } catch(e){} _recFaceSession = null }
+
+  _recFaceSession = window.initFaceIDEnrollment('rec-faceid-mount', {
+    onComplete: function(result) {
+      _recCapturedEmbedding = result.embedding
+      _recCapturedLiveness  = result.livenessScore
+      _recCapturedAntiSpoof = result.antiSpoofScore
+      _recCapturedQuality   = result.averageQuality
+
+      const btn = document.getElementById('rec-identify-btn')
+      if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-fingerprint mr-2"></i> Identify Face' }
+
+      const sb = document.getElementById('rec-status-box')
+      if (sb) sb.innerHTML = `
+        <div class="w-12 h-12 rounded-full bg-green-500/10 border border-green-500/20 flex items-center justify-center mx-auto mb-3">
+          <i class="fas fa-check text-green-400 text-xl"></i>
+        </div>
+        <p class="text-green-400 font-semibold text-sm mb-1">Face Scan Complete!</p>
+        <p class="text-gray-400 text-xs">Quality: ${result.averageQuality}% · Liveness: ${Math.round(result.livenessScore*100)}% · ${result.capturedAngles?.length||0} angles</p>`
+
+      const es = document.getElementById('rec-engine-status')
+      if (es) es.innerHTML = '<div class="w-1.5 h-1.5 rounded-full bg-green-400"></div><span class="text-green-400">Scan Ready</span>'
+
+      toast('Face scan complete — select a door and click Identify!', 'success')
+    },
+    onSkip: function() {
+      _mountRecFaceEngine()
+      const es = document.getElementById('rec-engine-status')
+      if (es) es.innerHTML = '<div class="w-1.5 h-1.5 rounded-full bg-gray-500"></div><span class="text-gray-500">Ready</span>'
+    }
+  })
+
+  const es = document.getElementById('rec-engine-status')
+  if (es) es.innerHTML = '<div class="w-1.5 h-1.5 rounded-full bg-indigo-400 pulse"></div><span class="text-indigo-400">Scanning…</span>'
+}
+
+async function runFaceRecognition() {
+  const btn = document.getElementById('rec-identify-btn')
+  const doorSel = document.getElementById('rec-door')
+  const door_id = doorSel?.value
+
+  if (!door_id) { toast('Please select a door first', 'error'); return }
+  if (!_recCapturedEmbedding) { toast('Complete the face scan first', 'error'); return }
+
+  btn.disabled = true
+  btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> Analyzing…'
+
+  try {
+    const { data } = await axios.post(`${API}/recognize`, {
+      door_id,
+      embedding:       _recCapturedEmbedding,
+      liveness_score:  _recCapturedLiveness  || 0.88,
+      image_quality:  (_recCapturedQuality   || 80) / 100,
+      device_info: { ua: navigator.userAgent, source: 'face_id_test_console' }
+    })
+
+    renderRecognitionResult(data, door_id)
+    _addRecHistory(data, doorSel?.options[doorSel.selectedIndex]?.text)
+
+    // Reset for next scan
+    _recCapturedEmbedding = null
+    btn.disabled = true
+    btn.innerHTML = '<i class="fas fa-fingerprint mr-2"></i> Identify Face'
+
+    setTimeout(() => _mountRecFaceEngine(), 1200)
+
+  } catch(e) {
+    toast('Recognition error: ' + (e.response?.data?.error || e.message), 'error')
+    btn.disabled = !_recCapturedEmbedding
+    btn.innerHTML = '<i class="fas fa-fingerprint mr-2"></i> Identify Face'
+  }
+}
+
+function _addRecHistory(data, doorName) {
+  const hist = document.getElementById('rec-history')
+  if (!hist) return
+  const pct   = Math.round((data.confidence || 0) * 100)
+  const color = data.result === 'granted' ? '#10b981' : data.result === 'denied' ? '#ef4444' : '#f59e0b'
+  const icon  = data.result === 'granted' ? 'fa-check-circle' : data.result === 'denied' ? 'fa-times-circle' : 'fa-clock'
+  const time  = new Date().toLocaleTimeString('en-US', { hour:'2-digit', minute:'2-digit', second:'2-digit' })
+  const empty = hist.querySelector('p')
+  if (empty) empty.remove()
+  const item = document.createElement('div')
+  item.style.cssText = `display:flex;align-items:center;gap:10px;padding:10px 12px;border-radius:8px;background:${color}08;border:1px solid ${color}20;`
+  item.innerHTML = `
+    <i class="fas ${icon} text-sm" style="color:${color}"></i>
+    <div style="flex:1;min-width:0">
+      <div style="display:flex;align-items:center;gap:8px">
+        <span style="font-size:11px;font-weight:700;color:${color}">${data.result?.toUpperCase().replace('_',' ')}</span>
+        <span style="font-size:10px;color:#64748b">${time}</span>
+      </div>
+      <div style="font-size:11px;color:#94a3b8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${data.user?.name || 'No match'} · ${doorName || ''}</div>
+    </div>
+    <span style="font-size:12px;font-weight:700;font-family:monospace;color:${color}">${pct}%</span>`
+  hist.insertBefore(item, hist.firstChild)
+  while (hist.children.length > 10) hist.removeChild(hist.lastChild)
+}
+
 
 async function startCamera(videoId, placeholderId, scanlineId) {
   try {
@@ -420,21 +565,18 @@ async function captureAndRecognize() {
 function renderRecognitionResult(data, doorId) {
   const sel = document.getElementById('rec-door')
   const doorName = sel ? sel.options[sel.selectedIndex]?.text : doorId
-  const el = document.getElementById('rec-result')
-  const selectHtml = `<div class="mb-4"><label class="text-xs text-gray-400 mb-1 block">Test at Door</label>
-    ${el.querySelector('#rec-door')?.outerHTML || ''}</div>`
+  // Support both old #rec-result and new #rec-result-card
+  const el = document.getElementById('rec-result-card') || document.getElementById('rec-result')
+  if (!el) return
+
+  // Show the result card
+  el.classList.remove('hidden')
 
   const pct = Math.round((data.confidence||0) * 100)
   const color = data.result === 'granted' ? '#10b981' : data.result === 'denied' ? '#ef4444' : '#f59e0b'
   const icon = data.result === 'granted' ? 'fa-check-circle' : data.result === 'denied' ? 'fa-times-circle' : 'fa-clock'
 
   let content = `
-  <div class="mb-4">
-    <label class="text-xs text-gray-400 mb-1 block">Test at Door</label>
-    <select id="rec-door" class="input" onchange="">
-      ${sel ? sel.innerHTML : ''}
-    </select>
-  </div>
   <div class="p-4 rounded-xl border" style="background:${color}10;border-color:${color}30">
     <div class="flex items-center gap-3 mb-3">
       <i class="fas ${icon} text-2xl" style="color:${color}"></i>
@@ -644,77 +786,91 @@ async function submitAddUser() {
   } catch(e) { toast(e.response?.data?.error || e.message, 'error') }
 }
 
+let _enrollFaceSession = null
+
 function openRegisterFaceModal(userId, userName) {
+  // Stop any existing session
+  if (_enrollFaceSession) { try { _enrollFaceSession.stop() } catch(e){} _enrollFaceSession = null }
+
   openModal(`
-  <div>
-    <h3 class="text-xl font-bold text-white mb-2 flex items-center gap-2">
-      <i class="fas fa-camera text-indigo-400"></i> Register Face — ${userName}
-    </h3>
-    <p class="text-xs text-gray-400 mb-4">Take a photo or capture from webcam to register biometric data</p>
-
-    <div class="face-scanner mb-4">
-      <video id="face-reg-video" autoplay muted playsinline class="w-full h-full object-cover rounded-full"></video>
-      <div class="ring"></div>
-      <div class="scan-line" id="face-reg-scanline" style="display:none"></div>
-      <div id="face-reg-placeholder" class="absolute inset-0 flex items-center justify-center bg-gray-900 rounded-full">
-        <div class="text-center">
-          <i class="fas fa-user-circle text-gray-600 text-5xl"></i>
-          <p class="text-xs text-gray-500 mt-2">Start camera or upload</p>
-        </div>
+  <div style="max-width:420px;width:100%">
+    <div class="flex items-center gap-3 mb-4">
+      <div class="w-10 h-10 rounded-xl bg-indigo-500/15 flex items-center justify-center">
+        <i class="fas fa-fingerprint text-indigo-400 text-lg"></i>
       </div>
-      <canvas id="face-reg-canvas" style="display:none" width="280" height="280"></canvas>
-    </div>
-
-    <div id="face-reg-quality" class="mb-4 hidden">
-      <div class="flex justify-between text-xs text-gray-400 mb-1">
-        <span>Image Quality</span><span id="quality-pct">—</span>
+      <div>
+        <h3 class="text-lg font-bold text-white">Register Face ID</h3>
+        <p class="text-xs text-gray-400">${userName}</p>
       </div>
-      <div class="confidence-bar"><div id="quality-bar" class="confidence-fill" style="width:0%;background:#10b981"></div></div>
     </div>
 
-    <div class="grid grid-cols-2 gap-3 mb-3">
-      <button onclick="startCamera('face-reg-video','face-reg-placeholder','face-reg-scanline')" class="btn-ghost">
-        <i class="fas fa-camera mr-1"></i> Open Camera
-      </button>
-      <label class="btn-ghost text-center cursor-pointer">
-        <i class="fas fa-upload mr-1"></i> Upload Photo
-        <input type="file" accept="image/*" style="display:none" onchange="handleFaceUpload(event,'${userId}')">
-      </label>
+    <!-- FaceID Engine mounts here -->
+    <div id="enroll-faceid-mount" class="rounded-xl overflow-hidden bg-black mb-4"></div>
+
+    <div id="enroll-status" class="hidden p-3 rounded-xl text-sm text-center mb-4"></div>
+
+    <div class="flex gap-3">
+      <button onclick="closeModal()" class="btn-ghost flex-1">Cancel</button>
     </div>
-    <button onclick="captureFace('${userId}')" class="btn-primary w-full" id="capture-btn">
-      <i class="fas fa-fingerprint mr-2"></i> Capture & Register
-    </button>
-    <div id="reg-status" class="mt-3"></div>
   </div>`)
+
+  // Wait for modal DOM to render, then mount FaceID engine
+  setTimeout(() => {
+    if (!window.initFaceIDEnrollment) {
+      const mount = document.getElementById('enroll-faceid-mount')
+      if (mount) mount.innerHTML = `
+        <div class="p-6 text-center">
+          <i class="fas fa-exclamation-triangle text-yellow-400 text-2xl mb-2"></i>
+          <p class="text-yellow-300 text-sm">FaceID Engine not available</p>
+          <p class="text-gray-500 text-xs mt-1">Reload the page</p>
+        </div>`
+      return
+    }
+
+    _enrollFaceSession = window.initFaceIDEnrollment('enroll-faceid-mount', {
+      onComplete: async function(result) {
+        const statusEl = document.getElementById('enroll-status')
+        if (statusEl) {
+          statusEl.className = 'p-3 rounded-xl text-sm text-center mb-4 bg-indigo-500/10 border border-indigo-500/20 text-indigo-300'
+          statusEl.textContent = 'Saving biometric data…'
+          statusEl.classList.remove('hidden')
+        }
+
+        try {
+          const { data } = await axios.post(`${API}/users/${userId}/face`, {
+            embedding:     result.embedding,
+            image_quality: result.averageQuality / 100,
+            liveness_score: result.livenessScore,
+            anti_spoof_score: result.antiSpoofScore,
+            captured_angles: result.capturedAngles,
+            enrollment_version: '4.0'
+          })
+
+          if (statusEl) {
+            statusEl.className = 'p-3 rounded-xl text-sm text-center mb-4 bg-green-500/10 border border-green-500/20 text-green-400'
+            statusEl.innerHTML = `<i class="fas fa-check-circle mr-1"></i> ${data.message} · Quality: ${Math.round(result.averageQuality)}%`
+          }
+
+          toast(`Face ID registered for ${userName}!`)
+          if (currentPage === 'users') setTimeout(() => { closeModal(); loadUsers() }, 1400)
+          else setTimeout(() => closeModal(), 1400)
+
+        } catch(e) {
+          if (statusEl) {
+            statusEl.className = 'p-3 rounded-xl text-sm text-center mb-4 bg-red-500/10 border border-red-500/20 text-red-400'
+            statusEl.innerHTML = `<i class="fas fa-times-circle mr-1"></i> ${e.response?.data?.error || e.message}`
+            statusEl.classList.remove('hidden')
+          }
+          toast('Registration failed: ' + (e.response?.data?.error || e.message), 'error')
+        }
+      },
+      onSkip: function() {
+        closeModal()
+      }
+    })
+  }, 100)
 }
 
-async function captureFace(userId) {
-  const btn = document.getElementById('capture-btn')
-  btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> Processing...'
-
-  // Simulate quality score
-  const quality = 0.88 + Math.random() * 0.12
-  const qEl = document.getElementById('face-reg-quality')
-  qEl?.classList.remove('hidden')
-  document.getElementById('quality-pct').textContent = Math.round(quality * 100) + '%'
-  document.getElementById('quality-bar').style.width = Math.round(quality * 100) + '%'
-
-  try {
-    // Generate simulated embedding (in production: run FaceNet)
-    const { data } = await axios.post(`${API}/users/${userId}/face`, { image_quality: quality })
-    document.getElementById('reg-status').innerHTML = `
-    <div class="p-3 bg-green-500/10 border border-green-500/20 rounded-lg text-green-400 text-sm">
-      <i class="fas fa-check-circle mr-2"></i> ${data.message}
-      <div class="text-xs mt-1">Quality score: ${Math.round((data.quality||quality) * 100)}% · Encryption: AES-256</div>
-    </div>`
-    toast('Face registered successfully!')
-    if (cameraStream) { cameraStream.getTracks().forEach(t => t.stop()); cameraStream = null }
-    setTimeout(() => { closeModal(); loadUsers() }, 1500)
-  } catch(e) {
-    document.getElementById('reg-status').innerHTML = `<div class="p-3 bg-red-500/10 border border-red-500/20 rounded-lg text-red-400 text-sm">${e.message}</div>`
-    btn.disabled = false; btn.innerHTML = '<i class="fas fa-fingerprint mr-2"></i> Capture & Register'
-  }
-}
 
 async function handleFaceUpload(event, userId) {
   const file = event.target.files[0]

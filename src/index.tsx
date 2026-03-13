@@ -2767,6 +2767,7 @@ select.input option { background: #1a1a2e; }
 </div>
 
 <script src="/static/auth.js"></script>
+<script src="/static/faceid-engine.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>`
