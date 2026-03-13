@@ -3840,11 +3840,1132 @@ app.get('/api/ai/trust/history/:user_id', async (c) => {
   })
 })
 
+// ═══════════════════════════════════════════════════════════════════════════
+// ██████╗ ███████╗██╗   ██╗    ██╗      █████╗ ██████╗
+// ██╔══██╗██╔════╝██║   ██║    ██║     ██╔══██╗██╔══██╗
+// ██║  ██║█████╗  ██║   ██║    ██║     ███████║██████╔╝
+// ██║  ██║██╔══╝  ╚██╗ ██╔╝    ██║     ██╔══██║██╔══██╗
+// ██████╔╝███████╗ ╚████╔╝     ███████╗██║  ██║██████╔╝
+// ╚═════╝ ╚══════╝  ╚═══╝      ╚══════╝╚═╝  ╚═╝╚═════╝
+// Developer Testing Lab — Internal Sandbox (v1.0)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── GET /api/devlab/profiles — list all test profiles ──────────────────────
+app.get('/api/devlab/profiles', async (c) => {
+  const { DB } = c.env as Bindings
+  try {
+    const { results } = await DB.prepare(`
+      SELECT p.*,
+             COUNT(e.id) AS stored_embeddings
+      FROM   devlab_profiles p
+      LEFT JOIN devlab_embeddings e ON e.profile_id = p.id
+      GROUP BY p.id
+      ORDER BY p.created_at DESC
+    `).all()
+    return c.json({ profiles: results, count: results.length })
+  } catch (err: any) {
+    return bad(c, 'Failed to list dev-lab profiles: ' + err.message)
+  }
+})
+
+// ── POST /api/devlab/profiles — create test profile ────────────────────────
+app.post('/api/devlab/profiles', async (c) => {
+  const { DB } = c.env as Bindings
+  try {
+    const body = await c.req.json()
+    const full_name       = sanitize(body.full_name || '')
+    const email           = sanitize(body.email || '')
+    const role            = sanitize(body.role || 'employee')
+    const phone_device_id = sanitize(body.phone_device_id || '')
+    const notes           = sanitize(body.notes || '')
+
+    if (!full_name) return bad(c, 'full_name is required')
+    if (!email || !isEmail(email)) return bad(c, 'valid email is required')
+    const VALID_ROLES = ['employee', 'admin', 'visitor']
+    if (!VALID_ROLES.includes(role)) return bad(c, 'role must be employee|admin|visitor')
+
+    const existing = await DB.prepare('SELECT id FROM devlab_profiles WHERE email=?').bind(email).first()
+    if (existing) return bad(c, 'A test profile with that email already exists')
+
+    const id = 'dlp-' + nanoid(10)
+    const ts = now()
+    await DB.prepare(`
+      INSERT INTO devlab_profiles(id,full_name,email,role,phone_device_id,notes,face_registered,embedding_count,created_at,updated_at)
+      VALUES(?,?,?,?,?,?,0,0,?,?)
+    `).bind(id, full_name, email, role, phone_device_id || null, notes || null, ts, ts).run()
+
+    return c.json({ success: true, profile: { id, full_name, email, role, phone_device_id, notes, face_registered: 0, embedding_count: 0, created_at: ts } }, 201)
+  } catch (err: any) {
+    return bad(c, 'Failed to create dev-lab profile: ' + err.message)
+  }
+})
+
+// ── GET /api/devlab/profiles/:id — get single test profile ─────────────────
+app.get('/api/devlab/profiles/:id', async (c) => {
+  const { DB } = c.env as Bindings
+  const id = c.req.param('id')
+  try {
+    const profile = await DB.prepare(`
+      SELECT p.*, COUNT(e.id) AS stored_embeddings
+      FROM devlab_profiles p
+      LEFT JOIN devlab_embeddings e ON e.profile_id=p.id
+      WHERE p.id=? GROUP BY p.id
+    `).bind(id).first()
+    if (!profile) return c.json({ error: 'Profile not found' }, 404)
+    return c.json(profile)
+  } catch (err: any) {
+    return bad(c, err.message)
+  }
+})
+
+// ── DELETE /api/devlab/profiles/:id — delete test profile ──────────────────
+app.delete('/api/devlab/profiles/:id', async (c) => {
+  const { DB } = c.env as Bindings
+  const id = c.req.param('id')
+  try {
+    await DB.prepare('DELETE FROM devlab_embeddings WHERE profile_id=?').bind(id).run()
+    await DB.prepare('DELETE FROM devlab_profiles WHERE id=?').bind(id).run()
+    return c.json({ success: true })
+  } catch (err: any) {
+    return bad(c, err.message)
+  }
+})
+
+// ── POST /api/devlab/enroll/:profile_id — store face embedding ─────────────
+app.post('/api/devlab/enroll/:profile_id', async (c) => {
+  const { DB } = c.env as Bindings
+  const profile_id = c.req.param('profile_id')
+  try {
+    const body = await c.req.json()
+    const embedding    = body.embedding    // float[]
+    const angle_label  = sanitize(body.angle_label  || 'center')
+    const quality_score = Math.min(1, Math.max(0, Number(body.quality_score) || 0))
+    const frame_index  = parseInt(body.frame_index) || 0
+
+    if (!embedding || !Array.isArray(embedding) || embedding.length < 64 || embedding.length > 512)
+      return bad(c, 'embedding must be a numeric array of 64-512 values')
+
+    const profile = await DB.prepare('SELECT id FROM devlab_profiles WHERE id=?').bind(profile_id).first()
+    if (!profile) return c.json({ error: 'Profile not found' }, 404)
+
+    const id = 'dle-' + nanoid(10)
+    const ts = now()
+    await DB.prepare(`
+      INSERT INTO devlab_embeddings(id,profile_id,embedding,angle_label,quality_score,frame_index,model_version,captured_at)
+      VALUES(?,?,?,?,?,?,?,?)
+    `).bind(id, profile_id, JSON.stringify(embedding), angle_label, quality_score, frame_index, '4.0', ts).run()
+
+    // Update profile counts
+    const cnt = await DB.prepare('SELECT COUNT(*) as c FROM devlab_embeddings WHERE profile_id=?').bind(profile_id).first() as any
+    await DB.prepare(`UPDATE devlab_profiles SET face_registered=1, embedding_count=?, updated_at=? WHERE id=?`)
+      .bind(cnt?.c || 1, ts, profile_id).run()
+
+    return c.json({ success: true, embedding_id: id, angle_label, quality_score, embedding_count: cnt?.c || 1 })
+  } catch (err: any) {
+    return bad(c, 'Failed to store embedding: ' + err.message)
+  }
+})
+
+// ── DELETE /api/devlab/enroll/:profile_id — clear all embeddings ───────────
+app.delete('/api/devlab/enroll/:profile_id', async (c) => {
+  const { DB } = c.env as Bindings
+  const profile_id = c.req.param('profile_id')
+  try {
+    await DB.prepare('DELETE FROM devlab_embeddings WHERE profile_id=?').bind(profile_id).run()
+    await DB.prepare(`UPDATE devlab_profiles SET face_registered=0, embedding_count=0, updated_at=? WHERE id=?`)
+      .bind(now(), profile_id).run()
+    return c.json({ success: true })
+  } catch (err: any) {
+    return bad(c, err.message)
+  }
+})
+
+// ── GET /api/devlab/enroll/:profile_id — list embeddings for profile ────────
+app.get('/api/devlab/enroll/:profile_id', async (c) => {
+  const { DB } = c.env as Bindings
+  const profile_id = c.req.param('profile_id')
+  try {
+    const { results } = await DB.prepare(`
+      SELECT id, angle_label, quality_score, frame_index, model_version, captured_at
+      FROM devlab_embeddings WHERE profile_id=? ORDER BY captured_at ASC
+    `).bind(profile_id).all()
+    return c.json({ embeddings: results, count: results.length })
+  } catch (err: any) {
+    return bad(c, err.message)
+  }
+})
+
+// ── POST /api/devlab/authenticate — run full auth pipeline in lab ───────────
+app.post('/api/devlab/authenticate', async (c) => {
+  const { DB } = c.env as Bindings
+  try {
+    const body = await c.req.json()
+    // Probe embedding (required or fallback to random for demo)
+    const probe_embedding: number[] | null = Array.isArray(body.embedding) && body.embedding.length >= 64 ? body.embedding : null
+    const liveness_score   = Math.min(1, Math.max(0, Number(body.liveness_score)   || 0.92))
+    const anti_spoof_score = Math.min(1, Math.max(0, Number(body.anti_spoof_score) || 0.88))
+    const ble_detected     = !!body.ble_detected
+    const wifi_matched     = !!body.wifi_matched
+    const test_mode        = sanitize(body.test_mode || 'camera')
+    const lock_simulated   = sanitize(body.lock_simulated || 'Lab-Door-01').slice(0, 60)
+    const debug_mode       = !!body.debug_mode
+
+    const t0 = Date.now()
+
+    // Reject on spoof
+    if (anti_spoof_score < 0.35) {
+      const id = 'dtl-' + nanoid(10)
+      const ts = now()
+      await DB.prepare(`INSERT INTO devlab_test_log(id,decision,denial_reason,anti_spoof_score,liveness_score,test_mode,lock_simulated,created_at)
+        VALUES(?,?,?,?,?,?,?,?)`).bind(id,'denied','spoof_detected',anti_spoof_score,liveness_score,test_mode,lock_simulated,ts).run()
+      return c.json({ id, result:'denied', reason:'spoof_detected', anti_spoof_score, liveness_score, pipeline_latency_ms: Date.now()-t0 })
+    }
+    if (liveness_score < 0.50) {
+      const id = 'dtl-' + nanoid(10)
+      const ts = now()
+      await DB.prepare(`INSERT INTO devlab_test_log(id,decision,denial_reason,anti_spoof_score,liveness_score,test_mode,lock_simulated,created_at)
+        VALUES(?,?,?,?,?,?,?,?)`).bind(id,'denied','liveness_failed',anti_spoof_score,liveness_score,test_mode,lock_simulated,ts).run()
+      return c.json({ id, result:'denied', reason:'liveness_failed', anti_spoof_score, liveness_score, pipeline_latency_ms: Date.now()-t0 })
+    }
+
+    // Load all devlab embeddings
+    const { results: allEmb } = await DB.prepare(`
+      SELECT e.id, e.profile_id, e.embedding, e.angle_label, e.quality_score,
+             p.full_name, p.role, p.email
+      FROM devlab_embeddings e
+      JOIN devlab_profiles p ON p.id = e.profile_id
+    `).all() as { results: any[] }
+
+    let bestConfidence = 0
+    let bestProfile: any = null
+    let stageReached = 'edge'
+    let isBorderline = false
+
+    const HIGH = 0.85
+    const MED  = 0.65
+    const BORDERLINE_LO = 0.60
+    const BORDERLINE_HI = 0.90
+
+    if (probe_embedding && allEmb.length > 0) {
+      // Real cosine similarity against stored embeddings
+      for (const row of allEmb) {
+        let stored: number[]
+        try { stored = JSON.parse(row.embedding as string) } catch { continue }
+        const sim = cosineSimilarity(probe_embedding, stored)
+        if (sim > bestConfidence) {
+          bestConfidence = sim
+          bestProfile = row
+        }
+      }
+      stageReached = bestConfidence > BORDERLINE_LO ? 'arcface' : 'edge'
+      isBorderline = bestConfidence >= BORDERLINE_LO && bestConfidence < BORDERLINE_HI
+      if (isBorderline) stageReached = 'fusion'
+    } else if (!probe_embedding && allEmb.length > 0) {
+      // Demo mode: pick random profile with simulated confidence
+      const roll = Math.random()
+      const randomProfile = allEmb[Math.floor(Math.random() * allEmb.length)]
+      if (roll < 0.65) {
+        bestConfidence = 0.88 + Math.random() * 0.10
+        bestProfile = randomProfile
+        stageReached = 'arcface'
+      } else if (roll < 0.80) {
+        bestConfidence = 0.70 + Math.random() * 0.12
+        bestProfile = randomProfile
+        stageReached = 'arcface'
+        isBorderline = true
+      } else {
+        bestConfidence = 0.15 + Math.random() * 0.35
+      }
+    } else {
+      bestConfidence = 0.10
+    }
+
+    // Simulate individual model scores around combined
+    const variance = () => (Math.random() - 0.5) * 0.06
+    const arcface_score     = Math.min(1, Math.max(0, bestConfidence + variance()))
+    const insightface_score = Math.min(1, Math.max(0, bestConfidence + variance()))
+    const facenet_score     = Math.min(1, Math.max(0, bestConfidence + variance()))
+    // Weighted fusion: ArcFace 50%, InsightFace 30%, FaceNet 20%
+    const combined_confidence = arcface_score*0.50 + insightface_score*0.30 + facenet_score*0.20
+
+    // Liveness adjustment
+    const finalConf = combined_confidence * (0.70 + liveness_score * 0.30)
+
+    // Proximity
+    const proximityScore = ble_detected ? 0.95 : wifi_matched ? 0.78 : 0.0
+
+    // Trust score calculation (simplified lab version)
+    const behavioralScore = 0.70
+    const anomalyPenalty  = anti_spoof_score < 0.60 ? 0.10 : 0.0
+    const trustScore = Math.min(1, Math.max(0,
+      finalConf * 0.35 + behavioralScore * 0.35 + 0.70 * 0.20 - anomalyPenalty
+    ))
+    const trust_tier = trustScore >= 0.85 ? 'trusted' : trustScore >= 0.60 ? 'standard' : trustScore >= 0.40 ? 'watchlist' : 'blocked'
+
+    const pipeline_latency_ms = Date.now() - t0
+    const ts = now()
+    const logId = 'dtl-' + nanoid(10)
+
+    let decision: string
+    let denial_reason: string | null = null
+
+    if (finalConf < MED || !bestProfile) {
+      decision = 'denied'
+      denial_reason = 'no_match'
+    } else if (finalConf >= HIGH && (proximityScore > 0 || true)) {
+      decision = 'granted'
+    } else {
+      decision = 'pending'
+    }
+
+    const debugData = debug_mode ? JSON.stringify({
+      raw_cosine: bestConfidence,
+      arcface_score, insightface_score, facenet_score,
+      combined_confidence, final_conf: finalConf,
+      liveness_score, anti_spoof_score, proximityScore,
+      trustScore, behavioralScore, anomalyPenalty,
+    }) : null
+
+    await DB.prepare(`
+      INSERT INTO devlab_test_log(
+        id, profile_id, matched_name, similarity_score, combined_confidence,
+        arcface_score, insightface_score, facenet_score,
+        liveness_score, anti_spoof_score,
+        trust_score, trust_tier, behavioral_score, proximity_score,
+        decision, denial_reason, pipeline_latency_ms, stage_reached,
+        is_borderline, debug_data, test_mode, lock_simulated, created_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    `).bind(
+      logId,
+      bestProfile?.profile_id || null,
+      bestProfile?.full_name || null,
+      bestConfidence,
+      combined_confidence,
+      arcface_score, insightface_score, facenet_score,
+      liveness_score, anti_spoof_score,
+      trustScore, trust_tier, behavioralScore, proximityScore,
+      decision, denial_reason, pipeline_latency_ms, stageReached,
+      isBorderline ? 1 : 0, debugData,
+      test_mode, lock_simulated, ts
+    ).run()
+
+    return c.json({
+      id: logId,
+      result: decision,
+      reason: denial_reason,
+      matched_profile: bestProfile ? {
+        id:        bestProfile.profile_id,
+        full_name: bestProfile.full_name,
+        role:      bestProfile.role,
+        email:     bestProfile.email,
+      } : null,
+      scores: {
+        similarity:   Math.round(bestConfidence * 1000) / 1000,
+        arcface:      Math.round(arcface_score     * 1000) / 1000,
+        insightface:  Math.round(insightface_score * 1000) / 1000,
+        facenet:      Math.round(facenet_score     * 1000) / 1000,
+        combined:     Math.round(combined_confidence * 1000) / 1000,
+        final:        Math.round(finalConf * 1000) / 1000,
+        liveness:     Math.round(liveness_score    * 1000) / 1000,
+        anti_spoof:   Math.round(anti_spoof_score  * 1000) / 1000,
+        proximity:    Math.round(proximityScore     * 1000) / 1000,
+      },
+      trust: { score: Math.round(trustScore * 1000) / 1000, tier: trust_tier, behavioral: behavioralScore },
+      pipeline: { latency_ms: pipeline_latency_ms, stage_reached: stageReached, is_borderline: isBorderline, engine_version: '4.0' },
+      debug: debug_mode ? JSON.parse(debugData!) : undefined,
+    })
+  } catch (err: any) {
+    return bad(c, 'Authentication test failed: ' + err.message)
+  }
+})
+
+// ── GET /api/devlab/logs — list test log entries ───────────────────────────
+app.get('/api/devlab/logs', async (c) => {
+  const { DB } = c.env as Bindings
+  try {
+    const limit  = parseIntParam(c.req.query('limit')  || '50', 50, 200)
+    const offset = parseIntParam(c.req.query('offset') || '0',   0, 10000)
+    const decision_filter = c.req.query('decision')
+    const profile_filter  = c.req.query('profile_id')
+
+    let sql = `SELECT * FROM devlab_test_log WHERE 1=1`
+    const params: any[] = []
+    if (decision_filter) { sql += ` AND decision=?`; params.push(decision_filter) }
+    if (profile_filter)  { sql += ` AND profile_id=?`; params.push(profile_filter) }
+    sql += ` ORDER BY created_at DESC LIMIT ? OFFSET ?`
+    params.push(limit, offset)
+
+    const { results } = await DB.prepare(sql).bind(...params).all()
+    const total = await DB.prepare(`SELECT COUNT(*) as c FROM devlab_test_log`).first() as any
+    return c.json({ logs: results, total: total?.c || 0, limit, offset })
+  } catch (err: any) {
+    return bad(c, err.message)
+  }
+})
+
+// ── DELETE /api/devlab/logs — clear all test logs ─────────────────────────
+app.delete('/api/devlab/logs', async (c) => {
+  const { DB } = c.env as Bindings
+  try {
+    await DB.prepare('DELETE FROM devlab_test_log').run()
+    return c.json({ success: true, message: 'All test logs cleared' })
+  } catch (err: any) {
+    return bad(c, err.message)
+  }
+})
+
+// ── GET /api/devlab/stats — aggregate lab stats ───────────────────────────
+app.get('/api/devlab/stats', async (c) => {
+  const { DB } = c.env as Bindings
+  try {
+    const totals = await DB.prepare(`
+      SELECT
+        COUNT(*) as total_attempts,
+        SUM(CASE WHEN decision='granted' THEN 1 ELSE 0 END)  as granted,
+        SUM(CASE WHEN decision='denied'  THEN 1 ELSE 0 END)  as denied,
+        SUM(CASE WHEN decision='pending' THEN 1 ELSE 0 END)  as pending,
+        AVG(combined_confidence)   as avg_confidence,
+        AVG(pipeline_latency_ms)   as avg_latency_ms,
+        AVG(anti_spoof_score)      as avg_anti_spoof,
+        AVG(liveness_score)        as avg_liveness,
+        AVG(trust_score)           as avg_trust_score,
+        SUM(CASE WHEN is_borderline=1 THEN 1 ELSE 0 END) as borderline_count
+      FROM devlab_test_log
+    `).first() as any
+
+    const profiles = await DB.prepare(`SELECT COUNT(*) as c FROM devlab_profiles`).first() as any
+    const enrolled  = await DB.prepare(`SELECT COUNT(*) as c FROM devlab_profiles WHERE face_registered=1`).first() as any
+    const recent = await DB.prepare(`SELECT * FROM devlab_test_log ORDER BY created_at DESC LIMIT 10`).all()
+
+    return c.json({
+      profiles:  { total: profiles?.c || 0, enrolled: enrolled?.c || 0 },
+      attempts:  totals,
+      recent_log: recent.results,
+    })
+  } catch (err: any) {
+    return bad(c, err.message)
+  }
+})
+
+// ── DELETE /api/devlab/reset — full lab reset ─────────────────────────────
+app.delete('/api/devlab/reset', async (c) => {
+  const { DB } = c.env as Bindings
+  try {
+    await DB.prepare('DELETE FROM devlab_test_log').run()
+    await DB.prepare('DELETE FROM devlab_embeddings').run()
+    await DB.prepare('UPDATE devlab_profiles SET face_registered=0, embedding_count=0, updated_at=?').bind(now()).run()
+    return c.json({ success: true, message: 'Dev lab fully reset — embeddings and logs cleared, profiles retained' })
+  } catch (err: any) {
+    return bad(c, err.message)
+  }
+})
+
+// ── Dev Lab page route ─────────────────────────────────────────────────────
+app.get('/dev-lab', (c) => c.html(getDevLabHTML()))
+app.get('/dev-lab/*', (c) => c.html(getDevLabHTML()))
+
 // ═══════════════════════════════════════════════════════════
 // Catch-all SPA route (MUST be last — after all API routes)
 // ═══════════════════════════════════════════════════════════
 app.get('*', (c) => {
   return c.html(getMainHTML())
 })
+
+// ═══════════════════════════════════════════════════════════════════════
+// Dev Lab HTML — Biometric Testing Sandbox
+// ═══════════════════════════════════════════════════════════════════════
+function getDevLabHTML(): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FaceAccess Dev Lab — Biometric Testing Sandbox</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/axios@1.6.0/dist/axios.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Inter',system-ui,sans-serif;background:#060612;color:#e2e8f0;min-height:100vh}
+:root{--accent:#6366f1;--green:#10b981;--red:#ef4444;--yellow:#f59e0b;--blue:#3b82f6;--purple:#8b5cf6}
+.card{background:#0e0e1f;border:1px solid #1e1e3a;border-radius:14px;padding:20px}
+.card-sm{background:#0e0e1f;border:1px solid #1e1e3a;border-radius:10px;padding:14px}
+.badge{display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.5px}
+.badge-green{background:#10b98120;color:#10b981;border:1px solid #10b98130}
+.badge-red{background:#ef444420;color:#ef4444;border:1px solid #ef444430}
+.badge-yellow{background:#f59e0b20;color:#f59e0b;border:1px solid #f59e0b30}
+.badge-blue{background:#3b82f620;color:#3b82f6;border:1px solid #3b82f630}
+.badge-purple{background:#8b5cf620;color:#8b5cf6;border:1px solid #8b5cf630}
+.badge-gray{background:#ffffff10;color:#94a3b8;border:1px solid #ffffff15}
+.btn{display:inline-flex;align-items:center;gap:6px;padding:9px 18px;border-radius:9px;font-size:13px;font-weight:600;cursor:pointer;border:none;transition:all .18s}
+.btn-primary{background:var(--accent);color:#fff}.btn-primary:hover{background:#4f46e5}
+.btn-success{background:var(--green);color:#fff}.btn-success:hover{background:#059669}
+.btn-danger{background:var(--red);color:#fff}.btn-danger:hover{background:#dc2626}
+.btn-ghost{background:#ffffff10;color:#cbd5e1;border:1px solid #ffffff15}.btn-ghost:hover{background:#ffffff18}
+.btn-sm{padding:6px 12px;font-size:12px;border-radius:7px}
+.input{background:#090916;border:1px solid #2d2d50;color:#e2e8f0;border-radius:8px;padding:9px 13px;font-size:13px;width:100%;outline:none;transition:border .18s}
+.input:focus{border-color:var(--accent)}
+.select{background:#090916;border:1px solid #2d2d50;color:#e2e8f0;border-radius:8px;padding:9px 13px;font-size:13px;width:100%;outline:none;cursor:pointer}
+.select:focus{border-color:var(--accent)}
+.label{font-size:11px;font-weight:600;color:#94a3b8;text-transform:uppercase;letter-spacing:.5px;margin-bottom:5px;display:block}
+/* sidebar */
+.sidebar{background:#09091a;border-right:1px solid #1e1e3a;width:240px;flex-shrink:0;height:100vh;position:sticky;top:0;display:flex;flex-direction:column}
+.nav-item{display:flex;align-items:center;gap:10px;padding:10px 18px;border-radius:9px;cursor:pointer;font-size:13px;font-weight:500;color:#94a3b8;transition:all .18s;margin:2px 8px}
+.nav-item:hover{background:#ffffff0d;color:#e2e8f0}
+.nav-item.active{background:var(--accent)22;color:var(--accent);border-left:3px solid var(--accent);padding-left:15px}
+.nav-section{font-size:10px;font-weight:700;color:#4a5568;text-transform:uppercase;letter-spacing:.8px;padding:14px 18px 4px}
+/* camera panel */
+#cam-video{width:100%;border-radius:12px;background:#000;display:block;max-height:300px;object-fit:cover}
+#cam-canvas{position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;border-radius:12px}
+.cam-wrapper{position:relative;background:#000;border-radius:12px;overflow:hidden;border:2px solid #1e1e3a}
+.cam-wrapper.scanning{border-color:var(--accent);box-shadow:0 0 20px #6366f140}
+.cam-wrapper.enrolled{border-color:var(--green);box-shadow:0 0 20px #10b98130}
+.cam-wrapper.error{border-color:var(--red)}
+/* score bars */
+.score-bar-wrap{height:8px;background:#ffffff12;border-radius:4px;overflow:hidden}
+.score-bar-fill{height:100%;border-radius:4px;transition:width .5s ease}
+/* lock animation */
+@keyframes unlock{0%{transform:scale(1)}50%{transform:scale(1.3) rotate(-15deg)}100%{transform:scale(1) rotate(0deg)}}
+@keyframes lockshake{0%,100%{transform:rotate(0)}25%{transform:rotate(-8deg)}75%{transform:rotate(8deg)}}
+@keyframes pulseGreen{0%,100%{box-shadow:0 0 0 0 #10b98140}50%{box-shadow:0 0 0 12px #10b98100}}
+@keyframes pulseRed{0%,100%{box-shadow:0 0 0 0 #ef444440}50%{box-shadow:0 0 0 12px #ef444400}}
+.lock-granted{animation:unlock .6s ease, pulseGreen 1.5s 2}
+.lock-denied{animation:lockshake .4s ease, pulseRed 1.5s 2}
+/* log table */
+.log-row{border-bottom:1px solid #1e1e3a;transition:background .15s}
+.log-row:hover{background:#ffffff06}
+/* confidence viz */
+.conf-ring{width:120px;height:120px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:26px;font-weight:700;transition:all .5s}
+/* toast */
+.toast{position:fixed;bottom:24px;right:24px;z-index:1000;display:flex;align-items:center;gap:10px;background:#1a1a30;border:1px solid #2d2d50;border-radius:12px;padding:12px 18px;font-size:13px;max-width:360px;box-shadow:0 8px 30px #0008;transform:translateY(80px);opacity:0;transition:all .3s}
+.toast.show{transform:translateY(0);opacity:1}
+/* debug panel */
+.debug-line{font-family:monospace;font-size:11px;color:#94a3b8;padding:3px 0;border-bottom:1px solid #1e1e3a10}
+.debug-line span{color:#6366f1}
+/* tabs */
+.tab-btn{padding:8px 16px;font-size:12px;font-weight:600;border-radius:8px;cursor:pointer;transition:all .18s;color:#64748b;border:none;background:transparent}
+.tab-btn.active{background:var(--accent);color:#fff}
+/* enrollment dots */
+.angle-dot{width:36px;height:36px;border-radius:50%;border:2px solid #2d2d50;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:600;cursor:pointer;transition:all .18s;color:#475569}
+.angle-dot.captured{border-color:var(--green);background:#10b98120;color:var(--green)}
+.angle-dot.active{border-color:var(--accent);background:var(--accent)20;color:var(--accent);animation:pulse .8s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.6}}
+.scan-line{position:absolute;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,var(--accent),transparent);animation:scanMove 2s linear infinite;opacity:.7}
+@keyframes scanMove{0%{top:0}100%{top:100%}}
+/* scrollbar */
+::-webkit-scrollbar{width:4px}::-webkit-scrollbar-track{background:#060612}::-webkit-scrollbar-thumb{background:#2d2d50;border-radius:2px}
+</style>
+</head>
+<body class="flex">
+
+<!-- ══ SIDEBAR ══════════════════════════════════════════ -->
+<div class="sidebar">
+  <div style="padding:20px 18px;border-bottom:1px solid #1e1e3a">
+    <div class="flex items-center gap-3 mb-1">
+      <div style="width:36px;height:36px;background:linear-gradient(135deg,#6366f1,#8b5cf6);border-radius:10px;display:flex;align-items:center;justify-content:center">
+        <i class="fas fa-flask text-white text-sm"></i>
+      </div>
+      <div>
+        <div style="font-size:14px;font-weight:700;color:#e2e8f0">Dev Lab</div>
+        <div style="font-size:10px;color:#6366f1">FaceAccess v4.0</div>
+      </div>
+    </div>
+    <div class="badge badge-yellow mt-2"><i class="fas fa-lock-open"></i> Internal Sandbox</div>
+  </div>
+
+  <nav style="flex:1;overflow-y:auto;padding:10px 0">
+    <div class="nav-section">Pipeline</div>
+    <div class="nav-item active" onclick="showSection('enroll')" id="nav-enroll">
+      <i class="fas fa-user-plus" style="width:18px"></i> Face Enrollment
+    </div>
+    <div class="nav-item" onclick="showSection('auth')" id="nav-auth">
+      <i class="fas fa-fingerprint" style="width:18px"></i> Auth Test
+    </div>
+    <div class="nav-item" onclick="showSection('confidence')" id="nav-confidence">
+      <i class="fas fa-chart-pie" style="width:18px"></i> Confidence Viz
+    </div>
+
+    <div class="nav-section">Management</div>
+    <div class="nav-item" onclick="showSection('profiles')" id="nav-profiles">
+      <i class="fas fa-users" style="width:18px"></i> Test Profiles
+    </div>
+    <div class="nav-item" onclick="showSection('logs')" id="nav-logs">
+      <i class="fas fa-list-ul" style="width:18px"></i> Security Log
+    </div>
+    <div class="nav-item" onclick="showSection('controls')" id="nav-controls">
+      <i class="fas fa-sliders-h" style="width:18px"></i> Dev Controls
+    </div>
+
+    <div class="nav-section">Links</div>
+    <div class="nav-item" onclick="window.location='/home/dashboard'">
+      <i class="fas fa-external-link-alt" style="width:18px"></i> Production Dashboard
+    </div>
+  </nav>
+
+  <!-- Stats footer -->
+  <div style="padding:14px;border-top:1px solid #1e1e3a">
+    <div id="sidebar-stats" style="font-size:11px;color:#475569">Loading…</div>
+  </div>
+</div>
+
+<!-- ══ MAIN CONTENT ════════════════════════════════════ -->
+<div style="flex:1;overflow-y:auto;min-height:100vh">
+
+  <!-- Top Bar -->
+  <div style="background:#09091a;border-bottom:1px solid #1e1e3a;padding:14px 28px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:50">
+    <div>
+      <h1 id="page-title" style="font-size:18px;font-weight:700;color:#e2e8f0">Face Enrollment</h1>
+      <p id="page-sub" style="font-size:12px;color:#64748b">Capture facial embeddings for test profiles</p>
+    </div>
+    <div class="flex items-center gap-3">
+      <div class="badge badge-purple"><i class="fas fa-microchip"></i> Engine v4.0</div>
+      <div id="debug-badge" class="badge badge-gray" style="display:none"><i class="fas fa-bug"></i> Debug ON</div>
+      <button class="btn btn-ghost btn-sm" onclick="refreshStats()"><i class="fas fa-sync-alt"></i> Refresh</button>
+    </div>
+  </div>
+
+  <div style="padding:24px 28px">
+
+    <!-- ══ SECTION: Face Enrollment ════════════════════════ -->
+    <div id="section-enroll" class="section-page">
+      <div class="grid" style="grid-template-columns:1fr 1fr;gap:20px">
+
+        <!-- Camera Panel -->
+        <div>
+          <div class="card">
+            <div class="flex items-center justify-between mb-4">
+              <h3 style="font-size:14px;font-weight:700"><i class="fas fa-camera mr-2" style="color:var(--accent)"></i>Camera Feed</h3>
+              <div id="enroll-cam-status" class="badge badge-gray"><i class="fas fa-circle"></i> Offline</div>
+            </div>
+
+            <!-- Camera source -->
+            <div class="flex gap-2 mb-3">
+              <button class="btn btn-ghost btn-sm active" id="src-webcam" onclick="setCamSrc('webcam')">
+                <i class="fas fa-webcam"></i> Webcam
+              </button>
+              <button class="btn btn-ghost btn-sm" id="src-laptop" onclick="setCamSrc('laptop')">
+                <i class="fas fa-laptop"></i> Laptop Cam
+              </button>
+              <button class="btn btn-ghost btn-sm" id="src-rtsp" onclick="setCamSrc('rtsp')">
+                <i class="fas fa-video"></i> RTSP
+              </button>
+            </div>
+
+            <!-- RTSP input (hidden by default) -->
+            <div id="rtsp-row" style="display:none;margin-bottom:10px">
+              <input class="input" id="rtsp-url" placeholder="rtsp://192.168.1.100:554/stream" style="font-size:12px">
+            </div>
+
+            <div class="cam-wrapper" id="enroll-cam-wrapper">
+              <video id="cam-video" autoplay muted playsinline></video>
+              <canvas id="cam-canvas"></canvas>
+              <div class="scan-line" id="scan-line" style="display:none"></div>
+              <div id="cam-placeholder" style="width:100%;height:240px;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:10px;color:#475569">
+                <i class="fas fa-camera" style="font-size:36px;opacity:.3"></i>
+                <span style="font-size:13px">Camera not started</span>
+              </div>
+            </div>
+
+            <div class="flex gap-2 mt-3">
+              <button class="btn btn-primary flex-1" id="cam-start-btn" onclick="startCamera('enroll')">
+                <i class="fas fa-play"></i> Start Camera
+              </button>
+              <button class="btn btn-ghost" id="cam-stop-btn" onclick="stopCamera()" style="display:none">
+                <i class="fas fa-stop"></i>
+              </button>
+              <button class="btn btn-ghost" onclick="switchCamera()">
+                <i class="fas fa-sync"></i>
+              </button>
+            </div>
+
+            <!-- Real-time metrics -->
+            <div class="grid mt-3" style="grid-template-columns:repeat(4,1fr);gap:8px" id="live-metrics">
+              <div class="card-sm text-center">
+                <div style="font-size:10px;color:#64748b">Brightness</div>
+                <div id="met-bright" style="font-size:14px;font-weight:700;color:#f59e0b">—</div>
+              </div>
+              <div class="card-sm text-center">
+                <div style="font-size:10px;color:#64748b">Sharpness</div>
+                <div id="met-sharp" style="font-size:14px;font-weight:700;color:#3b82f6">—</div>
+              </div>
+              <div class="card-sm text-center">
+                <div style="font-size:10px;color:#64748b">Anti-Spoof</div>
+                <div id="met-spoof" style="font-size:14px;font-weight:700;color:#10b981">—</div>
+              </div>
+              <div class="card-sm text-center">
+                <div style="font-size:10px;color:#64748b">Quality</div>
+                <div id="met-quality" style="font-size:14px;font-weight:700;color:#6366f1">—</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Enrollment Controls -->
+        <div class="flex flex-col gap-4">
+          <!-- Profile selector -->
+          <div class="card">
+            <h3 style="font-size:13px;font-weight:700;margin-bottom:12px"><i class="fas fa-user-circle mr-2" style="color:#8b5cf6"></i>Enroll Profile</h3>
+            <label class="label">Select Profile</label>
+            <div class="flex gap-2">
+              <select class="select flex-1" id="enroll-profile-select">
+                <option value="">— Pick a profile —</option>
+              </select>
+              <button class="btn btn-ghost btn-sm" onclick="showSection('profiles')">
+                <i class="fas fa-plus"></i>
+              </button>
+            </div>
+            <div id="enroll-profile-info" style="display:none;margin-top:12px;padding:10px;background:#060612;border-radius:8px;font-size:12px;color:#94a3b8"></div>
+          </div>
+
+          <!-- Angle progress -->
+          <div class="card">
+            <div class="flex items-center justify-between mb-3">
+              <h3 style="font-size:13px;font-weight:700"><i class="fas fa-cube mr-2" style="color:#3b82f6"></i>Capture Angles</h3>
+              <span id="angle-count" class="badge badge-gray">0 / 7</span>
+            </div>
+            <div class="flex flex-wrap gap-2 mb-3" id="angle-dots">
+              <!-- Rendered by JS -->
+            </div>
+            <div id="current-angle-hint" style="font-size:12px;color:#6366f1;text-align:center;padding:8px;background:#6366f110;border-radius:8px;display:none"></div>
+          </div>
+
+          <!-- Capture controls -->
+          <div class="card">
+            <h3 style="font-size:13px;font-weight:700;margin-bottom:12px"><i class="fas fa-crosshairs mr-2" style="color:#10b981"></i>Capture Controls</h3>
+            <div class="flex flex-col gap-2">
+              <button class="btn btn-success" id="capture-frame-btn" onclick="captureEnrollFrame()" disabled>
+                <i class="fas fa-camera"></i> Capture Frame
+              </button>
+              <button class="btn btn-primary" id="auto-enroll-btn" onclick="autoEnroll()" disabled>
+                <i class="fas fa-magic"></i> Auto-Enroll (7 Angles)
+              </button>
+              <button class="btn btn-ghost btn-sm" id="clear-enroll-btn" onclick="clearEnrollment()" disabled>
+                <i class="fas fa-trash"></i> Clear Embeddings
+              </button>
+            </div>
+            <div id="enroll-progress" style="display:none;margin-top:12px">
+              <div class="flex justify-between mb-1" style="font-size:11px;color:#94a3b8">
+                <span>Enrollment Progress</span><span id="enroll-pct">0%</span>
+              </div>
+              <div class="score-bar-wrap"><div class="score-bar-fill" id="enroll-bar" style="width:0%;background:var(--green)"></div></div>
+            </div>
+            <div id="enroll-status" style="margin-top:10px;font-size:12px;color:#64748b"></div>
+          </div>
+
+          <!-- Enrollment complete -->
+          <div id="enroll-complete" style="display:none" class="card" style="border-color:#10b98140">
+            <div class="flex items-center gap-3 mb-2">
+              <div style="width:40px;height:40px;background:#10b98120;border-radius:50%;display:flex;align-items:center;justify-content:center">
+                <i class="fas fa-check" style="color:#10b981;font-size:18px"></i>
+              </div>
+              <div>
+                <div style="font-size:14px;font-weight:700;color:#10b981">Enrollment Complete</div>
+                <div id="enroll-complete-sub" style="font-size:11px;color:#64748b"></div>
+              </div>
+            </div>
+            <button class="btn btn-primary btn-sm mt-2" onclick="showSection('auth')">
+              <i class="fas fa-arrow-right"></i> Test Authentication
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ══ SECTION: Auth Test ═══════════════════════════════ -->
+    <div id="section-auth" class="section-page" style="display:none">
+      <div class="grid" style="grid-template-columns:1fr 1fr;gap:20px">
+
+        <!-- Auth Camera -->
+        <div class="card">
+          <div class="flex items-center justify-between mb-4">
+            <h3 style="font-size:14px;font-weight:700"><i class="fas fa-fingerprint mr-2" style="color:var(--accent)"></i>Authentication Camera</h3>
+            <div id="auth-cam-status" class="badge badge-gray"><i class="fas fa-circle"></i> Offline</div>
+          </div>
+
+          <div class="cam-wrapper" id="auth-cam-wrapper">
+            <video id="auth-video" autoplay muted playsinline></video>
+            <canvas id="auth-canvas"></canvas>
+            <div class="scan-line" id="auth-scan-line" style="display:none"></div>
+            <div id="auth-placeholder" style="width:100%;height:240px;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:10px;color:#475569">
+              <i class="fas fa-camera" style="font-size:36px;opacity:.3"></i>
+              <span style="font-size:13px">Camera not started</span>
+            </div>
+          </div>
+
+          <div class="flex gap-2 mt-3">
+            <button class="btn btn-primary flex-1" id="auth-cam-start-btn" onclick="startCamera('auth')">
+              <i class="fas fa-play"></i> Start Camera
+            </button>
+            <button class="btn btn-ghost" id="auth-cam-stop-btn" onclick="stopCamera('auth')" style="display:none">
+              <i class="fas fa-stop"></i>
+            </button>
+          </div>
+
+          <!-- Auth controls -->
+          <div style="margin-top:14px;padding-top:14px;border-top:1px solid #1e1e3a">
+            <div class="grid mb-3" style="grid-template-columns:1fr 1fr;gap:10px">
+              <div>
+                <label class="label">Simulated Lock</label>
+                <select class="select" id="auth-lock-select">
+                  <option value="Lab-Door-01">Lab Door 01</option>
+                  <option value="Lab-Door-02">Lab Door 02</option>
+                  <option value="Lab-Entrance">Lab Entrance</option>
+                  <option value="Server-Room">Server Room</option>
+                </select>
+              </div>
+              <div>
+                <label class="label">Test Mode</label>
+                <select class="select" id="auth-mode-select">
+                  <option value="camera">Live Camera</option>
+                  <option value="manual">Manual Input</option>
+                  <option value="demo">Demo (Simulated)</option>
+                </select>
+              </div>
+            </div>
+            <div class="flex gap-3 mb-3">
+              <label class="flex items-center gap-2 cursor-pointer" style="font-size:12px;color:#94a3b8">
+                <input type="checkbox" id="ble-toggle" style="accent-color:var(--accent)"> BLE Proximity
+              </label>
+              <label class="flex items-center gap-2 cursor-pointer" style="font-size:12px;color:#94a3b8">
+                <input type="checkbox" id="wifi-toggle" style="accent-color:var(--accent)"> Wi-Fi Match
+              </label>
+              <label class="flex items-center gap-2 cursor-pointer" style="font-size:12px;color:#94a3b8">
+                <input type="checkbox" id="debug-toggle" onchange="toggleDebug(this.checked)" style="accent-color:var(--accent)"> Debug
+              </label>
+            </div>
+            <button class="btn btn-success w-full" id="auth-run-btn" onclick="runAuthTest()">
+              <i class="fas fa-bolt"></i> Start Authentication Test
+            </button>
+          </div>
+        </div>
+
+        <!-- Auth Result Panel -->
+        <div class="flex flex-col gap-4">
+
+          <!-- Lock Simulation -->
+          <div class="card text-center" id="lock-panel">
+            <div style="font-size:12px;font-weight:600;color:#64748b;margin-bottom:12px;text-transform:uppercase;letter-spacing:.5px">Simulated Lock</div>
+            <div id="lock-icon" style="font-size:56px;margin-bottom:8px;transition:all .5s">
+              <i class="fas fa-lock" style="color:#475569"></i>
+            </div>
+            <div id="lock-label" style="font-size:16px;font-weight:700;color:#64748b">Awaiting Test</div>
+            <div id="lock-sublabel" style="font-size:12px;color:#475569;margin-top:4px"></div>
+            <div id="lock-name-display" style="font-size:11px;color:#334155;margin-top:8px">—</div>
+          </div>
+
+          <!-- Confidence Score Bars -->
+          <div class="card">
+            <h3 style="font-size:13px;font-weight:700;margin-bottom:12px"><i class="fas fa-chart-bar mr-2" style="color:#6366f1"></i>Model Scores</h3>
+            <div class="flex flex-col gap-3" id="score-bars">
+              <!-- Rendered by JS -->
+              <div style="font-size:12px;color:#475569;text-align:center;padding:20px 0">
+                <i class="fas fa-bolt" style="font-size:24px;opacity:.3;display:block;margin-bottom:8px"></i>
+                Run a test to see scores
+              </div>
+            </div>
+          </div>
+
+          <!-- Trust Decision -->
+          <div class="card" id="trust-decision-card" style="display:none">
+            <div class="flex items-center justify-between mb-3">
+              <h3 style="font-size:13px;font-weight:700"><i class="fas fa-shield-alt mr-2" style="color:#8b5cf6"></i>Trust Engine Decision</h3>
+              <div id="trust-tier-badge" class="badge"></div>
+            </div>
+            <div class="grid" style="grid-template-columns:1fr 1fr 1fr;gap:10px">
+              <div class="card-sm text-center">
+                <div style="font-size:10px;color:#64748b">Trust Score</div>
+                <div id="trust-score-val" style="font-size:20px;font-weight:700;color:#8b5cf6">—</div>
+              </div>
+              <div class="card-sm text-center">
+                <div style="font-size:10px;color:#64748b">Liveness</div>
+                <div id="liveness-val" style="font-size:20px;font-weight:700;color:#3b82f6">—</div>
+              </div>
+              <div class="card-sm text-center">
+                <div style="font-size:10px;color:#64748b">Anti-Spoof</div>
+                <div id="antispoof-val" style="font-size:20px;font-weight:700;color:#10b981">—</div>
+              </div>
+            </div>
+            <div id="matched-user-row" style="display:none;margin-top:10px;padding:8px 12px;background:#10b98110;border-radius:8px;font-size:12px">
+              <i class="fas fa-user-check" style="color:#10b981;margin-right:6px"></i>
+              <span id="matched-user-name"></span>
+              <span id="matched-user-role" class="badge badge-gray" style="margin-left:6px;font-size:10px"></span>
+            </div>
+            <div id="denial-reason-row" style="display:none;margin-top:10px;padding:8px 12px;background:#ef444410;border-radius:8px;font-size:12px;color:#ef4444">
+              <i class="fas fa-exclamation-triangle mr-2"></i>
+              <span id="denial-reason-text"></span>
+            </div>
+          </div>
+
+          <!-- Pipeline Latency -->
+          <div class="card" id="pipeline-card" style="display:none">
+            <div class="flex items-center justify-between mb-2">
+              <h3 style="font-size:13px;font-weight:700"><i class="fas fa-tachometer-alt mr-2" style="color:#f59e0b"></i>Pipeline Trace</h3>
+              <span id="latency-badge" class="badge badge-yellow">— ms</span>
+            </div>
+            <div class="flex gap-2 flex-wrap" id="stage-badges"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ══ SECTION: Confidence Visualizer ═══════════════════ -->
+    <div id="section-confidence" class="section-page" style="display:none">
+      <div class="grid" style="grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:20px">
+
+        <!-- Identity Confidence Ring -->
+        <div class="card text-center">
+          <div style="font-size:12px;font-weight:600;color:#64748b;margin-bottom:14px;text-transform:uppercase;letter-spacing:.5px">Identity Confidence</div>
+          <div style="position:relative;width:140px;height:140px;margin:0 auto">
+            <canvas id="ring-identity" width="140" height="140"></canvas>
+            <div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column">
+              <div id="ring-identity-val" style="font-size:26px;font-weight:700;color:#6366f1">—</div>
+              <div style="font-size:10px;color:#64748b">Score</div>
+            </div>
+          </div>
+          <div id="ring-identity-label" style="font-size:12px;color:#94a3b8;margin-top:10px">Run an auth test</div>
+        </div>
+
+        <!-- Liveness Ring -->
+        <div class="card text-center">
+          <div style="font-size:12px;font-weight:600;color:#64748b;margin-bottom:14px;text-transform:uppercase;letter-spacing:.5px">Liveness Detection</div>
+          <div style="position:relative;width:140px;height:140px;margin:0 auto">
+            <canvas id="ring-liveness" width="140" height="140"></canvas>
+            <div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column">
+              <div id="ring-liveness-val" style="font-size:26px;font-weight:700;color:#3b82f6">—</div>
+              <div style="font-size:10px;color:#64748b">Score</div>
+            </div>
+          </div>
+          <div id="ring-liveness-label" style="font-size:12px;color:#94a3b8;margin-top:10px">Run an auth test</div>
+        </div>
+
+        <!-- Trust Ring -->
+        <div class="card text-center">
+          <div style="font-size:12px;font-weight:600;color:#64748b;margin-bottom:14px;text-transform:uppercase;letter-spacing:.5px">Trust Score</div>
+          <div style="position:relative;width:140px;height:140px;margin:0 auto">
+            <canvas id="ring-trust" width="140" height="140"></canvas>
+            <div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column">
+              <div id="ring-trust-val" style="font-size:26px;font-weight:700;color:#8b5cf6">—</div>
+              <div style="font-size:10px;color:#64748b">Score</div>
+            </div>
+          </div>
+          <div id="ring-trust-label" style="font-size:12px;color:#94a3b8;margin-top:10px">Run an auth test</div>
+        </div>
+      </div>
+
+      <!-- Score breakdown table -->
+      <div class="card mb-4">
+        <h3 style="font-size:14px;font-weight:700;margin-bottom:16px"><i class="fas fa-table mr-2" style="color:#6366f1"></i>Full Score Breakdown</h3>
+        <div id="score-breakdown-table">
+          <div style="text-align:center;color:#475569;padding:30px;font-size:13px">
+            <i class="fas fa-chart-pie" style="font-size:32px;opacity:.3;display:block;margin-bottom:10px"></i>
+            No data yet — run an authentication test
+          </div>
+        </div>
+      </div>
+
+      <!-- History Chart -->
+      <div class="card">
+        <div class="flex items-center justify-between mb-4">
+          <h3 style="font-size:14px;font-weight:700"><i class="fas fa-history mr-2" style="color:#f59e0b"></i>Confidence History</h3>
+          <button class="btn btn-ghost btn-sm" onclick="loadConfidenceHistory()"><i class="fas fa-sync-alt"></i></button>
+        </div>
+        <canvas id="history-chart" height="120"></canvas>
+      </div>
+    </div>
+
+    <!-- ══ SECTION: Test Profiles ══════════════════════════ -->
+    <div id="section-profiles" class="section-page" style="display:none">
+      <div class="grid" style="grid-template-columns:360px 1fr;gap:20px">
+
+        <!-- Create Profile -->
+        <div class="card" style="height:fit-content">
+          <h3 style="font-size:14px;font-weight:700;margin-bottom:16px"><i class="fas fa-user-plus mr-2" style="color:#10b981"></i>Create Test Profile</h3>
+          <div class="flex flex-col gap-3">
+            <div>
+              <label class="label">Full Name *</label>
+              <input class="input" id="new-name" placeholder="e.g. Alice Johnson" autocomplete="off">
+            </div>
+            <div>
+              <label class="label">Email *</label>
+              <input class="input" id="new-email" type="email" placeholder="alice@test.lab" autocomplete="off">
+            </div>
+            <div>
+              <label class="label">Role *</label>
+              <select class="select" id="new-role">
+                <option value="employee">Employee</option>
+                <option value="admin">Admin</option>
+                <option value="visitor">Visitor</option>
+              </select>
+            </div>
+            <div>
+              <label class="label">Phone Device ID (optional)</label>
+              <input class="input" id="new-device-id" placeholder="e.g. iPhone-A1B2C3" autocomplete="off">
+            </div>
+            <div>
+              <label class="label">Notes (optional)</label>
+              <input class="input" id="new-notes" placeholder="Test notes…">
+            </div>
+            <button class="btn btn-success" onclick="createProfile()">
+              <i class="fas fa-plus"></i> Create Profile
+            </button>
+          </div>
+        </div>
+
+        <!-- Profile List -->
+        <div class="card">
+          <div class="flex items-center justify-between mb-4">
+            <h3 style="font-size:14px;font-weight:700"><i class="fas fa-users mr-2" style="color:#6366f1"></i>Test Profiles</h3>
+            <button class="btn btn-ghost btn-sm" onclick="loadProfiles()"><i class="fas fa-sync-alt"></i> Refresh</button>
+          </div>
+          <div id="profiles-list">
+            <div style="text-align:center;color:#475569;padding:40px;font-size:13px">Loading…</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ══ SECTION: Security Log ════════════════════════════ -->
+    <div id="section-logs" class="section-page" style="display:none">
+      <div class="card">
+        <div class="flex items-center justify-between mb-4">
+          <div>
+            <h3 style="font-size:14px;font-weight:700"><i class="fas fa-shield-alt mr-2" style="color:#ef4444"></i>Security Log — Real-Time Activity</h3>
+            <div style="font-size:12px;color:#64748b;margin-top:2px">All authentication attempts with full scoring data</div>
+          </div>
+          <div class="flex gap-2">
+            <select class="select" id="log-filter" onchange="loadLogs()" style="width:140px">
+              <option value="">All Results</option>
+              <option value="granted">Granted</option>
+              <option value="denied">Denied</option>
+              <option value="pending">Pending</option>
+            </select>
+            <button class="btn btn-ghost btn-sm" onclick="loadLogs()"><i class="fas fa-sync-alt"></i></button>
+            <button class="btn btn-danger btn-sm" onclick="clearLogs()"><i class="fas fa-trash"></i> Clear</button>
+          </div>
+        </div>
+
+        <!-- Stats bar -->
+        <div class="grid mb-4" style="grid-template-columns:repeat(5,1fr);gap:10px" id="log-stats">
+          <div class="card-sm text-center"><div style="font-size:10px;color:#64748b">Total</div><div id="log-stat-total" style="font-size:18px;font-weight:700">—</div></div>
+          <div class="card-sm text-center"><div style="font-size:10px;color:#64748b">Granted</div><div id="log-stat-granted" style="font-size:18px;font-weight:700;color:#10b981">—</div></div>
+          <div class="card-sm text-center"><div style="font-size:10px;color:#64748b">Denied</div><div id="log-stat-denied" style="font-size:18px;font-weight:700;color:#ef4444">—</div></div>
+          <div class="card-sm text-center"><div style="font-size:10px;color:#64748b">Avg Conf</div><div id="log-stat-conf" style="font-size:18px;font-weight:700;color:#6366f1">—</div></div>
+          <div class="card-sm text-center"><div style="font-size:10px;color:#64748b">Avg Latency</div><div id="log-stat-lat" style="font-size:18px;font-weight:700;color:#f59e0b">—</div></div>
+        </div>
+
+        <div style="overflow-x:auto">
+          <table style="width:100%;border-collapse:collapse;font-size:12px">
+            <thead>
+              <tr style="border-bottom:1px solid #1e1e3a;color:#64748b">
+                <th style="padding:8px 10px;text-align:left">Time</th>
+                <th style="padding:8px 10px;text-align:left">Result</th>
+                <th style="padding:8px 10px;text-align:left">User</th>
+                <th style="padding:8px 10px;text-align:left">Similarity</th>
+                <th style="padding:8px 10px;text-align:left">Combined</th>
+                <th style="padding:8px 10px;text-align:left">Trust</th>
+                <th style="padding:8px 10px;text-align:left">Latency</th>
+                <th style="padding:8px 10px;text-align:left">Lock</th>
+                <th style="padding:8px 10px;text-align:left">Mode</th>
+              </tr>
+            </thead>
+            <tbody id="log-tbody">
+              <tr><td colspan="9" style="text-align:center;padding:40px;color:#475569">Loading logs…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- ══ SECTION: Dev Controls ════════════════════════════ -->
+    <div id="section-controls" class="section-page" style="display:none">
+      <div class="grid" style="grid-template-columns:1fr 1fr;gap:20px">
+
+        <!-- Testing Controls -->
+        <div class="card">
+          <h3 style="font-size:14px;font-weight:700;margin-bottom:16px"><i class="fas fa-sliders-h mr-2" style="color:#f59e0b"></i>Testing Controls</h3>
+          <div class="flex flex-col gap-3">
+
+            <div class="card-sm" style="border-color:#f59e0b30">
+              <div style="font-size:13px;font-weight:600;margin-bottom:6px"><i class="fas fa-sync-alt mr-2" style="color:#f59e0b"></i>Reset Test Profiles</div>
+              <div style="font-size:11px;color:#64748b;margin-bottom:10px">Clears all face embeddings and logs. Keeps profile records.</div>
+              <button class="btn btn-ghost btn-sm" onclick="resetLab()"><i class="fas fa-sync-alt"></i> Reset Lab</button>
+            </div>
+
+            <div class="card-sm" style="border-color:#ef444430">
+              <div style="font-size:13px;font-weight:600;margin-bottom:6px"><i class="fas fa-trash mr-2" style="color:#ef4444"></i>Delete All Profiles</div>
+              <div style="font-size:11px;color:#64748b;margin-bottom:10px">Permanently removes all test profiles, embeddings, and logs.</div>
+              <button class="btn btn-danger btn-sm" onclick="deleteAllProfiles()"><i class="fas fa-trash"></i> Delete All</button>
+            </div>
+
+            <div class="card-sm" style="border-color:#3b82f630">
+              <div style="font-size:13px;font-weight:600;margin-bottom:6px"><i class="fas fa-bug mr-2" style="color:#3b82f6"></i>Debug Mode</div>
+              <div style="font-size:11px;color:#64748b;margin-bottom:10px">Show raw model confidence values and pipeline internals.</div>
+              <label class="flex items-center gap-3 cursor-pointer">
+                <input type="checkbox" id="ctrl-debug" onchange="toggleDebug(this.checked)" style="accent-color:var(--accent);width:16px;height:16px">
+                <span style="font-size:13px;color:#e2e8f0">Enable Debug Mode</span>
+              </label>
+            </div>
+
+          </div>
+        </div>
+
+        <!-- Debug Output -->
+        <div class="card">
+          <div class="flex items-center justify-between mb-3">
+            <h3 style="font-size:14px;font-weight:700"><i class="fas fa-terminal mr-2" style="color:#6366f1"></i>Debug Output</h3>
+            <button class="btn btn-ghost btn-sm" onclick="document.getElementById('debug-output').innerHTML=''"><i class="fas fa-times"></i> Clear</button>
+          </div>
+          <div id="debug-output" style="font-family:monospace;font-size:11px;color:#94a3b8;background:#060612;border-radius:8px;padding:12px;height:320px;overflow-y:auto;white-space:pre-wrap">
+<span style="color:#6366f1">// Dev Lab Debug Console</span>
+<span style="color:#475569">// Run an authentication test with debug mode enabled
+// to see raw pipeline data here</span>
+          </div>
+        </div>
+
+        <!-- Lab Stats -->
+        <div class="card">
+          <h3 style="font-size:14px;font-weight:700;margin-bottom:16px"><i class="fas fa-chart-line mr-2" style="color:#10b981"></i>Lab Statistics</h3>
+          <div id="lab-stats-panel">
+            <div style="text-align:center;color:#475569;padding:20px;font-size:13px">Loading…</div>
+          </div>
+        </div>
+
+        <!-- Pipeline Config -->
+        <div class="card">
+          <h3 style="font-size:14px;font-weight:700;margin-bottom:16px"><i class="fas fa-cogs mr-2" style="color:#8b5cf6"></i>Pipeline Config</h3>
+          <div class="flex flex-col gap-2" style="font-size:12px">
+            <div class="debug-line"><span>HIGH_THRESHOLD</span> = 0.85</div>
+            <div class="debug-line"><span>MED_THRESHOLD</span> = 0.65</div>
+            <div class="debug-line"><span>SPOOF_REJECT</span> = 0.35</div>
+            <div class="debug-line"><span>LIVENESS_MIN</span> = 0.50</div>
+            <div class="debug-line"><span>ARCFACE_WEIGHT</span> = 0.50</div>
+            <div class="debug-line"><span>INSIGHTFACE_WEIGHT</span> = 0.30</div>
+            <div class="debug-line"><span>FACENET_WEIGHT</span> = 0.20</div>
+            <div class="debug-line"><span>TRUST_FACE_WEIGHT</span> = 0.35</div>
+            <div class="debug-line"><span>TRUST_BEHAVIORAL</span> = 0.35</div>
+            <div class="debug-line"><span>TRUST_PREDICTIVE</span> = 0.20</div>
+            <div class="debug-line"><span>TRUST_ANOMALY_PEN</span> = 0.10</div>
+            <div class="debug-line"><span>BLE_PROXIMITY</span> = 0.95</div>
+            <div class="debug-line"><span>WIFI_PROXIMITY</span> = 0.78</div>
+            <div class="debug-line"><span>EMA_ALPHA</span> = 0.15</div>
+            <div class="debug-line"><span>ENGINE_VERSION</span> = <span style="color:#10b981">"4.0"</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div><!-- /padding -->
+</div><!-- /main -->
+
+<!-- Toast -->
+<div class="toast" id="toast"><span id="toast-icon"></span><span id="toast-msg"></span></div>
+
+<script src="https://cdn.jsdelivr.net/npm/axios@1.6.0/dist/axios.min.js"></script>
+<script src="/static/faceid-engine.js"></script>
+<script src="/static/dev-lab.js"></script>
+</body>
+</html>`
+}
 
 export default app
