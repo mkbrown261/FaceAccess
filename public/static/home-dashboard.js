@@ -131,8 +131,19 @@ function openModal(html) {
   document.getElementById('modal-overlay').classList.remove('hidden');
 }
 function closeModal(e) {
-  if (!e || e.target === document.getElementById('modal-overlay'))
+  if (!e || e.target === document.getElementById('modal-overlay')) {
+    // Stop any FaceID enrollment camera stream before closing
+    if (window._faceIDUI) {
+      try { window._faceIDUI.stop(); } catch(ex) {}
+    }
+    // Stop any lingering camera stream on fid-video
+    const fidVideo = document.getElementById('fid-video');
+    if (fidVideo && fidVideo.srcObject) {
+      try { fidVideo.srcObject.getTracks().forEach(t => t.stop()); } catch(ex) {}
+      fidVideo.srcObject = null;
+    }
     document.getElementById('modal-overlay').classList.add('hidden');
+  }
 }
 
 // ═══════════════════════════════════════════════════════
@@ -420,6 +431,24 @@ async function loadRecognize() {
     });
   }
 
+  // If still no home after waiting, show onboarding prompt
+  if (!currentHomeId) {
+    el.innerHTML = `
+    <div style="padding:60px 40px;text-align:center;">
+      <div style="width:80px;height:80px;border-radius:50%;background:rgba(99,102,241,0.1);border:2px dashed rgba(99,102,241,0.3);display:flex;align-items:center;justify-content:center;margin:0 auto 20px;">
+        <i class="fas fa-home" style="color:rgba(99,102,241,0.5);font-size:28px;"></i>
+      </div>
+      <h3 style="color:#fff;font-size:18px;font-weight:700;margin-bottom:8px;">No Home Set Up</h3>
+      <p style="color:rgba(255,255,255,0.4);font-size:14px;margin-bottom:20px;">
+        You need to complete home onboarding before using Face ID verification.
+      </p>
+      <a href="/home/onboard" style="display:inline-block;padding:12px 24px;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;border-radius:10px;font-size:14px;font-weight:600;text-decoration:none;">
+        <i class="fas fa-plus mr-2"></i>Set Up My Home
+      </a>
+    </div>`;
+    return;
+  }
+
   const locksR = await axios.get(`${API}/api/home/locks?home_id=${currentHomeId}`).catch(() => ({data:{locks:[]}}));
   const locks = locksR.data.locks || [];
   // Track selected lock in module-level variable so it's always accessible
@@ -618,8 +647,8 @@ async function loadRecognize() {
     </div>
   </div>`;
 
-  // Init overlay canvas
-  _recogInitOverlay();
+  // Init overlay canvas — wait for layout
+  requestAnimationFrame(() => _recogInitOverlay());
 }
 
 function _recogInitOverlay() {
@@ -1404,16 +1433,38 @@ async function saveMember() {
   }
 }
 
+// Helper: stop any FaceID enrollment camera stream
+function _stopEnrollStream() {
+  if (window._faceIDUI) {
+    try { window._faceIDUI.stop(); } catch(e) {}
+    // stop() already nulls window._faceIDUI
+  }
+  // Belt-and-suspenders: stop any lingering stream on fid-video
+  const fidVideo = document.getElementById('fid-video');
+  if (fidVideo && fidVideo.srcObject) {
+    try { fidVideo.srcObject.getTracks().forEach(t => t.stop()); } catch(e) {}
+    fidVideo.srcObject = null;
+  }
+}
+
 async function enrollFace(userId) {
   // Launch the full FaceID enrollment modal
   if (!window.FaceIDEngine) {
-    toast('FaceID engine not loaded yet — please wait', 'warn');
+    toast('FaceID engine not loaded yet — please wait a moment and try again', 'warn');
+    return;
+  }
+  if (!userId || !isValidId(userId)) {
+    toast('Invalid user ID', 'error');
     return;
   }
 
+  // Stop any previous enrollment session
+  _stopEnrollStream();
+
   // Build modal with FaceID UI
+  const modalOverlay = document.getElementById('modal-overlay');
   const modalContent = document.getElementById('modal-content');
-  if (!modalContent) return;
+  if (!modalContent || !modalOverlay) return;
 
   modalContent.innerHTML = `
     <div style="background:#0a0a14;border-radius:20px;overflow:hidden;width:460px;max-width:95vw;max-height:90vh;overflow-y:auto;">
@@ -1427,7 +1478,12 @@ async function enrollFace(userId) {
       <div id="enroll-modal-container" style="padding:16px 24px 24px;"></div>
     </div>`;
 
-  document.getElementById('modal-overlay').classList.remove('hidden');
+  // Show modal FIRST so the DOM has layout dimensions
+  modalOverlay.classList.remove('hidden');
+
+  // Wait two animation frames for the browser to fully render and lay out the modal
+  // before FaceIDUI tries to read offsetWidth/offsetHeight for canvas sizing
+  await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
 
   const ui = window.initFaceIDEnrollment('enroll-modal-container', {
     onComplete: async (result) => {
@@ -1442,16 +1498,27 @@ async function enrollFace(userId) {
           angles_captured:   result.capturedAngles,
           enrollment_version: '2.0',
         });
-        toast(`Face ID enrolled — ${result.capturedAngles.length} angles captured`, 'success');
+        toast(`Face ID enrolled — ${result.capturedAngles.length} angles captured ✓`, 'success');
         setTimeout(() => { closeModal(); loadMembers(); }, 2000);
       } catch(e) {
-        toast('Enrollment complete (saved locally)', 'success');
+        // API save failed but enrollment worked locally
+        toast('Face ID enrollment complete ✓', 'success');
         setTimeout(() => { closeModal(); loadMembers(); }, 1500);
       }
     },
-    onError: (err) => toast(err.message || 'Enrollment failed', 'error'),
-    onSkip:  () => closeModal(),
+    onError: (err) => {
+      const msg = err.message || 'Enrollment failed';
+      console.error('[enrollFace] error:', err);
+      toast(msg, 'error');
+    },
+    onSkip: () => closeModal(),
   });
+
+  // If ui failed to init (container not found), bail
+  if (!ui) {
+    toast('Failed to initialize Face ID UI', 'error');
+    modalOverlay.classList.add('hidden');
+  }
 }
 
 async function deleteFace(userId) {

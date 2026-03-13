@@ -1298,6 +1298,20 @@ class FaceIDUI {
     this._bindEvents();
     this._initOverlayCanvas();
     this._startOverlayLoop();
+
+    // Re-init canvas after next paint (handles cases where container was just made visible)
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        this._initOverlayCanvas();
+      });
+    });
+
+    // Watch for container resize (e.g. modal animation completing)
+    if (typeof ResizeObserver !== 'undefined') {
+      const ro = new ResizeObserver(() => this._initOverlayCanvas());
+      ro.observe(this.container);
+      this._resizeObserver = ro;
+    }
   }
 
   _buildHTML() {
@@ -1509,8 +1523,12 @@ class FaceIDUI {
     const canvas = document.getElementById('fid-overlay');
     if (!canvas) return;
     const container = canvas.parentElement;
-    canvas.width  = container.offsetWidth  || 420;
-    canvas.height = container.offsetHeight || 420;
+    // Use getBoundingClientRect for accurate dimensions after layout
+    const rect = container.getBoundingClientRect();
+    const w = rect.width  || container.offsetWidth  || 420;
+    const h = rect.height || container.offsetHeight || 420;
+    canvas.width  = w > 0 ? w : 420;
+    canvas.height = h > 0 ? h : 420;
     this._overlayCanvas = canvas;
     this._overlayCtx    = canvas.getContext('2d');
   }
@@ -1870,8 +1888,16 @@ class FaceIDUI {
   }
 
   stop() {
-    if (this.session)    this.session.stop();
-    if (this._animFrame) cancelAnimationFrame(this._animFrame);
+    if (this.session)          this.session.stop();
+    if (this._animFrame)       cancelAnimationFrame(this._animFrame);
+    if (this._resizeObserver)  { this._resizeObserver.disconnect(); this._resizeObserver = null; }
+    // Stop any camera stream attached to fid-video
+    const v = document.getElementById('fid-video');
+    if (v && v.srcObject) {
+      try { v.srcObject.getTracks().forEach(t => t.stop()); } catch(e) {}
+      v.srcObject = null;
+    }
+    window._faceIDUI = null;
   }
 }
 

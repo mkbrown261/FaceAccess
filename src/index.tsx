@@ -3867,7 +3867,13 @@ body{font-family:system-ui,sans-serif;background:#07071a;color:#e2e8f0;max-width
   </div>
 </div>
 
+<!-- FaceID Enrollment Modal (mobile) -->
+<div id="mob-modal-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:200;display:none;align-items:center;justify-content:center;padding:16px;" onclick="mobCloseModal(event)">
+  <div id="mob-modal-content" onclick="event.stopPropagation()" style="width:100%;max-width:420px;"></div>
+</div>
+
 <script src="/static/auth.js"></script>
+<script src="/static/faceid-engine.js"></script>
 <script src="/static/home-mobile.js"></script>
 </body>
 </html>`
