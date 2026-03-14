@@ -1,16 +1,50 @@
-# FaceAccess — AI-Enhanced Facial Recognition Access Control System v4.1
+# FaceAccess — AI-Enhanced Facial Recognition Access Control System v4.2
 
 ## Project Overview
-A complete facial recognition-based access control system with a **multi-model biometric pipeline** (ArcFace + InsightFace + FaceNet), AI Trust Engine v4, predictive behavioral analysis, real-time anomaly detection, and a **dedicated internal Developer Testing Lab**.
+A complete facial recognition-based access control system with a **multi-model biometric pipeline** (ArcFace + InsightFace + FaceNet), AI Trust Engine v4, predictive behavioral analysis, real-time anomaly detection, a **dedicated internal Developer Testing Lab**, and a full **legal compliance framework** covering privacy, biometrics, SMS, and AI transparency.
 
 **Production:** [https://faceaccess.pages.dev](https://faceaccess.pages.dev)  
 **Home Dashboard:** [https://faceaccess.pages.dev/home/dashboard](https://faceaccess.pages.dev/home/dashboard)  
 **Mobile App:** [https://faceaccess.pages.dev/home/mobile](https://faceaccess.pages.dev/home/mobile)  
-**🔬 Dev Lab (NEW):** [https://faceaccess.pages.dev/dev-lab](https://faceaccess.pages.dev/dev-lab)
+**🔬 Dev Lab:** [https://faceaccess.pages.dev/dev-lab](https://faceaccess.pages.dev/dev-lab)
+
+### 📋 Legal Pages
+| Page | URL | Status |
+|---|---|---|
+| Privacy Policy | [/legal/privacy](https://faceaccess.pages.dev/legal/privacy) | ✅ Live |
+| Terms of Use | [/legal/terms](https://faceaccess.pages.dev/legal/terms) | ✅ Live |
+| SMS Consent Agreement | [/legal/sms-consent](https://faceaccess.pages.dev/legal/sms-consent) | ✅ Live |
+| Biometric Data Retention Policy | [/legal/biometric-retention](https://faceaccess.pages.dev/legal/biometric-retention) | ✅ Live |
+| AI & Facial Recognition Disclosure | [/legal/ai-disclosure](https://faceaccess.pages.dev/legal/ai-disclosure) | ✅ Live |
+| Enterprise Security Compliance | [/legal/enterprise-security](https://faceaccess.pages.dev/legal/enterprise-security) | ✅ Live |
 
 ---
 
 ## ✅ Completed Features
+
+### ⚖️ Legal Compliance Framework (v1.0 — NEW)
+Full legal policy ecosystem covering BIPA, CCPA, TCPA, and GDPR requirements.
+
+**6 Legal Pages (all live at `/legal/*`):**
+- **Privacy Policy** — Biometric data handling, SMS communications, data rights, contact information
+- **Terms of Use** — Service agreement, biometric consent, SMS consent, acceptable use, limitation of liability
+- **SMS Consent Agreement** — Twilio-compliant TCPA consent language, STOP/HELP keywords, opt-out instructions, message types
+- **Biometric Data Retention Policy** — BIPA-compliant written retention schedule, 3-year max, 30-day deletion SLA, IL/TX/WA/CA compliance
+- **AI & Facial Recognition Disclosure** — Algorithm transparency, 128-dim embeddings, anti-spoof threshold (0.72), accuracy limitations, demographic fairness
+- **Enterprise Security Compliance** — Cloudflare edge security, AES-256 encryption, RBAC, rate limiting, SOC2/ISO27001 vendor compliance
+
+**Consent Checkboxes at Every Signup Entry Point:**
+All 4 registration flows now include dual consent checkboxes:
+1. ✅ **Required:** Terms of Use + Privacy Policy + Biometric data consent
+2. ☐ **Optional:** SMS text message consent (TCPA-compliant)
+
+Registration flows updated:
+- **Business Registration** (`bizDoRegister`) — validates `biz-reg-consent-terms` required
+- **Home Registration** (`homeDoRegister`) — validates `home-reg-consent-terms` required
+- **Mobile Registration** (`mobDoRegister`) — validates `mob-reg-consent-terms` required
+- **Home Onboarding Step 0** (`saveAccount`) — validates `ob-consent-terms` required
+- `sms_consent` flag passed to all backend registration APIs
+
 
 ### 🔬 Developer Testing Lab (v1.0 — NEW at `/dev-lab`)
 Internal sandbox environment for validating biometric pipeline accuracy, enrollment quality, and trust engine logic — fully isolated from production data.
