@@ -1,6 +1,13 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { serveStatic } from 'hono/cloudflare-workers'
+// Legal policy pages — inlined at build time via Vite ?raw imports
+import legalPrivacyHtml from '../public/static/legal-privacy.html?raw'
+import legalTermsHtml from '../public/static/legal-terms.html?raw'
+import legalSmsConsentHtml from '../public/static/legal-sms-consent.html?raw'
+import legalBiometricHtml from '../public/static/legal-biometric-retention.html?raw'
+import legalAiHtml from '../public/static/legal-ai-disclosure.html?raw'
+import legalSecurityHtml from '../public/static/legal-enterprise-security.html?raw'
 
 type Bindings = {
   DB: D1Database
@@ -2596,6 +2603,17 @@ select.input option { background: #1a1a2e; }
             </button>
           </div>
         </div>
+        <!-- Legal Consent Checkboxes -->
+        <div style="margin-bottom:14px;background:rgba(99,102,241,.06);border:1px solid rgba(99,102,241,.15);border-radius:10px;padding:14px 16px;display:flex;flex-direction:column;gap:10px;">
+          <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;">
+            <input type="checkbox" id="biz-reg-consent-terms" style="margin-top:2px;width:16px;height:16px;accent-color:#6366f1;flex-shrink:0;">
+            <span style="font-size:11.5px;color:#94a3b8;line-height:1.55;">I agree to the FaceAccess <a href="/legal/terms" target="_blank" style="color:#818cf8;">Terms of Use</a> and <a href="/legal/privacy" target="_blank" style="color:#818cf8;">Privacy Policy</a>, including the collection and processing of my biometric facial data for identity verification. <span style="color:#ef4444">*</span></span>
+          </label>
+          <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;">
+            <input type="checkbox" id="biz-reg-consent-sms" style="margin-top:2px;width:16px;height:16px;accent-color:#6366f1;flex-shrink:0;">
+            <span style="font-size:11.5px;color:#94a3b8;line-height:1.55;">I agree to receive recurring automated SMS text messages from FaceAccess including security codes, access alerts, and account notifications. Msg &amp; data rates may apply. Reply STOP to opt out. Not required for service. <a href="/legal/sms-consent" target="_blank" style="color:#818cf8;">SMS Consent</a></span>
+          </label>
+        </div>
         <div id="biz-reg-err" style="display:none;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.2);border-radius:8px;padding:10px 14px;font-size:12px;color:#fca5a5;margin-bottom:14px"></div>
         <button id="biz-reg-btn" onclick="bizDoRegister()"
           style="width:100%;padding:12px;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;border:none;border-radius:10px;font-weight:700;font-size:14px;cursor:pointer">
@@ -3189,6 +3207,17 @@ nav a:hover { color: #e2e8f0; }
         <input id="home-reg-phone" type="tel" placeholder="+1 555 0100" style="width:100%;background:#07071a;border:1px solid #1e1e35;border-radius:8px;padding:10px 12px;color:#e2e8f0;font-size:14px;outline:none;box-sizing:border-box"></div>
       <div style="margin-bottom:14px"><label style="font-size:11px;color:rgba(255,255,255,.4);display:block;margin-bottom:5px;text-transform:uppercase;letter-spacing:.05em">Password * <span style="color:rgba(255,255,255,.2);font-size:10px">(8+ chars)</span></label>
         <input id="home-reg-pw" type="password" placeholder="••••••••" style="width:100%;background:#07071a;border:1px solid #1e1e35;border-radius:8px;padding:10px 12px;color:#e2e8f0;font-size:14px;outline:none;box-sizing:border-box"></div>
+      <!-- Legal Consent Checkboxes -->
+      <div style="margin-bottom:14px;background:rgba(99,102,241,.06);border:1px solid rgba(99,102,241,.15);border-radius:10px;padding:12px 14px;display:flex;flex-direction:column;gap:9px;">
+        <label style="display:flex;align-items:flex-start;gap:9px;cursor:pointer;">
+          <input type="checkbox" id="home-reg-consent-terms" style="margin-top:2px;width:15px;height:15px;accent-color:#6366f1;flex-shrink:0;">
+          <span style="font-size:11px;color:#94a3b8;line-height:1.55;">I agree to the FaceAccess <a href="/legal/terms" target="_blank" style="color:#818cf8;">Terms of Use</a> and <a href="/legal/privacy" target="_blank" style="color:#818cf8;">Privacy Policy</a>, including biometric facial data collection. <span style="color:#ef4444">*</span></span>
+        </label>
+        <label style="display:flex;align-items:flex-start;gap:9px;cursor:pointer;">
+          <input type="checkbox" id="home-reg-consent-sms" style="margin-top:2px;width:15px;height:15px;accent-color:#6366f1;flex-shrink:0;">
+          <span style="font-size:11px;color:#94a3b8;line-height:1.55;">I agree to receive automated SMS from FaceAccess (security codes, alerts). Msg &amp; data rates may apply. Reply STOP to opt out. <a href="/legal/sms-consent" target="_blank" style="color:#818cf8;">Details</a></span>
+        </label>
+      </div>
       <div id="home-reg-err" style="display:none;background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.2);border-radius:8px;padding:10px;font-size:12px;color:#fca5a5;margin-bottom:12px"></div>
       <button id="home-reg-btn" onclick="homeDoRegister()" style="width:100%;padding:11px;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;border:none;border-radius:10px;font-weight:700;font-size:14px;cursor:pointer"><i class="fas fa-user-plus" style="margin-right:6px"></i>Create Account</button>
     </div>
@@ -3240,14 +3269,17 @@ async function homeDoRegister() {
   const pw = document.getElementById('home-reg-pw').value;
   const errEl = document.getElementById('home-reg-err');
   const btn = document.getElementById('home-reg-btn');
+  const consentTerms = document.getElementById('home-reg-consent-terms')?.checked;
+  const consentSms = document.getElementById('home-reg-consent-sms')?.checked;
   if (!first||!last) { errEl.textContent='First and last name required'; errEl.style.display=''; return; }
   if (!FA_AUTH.validEmail(email)) { errEl.textContent='Invalid email'; errEl.style.display=''; return; }
   if (phone && !FA_AUTH.validPhone(phone)) { errEl.textContent='Invalid phone'; errEl.style.display=''; return; }
   if (!FA_AUTH.validPassword(pw)) { errEl.textContent='Password: 8+ chars with letters and numbers'; errEl.style.display=''; return; }
+  if (!consentTerms) { errEl.textContent='You must agree to the Terms of Use and Privacy Policy to create an account'; errEl.style.display=''; return; }
   errEl.style.display='none'; btn.disabled=true;
   btn.innerHTML='<i class="fas fa-spinner fa-spin" style="margin-right:6px"></i>Creating…';
   try {
-    await FA_AUTH.registerHome({ first_name:first, last_name:last, email, phone:phone||null, password:pw });
+    await FA_AUTH.registerHome({ first_name:first, last_name:last, email, phone:phone||null, password:pw, sms_consent:consentSms||false });
     window.location.href = '/home/onboard';
   } catch(e) {
     errEl.textContent = e.response?.data?.error || 'Registration failed';
@@ -3566,6 +3598,17 @@ body{font-family:system-ui,sans-serif;background:#070712;color:#e2e8f0;min-heigh
         <label class="text-xs text-gray-500 mb-1.5 block font-medium">Phone (for notifications)</label>
         <input id="ob-phone" type="tel" class="input" placeholder="+1 555 0100">
       </div>
+      <!-- Legal Consent Checkboxes -->
+      <div style="background:rgba(99,102,241,.06);border:1px solid rgba(99,102,241,.15);border-radius:10px;padding:12px 14px;display:flex;flex-direction:column;gap:9px;">
+        <label style="display:flex;align-items:flex-start;gap:9px;cursor:pointer;">
+          <input type="checkbox" id="ob-consent-terms" style="margin-top:2px;width:15px;height:15px;accent-color:#6366f1;flex-shrink:0;">
+          <span style="font-size:11.5px;color:#94a3b8;line-height:1.55;">I agree to the FaceAccess <a href="/legal/terms" target="_blank" style="color:#818cf8;">Terms of Use</a> and <a href="/legal/privacy" target="_blank" style="color:#818cf8;">Privacy Policy</a>, including the collection and processing of my biometric facial data. <span style="color:#ef4444">*</span></span>
+        </label>
+        <label style="display:flex;align-items:flex-start;gap:9px;cursor:pointer;">
+          <input type="checkbox" id="ob-consent-sms" style="margin-top:2px;width:15px;height:15px;accent-color:#6366f1;flex-shrink:0;">
+          <span style="font-size:11.5px;color:#94a3b8;line-height:1.55;">I agree to receive automated SMS text messages from FaceAccess (security codes, access alerts, account notifications). Msg &amp; data rates may apply. Reply STOP to opt out at any time. Not required for service. <a href="/legal/sms-consent" target="_blank" style="color:#818cf8;">SMS Consent</a></span>
+        </label>
+      </div>
     </div>
     <div id="step0-err" class="text-red-400 text-sm mt-3 hidden"></div>
     <button class="btn-primary mt-6" onclick="stepNext(0)">Continue <i class="fas fa-arrow-right ml-2"></i></button>
@@ -3863,6 +3906,17 @@ body{font-family:system-ui,sans-serif;background:#07071a;color:#e2e8f0;max-width
       <div style="margin-bottom:16px">
         <label style="font-size:11px;color:rgba(255,255,255,.4);display:block;margin-bottom:5px">Password * <span style="color:rgba(255,255,255,.2);font-size:10px">(8+ chars, letters+numbers)</span></label>
         <input id="mob-reg-pw" type="password" placeholder="••••••••" style="width:100%;background:#07071a;border:1px solid #1e1e35;border-radius:8px;padding:10px 12px;color:#e2e8f0;font-size:14px;outline:none;box-sizing:border-box">
+      </div>
+      <!-- Legal Consent Checkboxes -->
+      <div style="margin-bottom:14px;background:rgba(99,102,241,.06);border:1px solid rgba(99,102,241,.15);border-radius:10px;padding:12px 14px;display:flex;flex-direction:column;gap:9px;">
+        <label style="display:flex;align-items:flex-start;gap:9px;cursor:pointer;">
+          <input type="checkbox" id="mob-reg-consent-terms" style="margin-top:2px;width:15px;height:15px;accent-color:#6366f1;flex-shrink:0;">
+          <span style="font-size:11px;color:#94a3b8;line-height:1.55;">I agree to the FaceAccess <a href="/legal/terms" target="_blank" style="color:#818cf8;">Terms of Use</a> and <a href="/legal/privacy" target="_blank" style="color:#818cf8;">Privacy Policy</a>, including biometric facial data collection. <span style="color:#ef4444">*</span></span>
+        </label>
+        <label style="display:flex;align-items:flex-start;gap:9px;cursor:pointer;">
+          <input type="checkbox" id="mob-reg-consent-sms" style="margin-top:2px;width:15px;height:15px;accent-color:#6366f1;flex-shrink:0;">
+          <span style="font-size:11px;color:#94a3b8;line-height:1.55;">I agree to receive automated SMS from FaceAccess (security codes, access alerts). Msg &amp; data rates may apply. Reply STOP to opt out. <a href="/legal/sms-consent" target="_blank" style="color:#818cf8;">Details</a></span>
+        </label>
       </div>
       <div id="mob-reg-err" style="display:none;background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.2);border-radius:8px;padding:10px 14px;font-size:12px;color:#fca5a5;margin-bottom:12px"></div>
       <button id="mob-reg-btn" onclick="mobDoRegister()" style="width:100%;padding:12px;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;border:none;border-radius:10px;font-weight:700;font-size:14px;cursor:pointer">
@@ -5023,6 +5077,17 @@ app.delete('/api/devlab/reset', async (c) => {
 // ── Dev Lab page route ─────────────────────────────────────────────────────
 app.get('/dev-lab', (c) => c.html(getDevLabHTML()))
 app.get('/dev-lab/*', (c) => c.html(getDevLabHTML()))
+
+// ── Legal pages ────────────────────────────────────────────────────────────
+// Legal HTML inlined at build time via Vite ?raw imports — no runtime file I/O
+app.get('/legal', (c) => c.redirect('/legal/privacy', 302))
+app.get('/legal/', (c) => c.redirect('/legal/privacy', 302))
+app.get('/legal/privacy', (c) => c.html(legalPrivacyHtml))
+app.get('/legal/terms', (c) => c.html(legalTermsHtml))
+app.get('/legal/sms-consent', (c) => c.html(legalSmsConsentHtml))
+app.get('/legal/biometric-retention', (c) => c.html(legalBiometricHtml))
+app.get('/legal/ai-disclosure', (c) => c.html(legalAiHtml))
+app.get('/legal/enterprise-security', (c) => c.html(legalSecurityHtml))
 
 // ═══════════════════════════════════════════════════════════
 // Catch-all SPA route (MUST be last — after all API routes)

@@ -1757,14 +1757,17 @@ async function bizDoRegister() {
   const org    = document.getElementById('biz-reg-org')?.value.trim();
   const errEl  = document.getElementById('biz-reg-err');
   const btn    = document.getElementById('biz-reg-btn');
+  const consentTerms = document.getElementById('biz-reg-consent-terms')?.checked;
+  const consentSms   = document.getElementById('biz-reg-consent-sms')?.checked;
   if (!first || !last)              { errEl.textContent='First and last name required'; errEl.style.display=''; return; }
   if (!FA_AUTH.validEmail(email))   { errEl.textContent='Invalid email address'; errEl.style.display=''; return; }
   if (phone && !FA_AUTH.validPhone(phone)) { errEl.textContent='Invalid phone number format'; errEl.style.display=''; return; }
   if (!FA_AUTH.validPassword(pw))   { errEl.textContent='Password must be 8+ characters with letters and numbers'; errEl.style.display=''; return; }
+  if (!consentTerms) { errEl.textContent='You must agree to the Terms of Use and Privacy Policy to create an account'; errEl.style.display=''; return; }
   errEl.style.display = 'none';
   btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i>Creating…';
   try {
-    const data = await FA_AUTH.registerBusiness({ first_name:first, last_name:last, email, phone:phone||null, password:pw, role, org_name:org||null });
+    const data = await FA_AUTH.registerBusiness({ first_name:first, last_name:last, email, phone:phone||null, password:pw, role, org_name:org||null, sms_consent:consentSms||false });
     bizEnterDashboard(data.account);
   } catch(e) {
     errEl.textContent = e.response?.data?.error || 'Registration failed.';

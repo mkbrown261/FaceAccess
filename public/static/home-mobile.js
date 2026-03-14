@@ -71,14 +71,17 @@ async function mobDoRegister() {
   const pw    = document.getElementById('mob-reg-pw')?.value;
   const errEl = document.getElementById('mob-reg-err');
   const btn   = document.getElementById('mob-reg-btn');
+  const consentTerms = document.getElementById('mob-reg-consent-terms')?.checked;
+  const consentSms   = document.getElementById('mob-reg-consent-sms')?.checked;
   if (!first||!last) { errEl.textContent='First and last name required'; errEl.style.display=''; return; }
   if (!FA_AUTH.validEmail(email)) { errEl.textContent='Invalid email address'; errEl.style.display=''; return; }
   if (phone && !FA_AUTH.validPhone(phone)) { errEl.textContent='Invalid phone number'; errEl.style.display=''; return; }
   if (!FA_AUTH.validPassword(pw)) { errEl.textContent='Password must be 8+ chars with letters and numbers'; errEl.style.display=''; return; }
+  if (!consentTerms) { errEl.textContent='You must agree to the Terms of Use and Privacy Policy to create an account'; errEl.style.display=''; return; }
   errEl.style.display='none';
   btn.disabled=true; btn.innerHTML='<i class="fas fa-spinner fa-spin" style="margin-right:6px"></i>Creating…';
   try {
-    const data = await FA_AUTH.registerMobile({ first_name:first, last_name:last, email, phone:phone||null, password:pw });
+    const data = await FA_AUTH.registerMobile({ first_name:first, last_name:last, email, phone:phone||null, password:pw, sms_consent:consentSms||false });
     hmAccount = data.account;
     document.getElementById('mob-auth-wall').style.display='none';
     await loadUser();

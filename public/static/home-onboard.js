@@ -68,13 +68,19 @@ async function saveAccount() {
   const email = document.getElementById('ob-email')?.value.trim();
   const phone = document.getElementById('ob-phone')?.value.trim();
   const err   = document.getElementById('step0-err');
+  const consentTerms = document.getElementById('ob-consent-terms')?.checked;
+  const consentSms   = document.getElementById('ob-consent-sms')?.checked;
   if (!name || !email) {
     if (err) { err.textContent = 'Name and email are required.'; err.classList.remove('hidden'); }
     return false;
   }
+  if (!consentTerms) {
+    if (err) { err.textContent = 'You must agree to the Terms of Use and Privacy Policy to continue.'; err.classList.remove('hidden'); }
+    return false;
+  }
   if (err) err.classList.add('hidden');
   try {
-    const r = await axios.post(`${API}/api/home/users`, { name, email, phone: phone || null, role: 'owner' });
+    const r = await axios.post(`${API}/api/home/users`, { name, email, phone: phone || null, role: 'owner', sms_consent: consentSms||false });
     obUserId = r.data.user.id;
     return true;
   } catch(e) {
