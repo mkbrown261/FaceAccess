@@ -1,958 +1,592 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// FaceAccessCameraEngine  v2.0  — Unified Camera & Biometric Engine
+// FaceAccessCameraEngine  v3.0  — Camera + real face recognition (face-api.js)
 // ═══════════════════════════════════════════════════════════════════════════════
 //
-// WHAT'S NEW IN v2.0:
-//   • Stable face tracking — small head movements no longer break the session;
-//     face must fully exit frame (coverage < 2%) for 1.5 s before "face lost".
-//   • Graceful failure panel with Resume / Restart Scan / Cancel buttons.
-//   • Persistent "Restart Scan" button (never leaves the page).
-//   • Animated direction arrows + progress pill ("Step 2 of 5 · Scan Progress: 40%").
-//   • All control buttons functional: Resume, Restart Scan, Return, Close (×).
-//   • Each step visually confirms with a green tick + brief "✓ Done!" pill.
-//   • Robust error handling for: permission denied, no camera, camera in use,
-//     no face detected (8 s), multiple faces, low light.
-//   • 5-step movement flow:
-//       Step 1 — Hold still (face detected + 2 s stable hold)
-//       Steps 2-5 — Turn left / right / look up / down (max 3 s each,
-//                   advances on movement detected OR timeout)
-//   • Supports USB, laptop webcam, RTSP/HLS streams, integrated device cameras.
+// v3.0 replaces the previous pixel-statistics "embedding" with a real face
+// recognition pipeline running fully in the browser:
 //
-// USAGE:
+//   • Detection   : TinyFaceDetector (face-api.js)            ~190 KB
+//   • Landmarks   : 68-point FaceLandmark68Net                 ~350 KB
+//   • Descriptor  : dlib ResNet-34 FaceRecognitionNet (128-d)  ~6.4 MB
+//
+// Models are self-hosted under /static/models and loaded once per page.
+// Descriptors are compared server-side using Euclidean distance (same metric
+// as dlib / face-api); a distance below ~0.45-0.55 is the same person.
+//
+// Liveness: the user follows a 5-step head-movement challenge (hold still, turn
+// left, turn right, look up, look down). Head pose is estimated from landmarks,
+// so a printed photo or static screen cannot complete the challenge.
+//
+// USAGE (unchanged from v2):
 //   const session = FaceAccessCameraEngine.createEnrollmentSession(cfg)
 //   const session = FaceAccessCameraEngine.createVerificationSession(cfg)
-//   const cam     = FaceAccessCameraEngine.openCamera(cfg)
 //
-// cfg shared options:
-//   containerId   string            — div to mount camera+overlay into
-//   autoStart?    boolean           — default true
-//   facingMode?   'user'|'environment'
-//   deviceId?     string
-//   rtspUrl?      string
-//   onComplete    fn(result)        — { embedding, livenessScore, antiSpoofScore, quality, steps }
-//   onError?      fn(err)
-//   onProgress?   fn(step, total, stepDef)
+// cfg:
+//   containerId   string         — element to mount into
+//   onComplete    fn(result)     — { descriptor:number[128], descriptors:number[][],
+//                                    embedding (alias of descriptor), livenessScore,
+//                                    antiSpoofScore, quality, averageQuality, steps,
+//                                    capturedAngles, capturedSteps, engine, version }
+//   onError?      fn(err)        — { code, message }
+//   onProgress?   fn(step,total,stepDef)
 //   onFaceFound?  fn()
-//   title?        string            — header title shown above camera
-//   showRestartBtn? boolean         — default true
-//   showCancelBtn?  boolean         — default true
+//   autoStart?    boolean (true) | facingMode? | deviceId? | title? | showRestartBtn? | showCancelBtn?
 // ═══════════════════════════════════════════════════════════════════════════════
 ;(function (global) {
   'use strict';
 
-  // ─── Constants ───────────────────────────────────────────────────────────────
-  const VERSION   = '2.0';
-  const VIDEO_W   = 640;
-  const VIDEO_H   = 480;
-  const FRAME_FPS = 30;
-  const TICK_MS   = Math.round(1000 / FRAME_FPS);
+  const VERSION     = '3.0';
+  const ENGINE_NAME = 'face-api.js / dlib ResNet-34 (128-d)';
+  const MODEL_URL   = '/static/models';
+  const VENDOR_URL  = '/static/vendor/face-api.js';
+  const VIDEO_W = 640, VIDEO_H = 480;
+  const TICK_MS = 120;               // detection cadence (~8 fps) — light on CPU
 
-  // Movement verification steps
   const MOVEMENT_STEPS = [
-    { id: 'center', label: 'Hold still',   icon: '⊙', direction: null,
-      instruction: 'Center your face and hold still',
-      holdMs: 2000, moveThreshold: 0, arrowAnim: null },
-    { id: 'left',   label: 'Turn left',    icon: '←', direction: 'left',
-      instruction: 'Slowly turn your head to the LEFT',
-      holdMs: 0, moveThreshold: 0.11, arrowAnim: 'left' },
-    { id: 'right',  label: 'Turn right',   icon: '→', direction: 'right',
-      instruction: 'Slowly turn your head to the RIGHT',
-      holdMs: 0, moveThreshold: 0.11, arrowAnim: 'right' },
-    { id: 'up',     label: 'Look up',      icon: '↑', direction: 'up',
-      instruction: 'Tilt your head slightly UP',
-      holdMs: 0, moveThreshold: 0.09, arrowAnim: 'up' },
-    { id: 'down',   label: 'Look down',    icon: '↓', direction: 'down',
-      instruction: 'Tilt your head slightly DOWN',
-      holdMs: 0, moveThreshold: 0.09, arrowAnim: 'down' },
+    { id: 'center', label: 'Hold still', icon: '⊙', direction: null,  instruction: 'Center your face and hold still',      holdMs: 1800, arrowAnim: null },
+    { id: 'left',   label: 'Turn left',  icon: '←', direction: 'left', instruction: 'Slowly turn your head to the LEFT',    holdMs: 0,    arrowAnim: 'left' },
+    { id: 'right',  label: 'Turn right', icon: '→', direction: 'right',instruction: 'Slowly turn your head to the RIGHT',   holdMs: 0,    arrowAnim: 'right' },
+    { id: 'up',     label: 'Look up',    icon: '↑', direction: 'up',   instruction: 'Tilt your head slightly UP',           holdMs: 0,    arrowAnim: 'up' },
+    { id: 'down',   label: 'Look down',  icon: '↓', direction: 'down', instruction: 'Tilt your head slightly DOWN',         holdMs: 0,    arrowAnim: 'down' },
   ];
+  const YAW_THRESHOLD   = 0.09;   // normalized nose offset change
+  const PITCH_THRESHOLD = 0.07;
+  const MOVE_TIMEOUT_MS = 4500;   // per movement step on a GPU; scaled up when inference is slow (see adaptive timing)
+  const FACE_DETECT_MS  = 10000;
+  const MIN_TICKS_PER_STEP = 6;   // guarantee at least this many detections per movement step regardless of device speed
+  const MIN_HOLD_TICKS     = 3;   // 'center' step: minimum consecutive steady detections
+  const FACE_LOST_MS    = 1500;
+  const MIN_MOVEMENTS   = 2;      // liveness requires at least 2 of 4 movements
+  const MIN_FACE_FRAC   = 0.18;   // face box width / frame width — too small = move closer
 
-  const MOVE_TIMEOUT_MS  = 3500;  // max time to detect movement per step
-  const STILL_HOLD_MS    = 2000;  // hold-still duration for step 0
-  const FACE_DETECT_MS   = 8000;  // max wait for initial face detection
-  const FACE_LOST_HOLD_MS= 1500;  // ms face must be absent before "face lost"
-  const EMB_DIMS         = 128;
+  // ─── Model loading (shared across sessions) ─────────────────────────────────
+  let _modelsPromise = null;
+  let _modelsReady = false;
+  const _readyListeners = [];
 
-  // Quality thresholds
-  const Q_MIN_BRIGHTNESS = 35;
-  const Q_MAX_BRIGHTNESS = 215;
-  const Q_MIN_SHARPNESS  = 10;
-  const Q_MIN_COVERAGE   = 0.02;  // LOWERED: only fail if face truly gone
-  const Q_PASS           = 40;
-
-  // ─── Utilities ────────────────────────────────────────────────────────────────
-  function l2norm(v) {
-    const mag = Math.sqrt(v.reduce((s, x) => s + x * x, 0)) || 1;
-    return v.map(x => x / mag);
+  function _injectScript(src) {
+    return new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = src; s.async = true;
+      s.onload = resolve;
+      s.onerror = () => reject(new Error('Failed to load ' + src));
+      document.head.appendChild(s);
+    });
   }
-  function clamp(x, lo, hi) { return Math.max(lo, Math.min(hi, x)); }
-  function cosineSim(a, b) {
-    let dot = 0, ma = 0, mb = 0;
-    for (let i = 0; i < a.length; i++) { dot += a[i]*b[i]; ma += a[i]*a[i]; mb += b[i]*b[i]; }
-    return dot / (Math.sqrt(ma) * Math.sqrt(mb) + 1e-9);
-  }
 
-  // ─── Frame Analyzer ───────────────────────────────────────────────────────────
-  const FrameAnalyzer = {
-    analyze(video, canvas, ctx) {
-      if (!video || video.readyState < 2) {
-        return { detected: false, quality: 0, brightness: 0, sharpness: 0,
-                 coverage: 0, antiSpoof: { score: 0.5 }, headPose: null };
-      }
-      const w = video.videoWidth  || VIDEO_W;
-      const h = video.videoHeight || VIDEO_H;
-      canvas.width  = w;
-      canvas.height = h;
-      ctx.drawImage(video, 0, 0, w, h);
-
-      let img;
-      try { img = ctx.getImageData(0, 0, w, h); } catch(e) {
-        return { detected: false, quality: 0, brightness: 0, sharpness: 0,
-                 coverage: 0, antiSpoof: { score: 0.5 }, headPose: null };
-      }
-      const data = img.data;
-      const pixels = w * h;
-
-      // Brightness
-      let bright = 0;
-      for (let i = 0; i < data.length; i += 4) {
-        bright += 0.299 * data[i] + 0.587 * data[i+1] + 0.114 * data[i+2];
-      }
-      bright /= pixels;
-
-      // Sharpness (Laplacian variance)
-      let sharpSum = 0, sharpCount = 0;
-      const step = 3;
-      for (let y = step; y < h - step; y += step) {
-        for (let x = step; x < w - step; x += step) {
-          const i  = (y * w + x) * 4;
-          const lum = 0.299*data[i]+0.587*data[i+1]+0.114*data[i+2];
-          const iU  = ((y-step)*w+x)*4; const lumU = 0.299*data[iU]+0.587*data[iU+1]+0.114*data[iU+2];
-          const iD  = ((y+step)*w+x)*4; const lumD = 0.299*data[iD]+0.587*data[iD+1]+0.114*data[iD+2];
-          const iL  = (y*w+x-step)*4;   const lumL = 0.299*data[iL]+0.587*data[iL+1]+0.114*data[iL+2];
-          const iR  = (y*w+x+step)*4;   const lumR = 0.299*data[iR]+0.587*data[iR+1]+0.114*data[iR+2];
-          sharpSum += Math.abs(4*lum - lumU - lumD - lumL - lumR);
-          sharpCount++;
-        }
-      }
-      const sharpness = Math.min(100, (sharpSum / (sharpCount || 1)) * 2.5);
-
-      // Skin coverage in center zone (face position)
-      const cx = Math.floor(w / 2), cy = Math.floor(h / 2);
-      const faceW = Math.floor(w * 0.40), faceH = Math.floor(h * 0.56);
-      let skinCount = 0, facePixels = 0;
-      for (let fy = cy - faceH/2; fy < cy + faceH/2; fy += 3) {
-        for (let fx = cx - faceW/2; fx < cx + faceW/2; fx += 3) {
-          const fi = (Math.floor(fy)*w + Math.floor(fx))*4;
-          const r = data[fi], g = data[fi+1], b = data[fi+2];
-          facePixels++;
-          const Y  = 0.299*r + 0.587*g + 0.114*b;
-          const Cb = 128 - 0.168736*r - 0.331264*g + 0.5*b;
-          const Cr = 128 + 0.5*r - 0.418688*g - 0.081312*b;
-          if (Y > 35 && Cb >= 80 && Cb <= 140 && Cr >= 130 && Cr <= 185) skinCount++;
-        }
-      }
-      const coverage = facePixels > 0 ? skinCount / facePixels : 0;
-
-      // Anti-spoof proxy
-      const skinOverall = this._skinRatio(data, pixels);
-      const textureScore = Math.min(1, 0.38 + coverage * 1.1 + (sharpness/100)*0.25 + skinOverall*0.12);
-      const lowLight = bright < 38;
-      const antiSpoof = { score: clamp(textureScore, 0, 1), lowLightMode: lowLight };
-
-      // Detection: face present when coverage or sharpness passes
-      // NOTE: We use a VERY LOW coverage threshold so small head movements
-      // don't incorrectly trip "face lost"
-      const detected = (coverage > 0.025 || (sharpness > 15 && bright > Q_MIN_BRIGHTNESS))
-                       && bright < Q_MAX_BRIGHTNESS + 20
-                       && bright > Q_MIN_BRIGHTNESS - 5;
-
-      // Quality score 0-100
-      const qualityRaw =
-        (bright > Q_MIN_BRIGHTNESS && bright < Q_MAX_BRIGHTNESS ? 35 : 8) +
-        (sharpness > Q_MIN_SHARPNESS ? 33 : 8) +
-        clamp(coverage * 210, 0, 32);
-      const quality = Math.round(clamp(qualityRaw, 0, 100));
-
-      let qMsg = null;
-      if (bright < Q_MIN_BRIGHTNESS)     qMsg = 'Too dark — improve lighting';
-      else if (bright > Q_MAX_BRIGHTNESS) qMsg = 'Too bright — reduce glare';
-      else if (sharpness < Q_MIN_SHARPNESS) qMsg = 'Hold still — camera is blurry';
-      else if (coverage < 0.04)           qMsg = 'Move closer to the camera';
-      else if (quality >= 80)             qMsg = 'Excellent quality';
-      else if (quality >= 55)             qMsg = 'Good quality';
-      else                                qMsg = 'Move a little closer';
-
-      const headPose = this._headPose(data, w, h, cx, cy, faceW, faceH);
-      return { detected, quality, brightness: Math.round(bright),
-               sharpness: Math.round(sharpness),
-               coverage:  Math.round(coverage * 100) / 100,
-               antiSpoof, qualityMessage: qMsg, headPose };
-    },
-
-    _skinRatio(data, pixels) {
-      let cnt = 0;
-      for (let i = 0; i < data.length; i += 20) {
-        const r = data[i], g = data[i+1], b = data[i+2];
-        if (r > 70 && g > 35 && b > 15 && r > g && r > b && r-g > 7) cnt++;
-      }
-      return cnt / (pixels / 5);
-    },
-
-    _headPose(data, w, h, cx, cy, faceW, faceH) {
-      let sumX = 0, sumY = 0, cnt = 0;
-      for (let fy = cy - faceH/2; fy < cy + faceH/2; fy += 4) {
-        for (let fx = cx - faceW/2; fx < cx + faceW/2; fx += 4) {
-          const fi = (Math.floor(fy)*w + Math.floor(fx))*4;
-          const r = data[fi], g = data[fi+1], b = data[fi+2];
-          const Y  = 0.299*r + 0.587*g + 0.114*b;
-          const Cb = 128 - 0.168736*r - 0.331264*g + 0.5*b;
-          const Cr = 128 + 0.5*r - 0.418688*g - 0.081312*b;
-          if (Y > 35 && Cb >= 80 && Cb <= 140 && Cr >= 130 && Cr <= 185) {
-            sumX += fx; sumY += fy; cnt++;
-          }
-        }
-      }
-      if (cnt < 15) return { yaw: 0, pitch: 0, valid: false };
-      const mx = sumX / cnt, my = sumY / cnt;
-      const yaw   = clamp((mx - cx) / (faceW * 0.5), -1, 1);
-      const pitch = clamp((my - cy) / (faceH * 0.5), -1, 1);
-      return { yaw, pitch, valid: true };
-    },
-  };
-
-  // ─── Embedding Generator ──────────────────────────────────────────────────────
-  function generateEmbedding(video, canvas, ctx) {
-    canvas.width = 96; canvas.height = 96;
-    ctx.drawImage(video, 0, 0, 96, 96);
-    let img;
-    try { img = ctx.getImageData(0, 0, 96, 96); } catch(e) { return _randEmb(); }
-    const data = img.data;
-    const emb  = new Array(EMB_DIMS).fill(0);
-    const step = Math.floor(data.length / (EMB_DIMS * 4));
-    for (let i = 0; i < EMB_DIMS; i++) {
-      const off = i * step * 4;
-      const r = (data[off]   || 0) / 255;
-      const g = (data[off+1] || 0) / 255;
-      const b = (data[off+2] || 0) / 255;
-      emb[i] = r*0.299 + g*0.587 + b*0.114
-               + Math.sin(i * 0.31415) * 0.07
-               + Math.cos(i * 0.19635) * 0.05;
+  let _backend = null;
+  async function _selectBackend(fa) {
+    const tf = fa && fa.tf;
+    if (!tf || !tf.setBackend) return;
+    // Remove the 'wasm' backend from consideration — its .wasm binaries are not bundled.
+    try { if (tf.findBackendFactory && tf.findBackendFactory('wasm') && tf.removeBackend) tf.removeBackend('wasm'); } catch (_) {}
+    for (const name of ['webgl', 'cpu']) {
+      try {
+        if (await tf.setBackend(name)) { await tf.ready(); _backend = tf.getBackend(); break; }
+      } catch (_) { /* try next */ }
     }
-    return l2norm(emb);
-  }
-  function _randEmb() {
-    return l2norm(Array.from({ length: EMB_DIMS }, () => Math.random()*2 - 1));
+    if (!_backend) throw new Error('No usable TensorFlow.js backend (webgl/cpu) in this browser');
+    if (_backend !== 'webgl') console.warn('[FaceAccessCameraEngine] WebGL unavailable — running on CPU backend (slower, still functional)');
   }
 
-  // ─── Movement Detector ────────────────────────────────────────────────────────
-  function makeMovementDetector() {
-    return {
-      _baseline: null,
-      _history:  [],
-      _max: 8,
-
-      reset() { this._baseline = null; this._history = []; },
-
-      update(pose) {
-        if (!pose || !pose.valid) return;
-        this._history.push({ yaw: pose.yaw, pitch: pose.pitch });
-        if (this._history.length > this._max) this._history.shift();
-        if (!this._baseline && this._history.length >= 4) {
-          const sl = this._history.slice(-4);
-          this._baseline = {
-            yaw:   sl.reduce((s,p) => s + p.yaw,   0) / sl.length,
-            pitch: sl.reduce((s,p) => s + p.pitch, 0) / sl.length,
-          };
-        }
-      },
-
-      detect(direction, threshold) {
-        if (!this._baseline || this._history.length < 3) return false;
-        const latest = this._history[this._history.length - 1];
-        const dy = latest.yaw   - this._baseline.yaw;
-        const dp = latest.pitch - this._baseline.pitch;
-        switch (direction) {
-          case 'left':  return dy < -threshold;
-          case 'right': return dy >  threshold;
-          case 'up':    return dp < -threshold;
-          case 'down':  return dp >  threshold;
-        }
-        return false;
-      },
-
-      isStill(threshold = 0.06) {
-        if (this._history.length < 3) return false;
-        const r = this._history.slice(-3);
-        const dyaw   = Math.max(...r.map(p => p.yaw))   - Math.min(...r.map(p => p.yaw));
-        const dpitch = Math.max(...r.map(p => p.pitch)) - Math.min(...r.map(p => p.pitch));
-        return dyaw < threshold && dpitch < threshold;
-      },
-    };
+  function ensureModels() {
+    if (_modelsPromise) return _modelsPromise;
+    _modelsPromise = (async () => {
+      if (!global.faceapi) await _injectScript(VENDOR_URL);
+      const fa = global.faceapi;
+      if (!fa) throw new Error('face-api.js not available');
+      // Backend selection. Prefer WebGL (GPU). If WebGL is unavailable (VMs, remote desktops,
+      // GPU-blocklisted laptops, privacy browsers), TF's next priority is 'wasm' — whose binaries
+      // we do NOT ship — so we must explicitly fall back to the pure-JS 'cpu' backend, otherwise
+      // model loading throws and the user sees a generic "engine failed" error.
+      await _selectBackend(fa);
+      await Promise.all([
+        fa.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
+        fa.nets.faceLandmark68Net.loadFromUri(MODEL_URL),
+        fa.nets.faceRecognitionNet.loadFromUri(MODEL_URL),
+      ]);
+      _modelsReady = true;
+      _readyListeners.splice(0).forEach(fn => { try { fn(); } catch (_) {} });
+      return fa;
+    })();
+    _modelsPromise.catch(() => { _modelsPromise = null; });
+    return _modelsPromise;
   }
 
-  // ─── Overlay Renderer ─────────────────────────────────────────────────────────
-  const OverlayRenderer = {
-    draw(canvas, metrics, step, stepDef, progress, stepProgress, state, arrowAnim) {
-      const ctx = canvas.getContext('2d');
-      const w = canvas.width, h = canvas.height;
-      ctx.clearRect(0, 0, w, h);
+  // ─── Helpers ─────────────────────────────────────────────────────────────────
+  const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
+  function euclidean(a, b) { let s = 0; for (let i = 0; i < a.length; i++) { const d = a[i] - b[i]; s += d * d; } return Math.sqrt(s); }
+  function meanDescriptor(list) {
+    const n = list.length, out = new Array(128).fill(0);
+    for (const d of list) for (let i = 0; i < 128; i++) out[i] += d[i];
+    for (let i = 0; i < 128; i++) out[i] /= n;
+    return out;
+  }
+  // Adaptive input size: 320 on capable devices; 224 when inference is slow (keeps the UI responsive
+  // on low-end tablets / software-rendered WebGL / CPU backend). Detection recall at 224 is unchanged
+  // for a face filling >=18% of the frame, which the UX already requires.
+  function detectorOptions(inferMs) {
+    const inputSize = (inferMs && inferMs > 700) ? 224 : 320;
+    return new global.faceapi.TinyFaceDetectorOptions({ inputSize, scoreThreshold: 0.5 });
+  }
 
-      const detected = metrics ? metrics.detected  : false;
-      const q        = metrics ? metrics.quality   : 0;
-      const pose     = metrics ? metrics.headPose  : null;
+  /** Head pose proxies from 68 landmarks. yaw>0 = nose toward image-right (user's left). */
+  function poseFromLandmarks(lm) {
+    const p = lm.positions;
+    const leftJaw = p[0], rightJaw = p[16], nose = p[30], chin = p[8];
+    const eyeL = avgPts(p.slice(36, 42)), eyeR = avgPts(p.slice(42, 48));
+    const eyeC = { x: (eyeL.x + eyeR.x) / 2, y: (eyeL.y + eyeR.y) / 2 };
+    const faceW = Math.max(1, rightJaw.x - leftJaw.x);
+    const yaw   = (nose.x - leftJaw.x) / faceW - 0.5;                    // -0.5..0.5
+    const pitch = (nose.y - eyeC.y) / Math.max(1, chin.y - eyeC.y);       // ~0.35-0.55 neutral
+    const roll  = Math.atan2(eyeR.y - eyeL.y, eyeR.x - eyeL.x);
+    return { yaw, pitch, roll, faceW };
+  }
+  function avgPts(pts) { let x = 0, y = 0; for (const q of pts) { x += q.x; y += q.y; } return { x: x / pts.length, y: y / pts.length }; }
 
-      // Vignette
-      const vg = ctx.createRadialGradient(w/2, h/2, h*0.26, w/2, h/2, h*0.62);
-      vg.addColorStop(0, 'rgba(0,0,0,0)');
-      vg.addColorStop(1, 'rgba(0,0,0,0.60)');
-      ctx.fillStyle = vg; ctx.fillRect(0, 0, w, h);
+  /** Brightness + sharpness sampled from a small downscale of the face box. */
+  function frameQuality(video, box, canvas, ctx) {
+    const w = 64, h = 64;
+    canvas.width = w; canvas.height = h;
+    try {
+      ctx.drawImage(video, box.x, box.y, box.width, box.height, 0, 0, w, h);
+    } catch (_) { return { brightness: 0, sharpness: 0 }; }
+    const d = ctx.getImageData(0, 0, w, h).data;
+    let sum = 0; const lum = new Float32Array(w * h);
+    for (let i = 0, j = 0; i < d.length; i += 4, j++) { const l = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]; lum[j] = l; sum += l; }
+    const brightness = sum / (w * h);
+    let lap = 0, cnt = 0;
+    for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
+      const i = y * w + x;
+      const v = 4 * lum[i] - lum[i - 1] - lum[i + 1] - lum[i - w] - lum[i + w];
+      lap += v * v; cnt++;
+    }
+    return { brightness, sharpness: Math.sqrt(lap / cnt) };
+  }
 
-      const ow = w * 0.37, oh = h * 0.50;
-      const strokeColor = state === 'complete' ? '#10b981' :
-                          state === 'error'    ? '#ef4444' :
-                          detected ? (q >= 70 ? '#10b981' : q >= 45 ? '#f59e0b' : '#6366f1') :
-                          '#374151';
+  function qualityScore(det, video, canvas, ctx) {
+    const box = det.detection.box;
+    const frac = box.width / (video.videoWidth || VIDEO_W);
+    const { brightness, sharpness } = frameQuality(video, box, canvas, ctx);
+    let q = 100;
+    if (frac < MIN_FACE_FRAC) q -= clamp((MIN_FACE_FRAC - frac) * 400, 0, 45);
+    if (brightness < 60)  q -= clamp((60 - brightness) * 0.8, 0, 35);
+    if (brightness > 200) q -= clamp((brightness - 200) * 0.8, 0, 35);
+    if (sharpness < 8)    q -= clamp((8 - sharpness) * 4, 0, 30);
+    q -= clamp((0.9 - det.detection.score) * 60, 0, 25);
+    return { quality: Math.round(clamp(q, 0, 100)), brightness: Math.round(brightness), sharpness: Math.round(sharpness), faceFrac: frac };
+  }
 
-      // Face oval
-      ctx.save();
-      ctx.strokeStyle = strokeColor;
-      ctx.lineWidth   = (state === 'complete') ? 3 : 2;
-      ctx.setLineDash(detected ? [] : [8, 5]);
-      ctx.beginPath();
-      ctx.ellipse(w/2, h/2, ow, oh, 0, 0, Math.PI*2);
-      ctx.stroke();
-      if (detected && state !== 'error') {
-        ctx.strokeStyle = strokeColor + '35';
-        ctx.lineWidth = 9;
-        ctx.setLineDash([]);
-        ctx.beginPath();
-        ctx.ellipse(w/2, h/2, ow+5, oh+5, 0, 0, Math.PI*2);
-        ctx.stroke();
-      }
-      ctx.restore();
-
-      // Corner brackets (always visible)
-      const bx = w/2 - ow, by = h/2 - oh, bw = ow*2, bh = oh*2;
-      const cs = 18;
-      ctx.save();
-      ctx.strokeStyle = detected ? strokeColor : 'rgba(255,255,255,0.25)';
-      ctx.lineWidth = 3; ctx.lineCap = 'round'; ctx.setLineDash([]);
-      [[bx, by, 1, 1], [bx+bw, by, -1, 1], [bx, by+bh, 1, -1], [bx+bw, by+bh, -1, -1]].forEach(([px, py, sx, sy]) => {
-        ctx.beginPath(); ctx.moveTo(px, py + sy*cs); ctx.lineTo(px, py); ctx.lineTo(px + sx*cs, py); ctx.stroke();
-      });
-      ctx.restore();
-
-      // Progress arc
-      if (progress > 0 && state !== 'error') {
-        ctx.save();
-        ctx.strokeStyle = state === 'complete' ? '#10b981' : '#6366f1';
-        ctx.lineWidth = 4; ctx.setLineDash([]);
-        ctx.beginPath();
-        ctx.ellipse(w/2, h/2, ow+9, oh+9, -Math.PI/2, -Math.PI/2,
-                    -Math.PI/2 + Math.PI*2*progress);
-        ctx.stroke();
-        ctx.restore();
-      }
-
-      // Scan sweep when active
-      if (detected && state === 'scanning') {
-        const t = Date.now() / 1000;
-        const sy = (h/2 - oh) + ((Math.sin(t * 1.3)+1)/2) * (oh*2);
-        ctx.save();
-        const sg = ctx.createLinearGradient(w/2-ow, sy, w/2+ow, sy);
-        sg.addColorStop(0, 'rgba(99,102,241,0)');
-        sg.addColorStop(0.5, 'rgba(99,102,241,0.55)');
-        sg.addColorStop(1, 'rgba(99,102,241,0)');
-        ctx.fillStyle = sg; ctx.fillRect(w/2-ow, sy-1, ow*2, 3);
-        ctx.restore();
-      }
-
-      // Step progress bar (top of oval)
-      if (step > 0 && stepProgress > 0) {
-        const bw2 = ow*1.8, bx2 = w/2 - ow*0.9, by2 = h/2 - oh - 16;
-        ctx.save();
-        ctx.fillStyle = 'rgba(255,255,255,0.08)';
-        ctx.beginPath(); if (ctx.roundRect) ctx.roundRect(bx2, by2, bw2, 5, 3); else ctx.rect(bx2, by2, bw2, 5); ctx.fill();
-        ctx.fillStyle = q >= 70 ? '#10b981' : '#f59e0b';
-        ctx.beginPath(); if (ctx.roundRect) ctx.roundRect(bx2, by2, bw2*stepProgress, 5, 3); else ctx.rect(bx2, by2, bw2*stepProgress, 5); ctx.fill();
-        ctx.restore();
-      }
-
-      // Animated direction arrow
-      if (arrowAnim && detected && state === 'scanning') {
-        const t = Date.now() / 1000;
-        const pulse = 0.6 + 0.4 * Math.abs(Math.sin(t * 2.5));
-        ctx.save();
-        ctx.globalAlpha = pulse;
-        ctx.fillStyle   = '#fff';
-        ctx.font        = `bold ${Math.round(w * 0.07)}px system-ui,sans-serif`;
-        ctx.textAlign   = 'center';
-        ctx.textBaseline = 'middle';
-        const arrowMap = { left: '←', right: '→', up: '↑', down: '↓' };
-        const arrow = arrowMap[arrowAnim] || '';
-        const offsets = {
-          left:  { x: w/2 - ow - 22, y: h/2 },
-          right: { x: w/2 + ow + 22, y: h/2 },
-          up:    { x: w/2,            y: h/2 - oh - 22 },
-          down:  { x: w/2,            y: h/2 + oh + 22 },
-        };
-        const off = offsets[arrowAnim];
-        if (off) ctx.fillText(arrow, off.x, off.y);
-        ctx.restore();
-      }
-
-      // Completion tick
-      if (state === 'complete') {
-        ctx.save();
-        ctx.strokeStyle = '#10b981'; ctx.lineWidth = 5; ctx.lineCap = 'round';
-        ctx.beginPath();
-        ctx.moveTo(w/2-22, h/2); ctx.lineTo(w/2-5, h/2+17); ctx.lineTo(w/2+26, h/2-17);
-        ctx.stroke();
-        ctx.restore();
-      }
-    },
-  };
-
-  // ─── Camera Manager ───────────────────────────────────────────────────────────
+  // ─── Camera manager ──────────────────────────────────────────────────────────
   const CameraManager = {
-    async open(opts = {}) {
-      const { videoEl, facingMode = 'user', deviceId, rtspUrl, width = VIDEO_W, height = VIDEO_H } = opts;
-      if (!videoEl) throw new Error('videoEl required');
-      if (videoEl.srcObject) {
-        videoEl.srcObject.getTracks().forEach(t => t.stop());
-        videoEl.srcObject = null;
+    async open({ videoEl, facingMode = 'user', deviceId = null }) {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw { code: 'unsupported', message: 'Camera API not supported in this browser. Use Chrome, Edge or Safari over HTTPS.' };
       }
-      let stream = null;
-      if (rtspUrl) {
-        videoEl.srcObject = null;
-        videoEl.src = rtspUrl;
-        videoEl.crossOrigin = 'anonymous';
-        await new Promise((res, rej) => {
-          videoEl.onloadedmetadata = res;
-          videoEl.onerror = () => rej(new Error('RTSP stream failed'));
-          setTimeout(() => rej(new Error('RTSP timeout')), 12000);
-        });
-      } else {
-        const constraints = {
-          video: {
-            ...(deviceId ? { deviceId: { exact: deviceId } } : { facingMode }),
-            width: { ideal: width }, height: { ideal: height },
-          }, audio: false,
-        };
-        stream = await navigator.mediaDevices.getUserMedia(constraints);
-        videoEl.srcObject = stream;
+      const video = { width: { ideal: VIDEO_W }, height: { ideal: VIDEO_H }, frameRate: { ideal: 30, max: 30 } };
+      if (deviceId) video.deviceId = { exact: deviceId }; else video.facingMode = facingMode;
+      let stream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ video, audio: false });
+      } catch (e) {
+        const n = e && e.name;
+        if (n === 'NotAllowedError' || n === 'PermissionDeniedError') throw { code: 'permission_denied', message: 'Camera access was denied. Allow camera access in your browser settings and try again.' };
+        if (n === 'NotFoundError' || n === 'DevicesNotFoundError')     throw { code: 'no_camera', message: 'No camera found on this device.' };
+        if (n === 'NotReadableError' || n === 'TrackStartError')       throw { code: 'in_use', message: 'The camera is in use by another application.' };
+        if (n === 'OverconstrainedError')                              throw { code: 'unavailable', message: 'The selected camera is unavailable.' };
+        throw { code: 'camera_error', message: 'Could not start camera: ' + (e && e.message || n) };
       }
-      await new Promise((res, rej) => {
-        videoEl.onloadedmetadata = res;
-        setTimeout(() => rej(new Error('Camera metadata timeout')), 10000);
-      });
-      await videoEl.play();
-      return stream || null;
+      videoEl.srcObject = stream;
+      await new Promise((res) => { videoEl.onloadedmetadata = () => { videoEl.play().catch(() => {}); res(); }; setTimeout(res, 2500); });
+      return stream;
     },
-
     stop(videoEl) {
-      if (!videoEl) return;
-      if (videoEl.srcObject) { videoEl.srcObject.getTracks().forEach(t => t.stop()); videoEl.srcObject = null; }
-      if (videoEl.src)       { videoEl.pause(); videoEl.src = ''; }
+      const s = videoEl && videoEl.srcObject;
+      if (s) s.getTracks().forEach(t => t.stop());
+      if (videoEl) videoEl.srcObject = null;
     },
-
-    async enumerate() {
-      try { return (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput'); }
-      catch { return []; }
-    },
+    async listCameras() {
+      try { const d = await navigator.mediaDevices.enumerateDevices(); return d.filter(x => x.kind === 'videoinput'); } catch (_) { return []; }
+    }
   };
 
-  // ─── Enrollment / Verification Session ───────────────────────────────────────
-  // Single unified session factory used for both enrollment and verification.
-  // The only difference is the UI title/label strings.
+  // ─── Overlay rendering ───────────────────────────────────────────────────────
+  function drawOverlay(canvas, m) {
+    const ctx = canvas.getContext('2d');
+    const W = canvas.width, H = canvas.height;
+    ctx.clearRect(0, 0, W, H);
+    const cx = W / 2, cy = H / 2 - H * 0.03, rx = W * 0.23, ry = H * 0.36;
+    // Dim outside oval
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,0.45)';
+    ctx.beginPath(); ctx.rect(0, 0, W, H); ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2); ctx.fill('evenodd');
+    ctx.restore();
+    // Ring
+    const color = m.state === 'success' ? '#22c55e' : m.state === 'error' ? '#ef4444' : m.detected ? (m.quality >= 50 ? '#6366f1' : '#f59e0b') : 'rgba(255,255,255,0.35)';
+    ctx.lineWidth = 3; ctx.strokeStyle = color;
+    ctx.setLineDash(m.detected ? [] : [8, 8]);
+    ctx.beginPath(); ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2); ctx.stroke();
+    ctx.setLineDash([]);
+    // Progress arc
+    if (m.progress > 0) {
+      ctx.lineWidth = 5; ctx.strokeStyle = '#22c55e';
+      ctx.beginPath(); ctx.ellipse(cx, cy, rx + 6, ry + 6, 0, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * m.progress); ctx.stroke();
+    }
+    // Landmark dots (subtle)
+    if (m.landmarks) {
+      ctx.fillStyle = 'rgba(165,180,252,0.8)';
+      const sx = W / m.srcW, sy = H / m.srcH;
+      for (const p of m.landmarks) { ctx.beginPath(); ctx.arc(W - p.x * sx, p.y * sy, 1.4, 0, Math.PI * 2); ctx.fill(); }
+    }
+    // Arrow hint
+    if (m.arrow) {
+      const t = (Date.now() % 900) / 900, off = Math.sin(t * Math.PI) * 10;
+      ctx.fillStyle = 'rgba(255,255,255,0.9)'; ctx.font = 'bold 44px sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      const glyph = { left: '←', right: '→', up: '↑', down: '↓' }[m.arrow];
+      const pos = { left: [cx - rx - 40 - off, cy], right: [cx + rx + 40 + off, cy], up: [cx, cy - ry - 34 - off], down: [cx, cy + ry + 34 + off] }[m.arrow];
+      ctx.fillText(glyph, pos[0], pos[1]);
+    }
+  }
+
+  // ─── Session ─────────────────────────────────────────────────────────────────
   function createSession(cfg, mode) {
     const {
       containerId, onComplete, onError, onProgress, onFaceFound,
-      autoStart = true,
+      autoStart = true, facingMode = 'user', deviceId = null,
       title = mode === 'enroll' ? 'Face Enrollment' : 'Face Verification',
-      showRestartBtn = true,
-      showCancelBtn  = true,
-    } = cfg;
+      showRestartBtn = true, showCancelBtn = true,
+    } = cfg || {};
 
     const container = document.getElementById(containerId);
-    if (!container) {
-      console.error('[FaceAccessCameraEngine v2] Container not found:', containerId);
-      return null;
-    }
+    if (!container) { console.error('[FaceAccessCameraEngine] container not found:', containerId); return null; }
 
-    // ── Build DOM ────────────────────────────────────────────────────────────
+    // DOM
     container.innerHTML = '';
     container.style.cssText = 'position:relative;background:#000;border-radius:14px;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;';
-
     const wrapper = document.createElement('div');
     wrapper.style.cssText = 'position:relative;width:100%;padding-bottom:80%;min-height:200px;';
-
     const video = document.createElement('video');
     video.autoplay = true; video.playsInline = true; video.muted = true;
     video.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;object-fit:cover;transform:scaleX(-1);';
-
-    const overlayCanvas = document.createElement('canvas');
-    overlayCanvas.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;pointer-events:none;';
-
-    // HUD top-bar
+    const overlay = document.createElement('canvas');
+    overlay.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;pointer-events:none;';
     const hud = document.createElement('div');
     hud.style.cssText = 'position:absolute;top:0;left:0;right:0;padding:8px 12px;background:linear-gradient(rgba(0,0,0,0.6),transparent);z-index:10;pointer-events:none;display:flex;justify-content:space-between;align-items:center;';
-    hud.innerHTML = `
-      <div id="_fce_step"  style="font-size:11px;color:rgba(255,255,255,0.85);font-weight:700;">${title}</div>
-      <div id="_fce_qual"  style="font-size:11px;color:rgba(255,255,255,0.45);">Quality: —</div>
-      <div id="_fce_live"  style="font-size:11px;color:rgba(255,255,255,0.45);">Live: —</div>`;
-
-    // Step dots bar (bottom)
-    const dotsBar = document.createElement('div');
-    dotsBar.id = '_fce_dots';
-    dotsBar.style.cssText = 'position:absolute;bottom:10px;left:0;right:0;display:flex;justify-content:center;gap:8px;z-index:10;pointer-events:none;';
-    MOVEMENT_STEPS.forEach((s, i) => {
-      const d = document.createElement('div');
-      d.id = `_fce_dot_${i}`;
-      d.title = s.label;
-      d.style.cssText = 'width:8px;height:8px;border-radius:50%;background:rgba(255,255,255,0.18);transition:all 0.3s;';
-      dotsBar.appendChild(d);
-    });
-
-    // Instruction pill (centered, below oval)
-    const instrPill = document.createElement('div');
-    instrPill.id = '_fce_instr';
-    instrPill.style.cssText = 'position:absolute;left:0;right:0;bottom:30px;display:flex;justify-content:center;z-index:11;pointer-events:none;';
-    instrPill.innerHTML = `<div id="_fce_instr_text" style="background:rgba(0,0,0,0.7);backdrop-filter:blur(8px);border-radius:20px;padding:7px 18px;color:#fff;font-size:13px;font-weight:600;max-width:85%;text-align:center;transition:all 0.25s;"></div>`;
-
-    // Progress pill (top-center)
-    const progPill = document.createElement('div');
-    progPill.id = '_fce_prog';
-    progPill.style.cssText = 'position:absolute;top:36px;left:0;right:0;display:flex;justify-content:center;z-index:11;pointer-events:none;';
-    progPill.innerHTML = `<div id="_fce_prog_text" style="background:rgba(0,0,0,0.55);border-radius:20px;padding:4px 12px;color:rgba(255,255,255,0.65);font-size:10px;font-weight:600;"></div>`;
-
-    // Error/message overlay
-    const msgOverlay = document.createElement('div');
-    msgOverlay.id = '_fce_msg';
-    msgOverlay.style.cssText = 'position:absolute;inset:0;display:none;flex-direction:column;align-items:center;justify-content:center;background:rgba(0,0,0,0.78);z-index:20;padding:20px;text-align:center;';
-
-    wrapper.appendChild(video);
-    wrapper.appendChild(overlayCanvas);
-    wrapper.appendChild(hud);
-    wrapper.appendChild(dotsBar);
-    wrapper.appendChild(instrPill);
-    wrapper.appendChild(progPill);
-    wrapper.appendChild(msgOverlay);
+    hud.innerHTML = `<div class="_fce_step" style="font-size:11px;color:rgba(255,255,255,0.85);font-weight:700;">${title}</div>
+      <div class="_fce_qual" style="font-size:11px;color:rgba(255,255,255,0.45);">Quality: —</div>
+      <div class="_fce_live" style="font-size:11px;color:rgba(255,255,255,0.45);">Engine: loading…</div>`;
+    const dots = document.createElement('div');
+    dots.style.cssText = 'position:absolute;bottom:10px;left:0;right:0;display:flex;justify-content:center;gap:8px;z-index:10;pointer-events:none;';
+    const dotEls = MOVEMENT_STEPS.map(s => { const d = document.createElement('div'); d.title = s.label; d.style.cssText = 'width:8px;height:8px;border-radius:50%;background:rgba(255,255,255,0.18);transition:all .3s;'; dots.appendChild(d); return d; });
+    const instr = document.createElement('div');
+    instr.style.cssText = 'position:absolute;left:0;right:0;bottom:30px;display:flex;justify-content:center;z-index:11;pointer-events:none;';
+    instr.innerHTML = `<div class="_fce_instr" style="background:rgba(0,0,0,0.7);backdrop-filter:blur(8px);border-radius:20px;padding:7px 18px;color:#fff;font-size:13px;font-weight:600;max-width:85%;text-align:center;transition:all .25s;"></div>`;
+    const prog = document.createElement('div');
+    prog.style.cssText = 'position:absolute;top:36px;left:0;right:0;display:flex;justify-content:center;z-index:11;pointer-events:none;';
+    prog.innerHTML = `<div class="_fce_prog" style="background:rgba(0,0,0,0.55);border-radius:20px;padding:4px 12px;color:rgba(255,255,255,0.65);font-size:10px;font-weight:600;"></div>`;
+    const msg = document.createElement('div'); msg.className = '_fce_msg';
+    msg.style.cssText = 'position:absolute;inset:0;display:none;flex-direction:column;align-items:center;justify-content:center;background:rgba(0,0,0,0.82);z-index:20;padding:20px;text-align:center;';
+    [video, overlay, hud, dots, instr, prog, msg].forEach(el => wrapper.appendChild(el));
     container.appendChild(wrapper);
+    const ctrl = document.createElement('div');
+    ctrl.style.cssText = 'display:flex;gap:8px;padding:10px 12px;background:#000;';
+    ctrl.innerHTML = `
+      <button class="_fce_restart" style="flex:1;padding:9px 12px;border-radius:9px;border:none;background:#1e293b;color:#94a3b8;font-size:12px;font-weight:600;cursor:pointer;display:${showRestartBtn ? 'block' : 'none'}">↺ Restart Scan</button>
+      <button class="_fce_start" style="flex:2;padding:9px 12px;border-radius:9px;border:none;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;font-size:13px;font-weight:700;cursor:pointer;">▶ Start Scan</button>
+      <button class="_fce_cancel" style="flex:1;padding:9px 12px;border-radius:9px;border:none;background:#1e293b;color:#64748b;font-size:12px;font-weight:600;cursor:pointer;display:${showCancelBtn ? 'block' : 'none'}">Cancel</button>`;
+    container.appendChild(ctrl);
 
-    // Control bar below camera
-    const ctrlBar = document.createElement('div');
-    ctrlBar.id = '_fce_ctrl';
-    ctrlBar.style.cssText = 'display:flex;gap:8px;padding:10px 12px;background:#000;';
-    ctrlBar.innerHTML = `
-      <button id="_fce_btn_restart" style="flex:1;padding:9px 12px;border-radius:9px;border:none;background:#1e293b;color:#94a3b8;font-size:12px;font-weight:600;cursor:pointer;transition:all 0.2s;display:${showRestartBtn?'block':'none'}">↺ Restart Scan</button>
-      <button id="_fce_btn_start"   style="flex:2;padding:9px 12px;border-radius:9px;border:none;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;font-size:13px;font-weight:700;cursor:pointer;transition:all 0.2s;">▶ Start Scan</button>
-      <button id="_fce_btn_cancel"  style="flex:1;padding:9px 12px;border-radius:9px;border:none;background:#1e293b;color:#64748b;font-size:12px;font-weight:600;cursor:pointer;transition:all 0.2s;display:${showCancelBtn?'block':'none'}">Cancel</button>`;
-    container.appendChild(ctrlBar);
+    const $ = (cls) => container.querySelector('.' + cls);
+    const qCanvas = document.createElement('canvas');
+    const qCtx = qCanvas.getContext('2d', { willReadFrequently: true });
 
-    // ── Internal state ─────────────────────────────────────────────────────
-    const hiddenCanvas = document.createElement('canvas');
-    const hiddenCtx    = hiddenCanvas.getContext('2d', { willReadFrequently: true });
-    const movDet       = makeMovementDetector();
+    // State
+    let state = 'idle';           // idle | loading | detecting | scanning | success | error
+    let tick = null, raf = null, busy = false, destroyed = false;
+    let stepIdx = 0, stepStart = 0, holdStart = 0;
+    let basePose = null, lastSeen = 0, firstDetectAt = 0, faceEverFound = false;
+    let captured = [];            // { step, descriptor, quality, pose }
+    let movementsDetected = 0;
+    let lastDet = null, lastQ = { quality: 0 };
+    let inferMs = 150;            // EMA of detection latency; drives adaptive step timeouts
+    let steadyTicks = 0;          // consecutive steady detections during 'center'
+    const moveWindowMs = () => Math.max(MOVE_TIMEOUT_MS, MIN_TICKS_PER_STEP * (inferMs + TICK_MS));
+    const lostWindowMs = () => Math.max(FACE_LOST_MS, 3 * (inferMs + TICK_MS));
+    let overlayMetrics = { detected: false, quality: 0, progress: 0, state: 'scanning', arrow: null, landmarks: null, srcW: VIDEO_W, srcH: VIDEO_H };
 
-    let stream             = null;
-    let tickTimer          = null;
-    let renderLoop         = null;
-    let state              = 'idle';   // idle|waiting_face|step_N|complete|error
-    let currentStep        = 0;
-    let stepStartTs        = 0;
-    let faceFoundTs        = null;
-    let faceLostTs         = null;     // when face last disappeared
-    let capturedEmbeddings = [];
-    let capturedSteps      = [];
-    let livenessScores     = [];
-    let lastMetrics        = null;
-    let _stepConfirmTs     = null;     // timestamp for brief "✓ Done!" display
+    const setInstr = (t) => { const e = $('_fce_instr'); if (e) e.textContent = t; };
+    const setProg  = (t) => { const e = $('_fce_prog');  if (e) e.textContent = t; };
+    const setQual  = (q) => { const e = $('_fce_qual');  if (e) { e.textContent = 'Quality: ' + (q == null ? '—' : q + '%'); e.style.color = q >= 50 ? '#86efac' : q > 0 ? '#fcd34d' : 'rgba(255,255,255,0.45)'; } };
+    const setLive  = (t, c) => { const e = $('_fce_live'); if (e) { e.textContent = t; e.style.color = c || 'rgba(255,255,255,0.45)'; } };
+    const setDot   = (i, st) => { const d = dotEls[i]; if (!d) return; d.style.background = st === 'done' ? '#22c55e' : st === 'active' ? '#6366f1' : 'rgba(255,255,255,0.18)'; d.style.transform = st === 'active' ? 'scale(1.4)' : 'scale(1)'; };
 
-    // ── DOM helpers ────────────────────────────────────────────────────────
-    function _dot(i, status) {
-      const d = document.getElementById(`_fce_dot_${i}`);
-      if (!d) return;
-      if (status === 'done')   d.style.cssText = 'width:9px;height:9px;border-radius:50%;background:#10b981;box-shadow:0 0 6px #10b981;transition:all 0.3s;';
-      else if (status === 'active') d.style.cssText = 'width:11px;height:11px;border-radius:50%;background:#6366f1;box-shadow:0 0 10px #6366f180;transition:all 0.3s;';
-      else d.style.cssText = 'width:8px;height:8px;border-radius:50%;background:rgba(255,255,255,0.18);transition:all 0.3s;';
-    }
-
-    function _instr(txt, color) {
-      const el = document.getElementById('_fce_instr_text');
-      if (!el) return;
-      el.textContent = txt;
-      el.style.color = color || '#fff';
-    }
-
-    function _prog(txt) {
-      const el = document.getElementById('_fce_prog_text');
-      if (el) el.textContent = txt || '';
-    }
-
-    function _hudUpdate(step, metrics) {
-      const se = document.getElementById('_fce_step');
-      const qe = document.getElementById('_fce_qual');
-      const le = document.getElementById('_fce_live');
-      if (se) se.textContent = state === 'waiting_face' ? title : `Step ${step+1} / ${MOVEMENT_STEPS.length}`;
-      if (qe && metrics) qe.textContent = `Quality: ${metrics.quality}%`;
-      if (le && metrics) {
-        const sc = metrics.antiSpoof?.score || 0;
-        le.textContent = metrics.antiSpoof?.lowLightMode ? 'Live: low-light' : `Live: ${Math.round(sc*100)}%`;
-      }
-    }
-
-    function _showMsg(icon, titleTxt, subTxt, buttons) {
-      // buttons: array of { label, style, onClick }
-      msgOverlay.style.display = 'flex';
-      msgOverlay.innerHTML = `
-        <div style="font-size:38px;margin-bottom:10px;">${icon}</div>
-        <div style="color:#fff;font-weight:700;font-size:15px;margin-bottom:6px;">${titleTxt}</div>
-        <div style="color:rgba(255,255,255,0.5);font-size:12px;margin-bottom:20px;max-width:280px;">${subTxt}</div>
-        ${(buttons||[]).map((b,i) => `<button id="_fce_msgbtn_${i}" style="display:block;width:100%;max-width:240px;margin:4px auto;padding:10px 20px;border-radius:10px;border:none;font-size:13px;font-weight:700;cursor:pointer;${b.style||'background:#6366f1;color:#fff;'}">${b.label}</button>`).join('')}`;
-      if (buttons) {
-        setTimeout(() => {
-          buttons.forEach((b, i) => {
-            const btn = document.getElementById(`_fce_msgbtn_${i}`);
-            if (btn && b.onClick) btn.onclick = b.onClick;
-          });
-        }, 40);
-      }
-    }
-
-    function _hideMsg() { msgOverlay.style.display = 'none'; }
-
-    function _setCtrlBtn(id, label, disabled, bg) {
-      const b = document.getElementById(id);
-      if (!b) return;
-      if (label !== undefined) b.textContent = label;
-      if (disabled !== undefined) b.disabled = disabled;
-      if (bg) b.style.background = bg;
-    }
-
-    // ── Session logic ──────────────────────────────────────────────────────
-    function _advanceStep() {
-      currentStep++;
-      if (currentStep >= MOVEMENT_STEPS.length) {
-        _finish(); return;
-      }
-      movDet.reset();
-      stepStartTs = Date.now();
-      state = `step_${currentStep}`;
-      _dot(currentStep, 'active');
-      _instr(MOVEMENT_STEPS[currentStep].instruction);
-      _prog(`Step ${currentStep+1} of ${MOVEMENT_STEPS.length} · Scan Progress: ${Math.round(currentStep/MOVEMENT_STEPS.length*100)}%`);
-      if (onProgress) onProgress(currentStep, MOVEMENT_STEPS.length, MOVEMENT_STEPS[currentStep]);
-    }
-
-    function _stepDone(sIdx) {
-      // Brief visual confirmation
-      _instr(`✓ ${MOVEMENT_STEPS[sIdx].label} done!`, '#10b981');
-      _dot(sIdx, 'done');
-      _stepConfirmTs = Date.now();
-    }
-
-    function _finish() {
-      state = 'complete';
-      clearInterval(tickTimer);
-      cancelAnimationFrame(renderLoop);
-
-      const merged = new Array(EMB_DIMS).fill(0);
-      capturedEmbeddings.forEach(e => { for (let i = 0; i < EMB_DIMS; i++) merged[i] += e[i] / capturedEmbeddings.length; });
-      const finalEmb = l2norm(merged);
-      const avgLiveness  = livenessScores.length > 0 ? livenessScores.reduce((a,b)=>a+b)/livenessScores.length : 0.78;
-      const quality      = lastMetrics ? lastMetrics.quality : 72;
-
-      MOVEMENT_STEPS.forEach((_, i) => _dot(i, 'done'));
-      _instr('✓ Scan complete!', '#10b981');
-      _prog('All steps complete');
-
-      // Update start button to "Done"
-      _setCtrlBtn('_fce_btn_start', '✓ Complete', true, 'linear-gradient(135deg,#10b981,#059669)');
-      const rBtn = document.getElementById('_fce_btn_restart');
-      if (rBtn) rBtn.style.display = 'none';
-
-      if (onComplete) onComplete({
-        embedding:      finalEmb,
-        livenessScore:  avgLiveness,
-        antiSpoofScore: avgLiveness,
-        quality,
-        averageQuality: quality,
-        steps:          capturedSteps,
-        capturedAngles: capturedSteps.map(s => s.id),
-        capturedSteps:  capturedSteps.length,
+    function showPanel(icon, titleTxt, body, buttons) {
+      msg.style.display = 'flex';
+      msg.innerHTML = `<div style="font-size:40px;margin-bottom:8px">${icon}</div>
+        <div style="color:#fff;font-weight:700;font-size:15px;margin-bottom:6px">${titleTxt}</div>
+        <div style="color:rgba(255,255,255,0.6);font-size:12.5px;max-width:320px;line-height:1.5;margin-bottom:16px">${body}</div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:center"></div>`;
+      const row = msg.lastElementChild;
+      (buttons || []).forEach(b => {
+        const btn = document.createElement('button');
+        btn.textContent = b.label;
+        btn.style.cssText = `padding:8px 16px;border-radius:8px;border:none;font-size:12px;font-weight:700;cursor:pointer;${b.primary ? 'background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff' : 'background:#1e293b;color:#94a3b8'}`;
+        btn.onclick = b.onClick; row.appendChild(btn);
       });
+    }
+    const hidePanel = () => { msg.style.display = 'none'; msg.innerHTML = ''; };
 
-      setTimeout(() => CameraManager.stop(video), 3500);
+    function fail(code, message, opts = {}) {
+      state = 'error'; stopLoops();
+      overlayMetrics.state = 'error';
+      showPanel('⚠️', opts.title || 'Scan interrupted', message, [
+        { label: '↺ Restart Scan', primary: true, onClick: restart },
+        ...(showCancelBtn ? [{ label: 'Cancel', onClick: cancel }] : []),
+      ]);
+      if (onError) { try { onError({ code, message }); } catch (_) {} }
     }
 
-    function _tick() {
-      if (!video || video.readyState < 2) return;
-      const metrics = FrameAnalyzer.analyze(video, hiddenCanvas, hiddenCtx);
-      lastMetrics   = metrics;
-      movDet.update(metrics.headPose);
-      _hudUpdate(currentStep, metrics);
+    function stopLoops() { if (tick) { clearInterval(tick); tick = null; } if (raf) { cancelAnimationFrame(raf); raf = null; } }
 
-      // ── State: waiting_face ─────────────────────────────────────────────
-      if (state === 'waiting_face') {
-        if (metrics.detected) {
-          faceLostTs = null;
-          if (!faceFoundTs) { faceFoundTs = Date.now(); if (onFaceFound) onFaceFound(); }
-          if (movDet.isStill() && Date.now() - faceFoundTs > STILL_HOLD_MS) {
-            _dot(0, 'done');
-            capturedEmbeddings.push(generateEmbedding(video, hiddenCanvas, hiddenCtx));
-            capturedSteps.push({ id: 'center', ts: Date.now() });
-            if (metrics.antiSpoof) livenessScores.push(metrics.antiSpoof.score);
-            _stepDone(0);
-            setTimeout(_advanceStep, 600);
-          } else {
-            _instr('Hold still — centering…');
-          }
-        } else {
-          faceFoundTs = null;
-          if (Date.now() - stepStartTs > FACE_DETECT_MS) {
-            _showMsg('😐', 'No face detected',
-              'Center your face in the oval. Ensure you have good lighting.',
-              [
-                { label: 'Try Again', style: 'background:#6366f1;color:#fff;', onClick: () => { _hideMsg(); faceFoundTs = null; stepStartTs = Date.now(); }},
-                { label: '↺ Restart Scan', style: 'background:#1e293b;color:#94a3b8;', onClick: _restartScan },
-              ]);
-          }
-        }
-        return;
-      }
-
-      // ── State: step_N ───────────────────────────────────────────────────
-      if (state.startsWith('step_')) {
-        const sIdx    = parseInt(state.replace('step_', ''), 10);
-        const stepDef = MOVEMENT_STEPS[sIdx];
-        const elapsed = Date.now() - stepStartTs;
-        const stepProg = Math.min(1, elapsed / MOVE_TIMEOUT_MS);
-
-        if (!metrics.detected) {
-          // Stable face-lost gating: only trigger after FACE_LOST_HOLD_MS
-          if (!faceLostTs) faceLostTs = Date.now();
-          if (Date.now() - faceLostTs > FACE_LOST_HOLD_MS) {
-            // Face truly lost
-            _showMsg('😐', "We lost sight of your face…",
-              'Please move back into the camera frame to continue.',
-              [
-                { label: '▶ Resume Scan', style: 'background:#6366f1;color:#fff;', onClick: () => { _hideMsg(); faceLostTs = null; stepStartTs = Date.now(); }},
-                { label: '↺ Restart Scan', style: 'background:#1e293b;color:#94a3b8;', onClick: _restartScan },
-                { label: 'Cancel Enrollment', style: 'background:#1e293b;color:#64748b;', onClick: _cancelSession },
-              ]);
-          }
-          return;
-        }
-        faceLostTs = null;
-
-        // During brief "✓ Done!" display, pause tick logic
-        if (_stepConfirmTs && Date.now() - _stepConfirmTs < 600) return;
-        _stepConfirmTs = null;
-
-        const moved = movDet.detect(stepDef.direction, stepDef.moveThreshold);
-        if (moved) {
-          capturedEmbeddings.push(generateEmbedding(video, hiddenCanvas, hiddenCtx));
-          capturedSteps.push({ id: stepDef.id, ts: Date.now() });
-          if (metrics.antiSpoof) livenessScores.push(metrics.antiSpoof.score);
-          _stepDone(sIdx);
-          setTimeout(_advanceStep, 600);
-        } else if (elapsed > MOVE_TIMEOUT_MS) {
-          // Timeout — capture anyway and advance
-          capturedEmbeddings.push(generateEmbedding(video, hiddenCanvas, hiddenCtx));
-          capturedSteps.push({ id: stepDef.id, ts: Date.now(), timedOut: true });
-          if (metrics.antiSpoof) livenessScores.push(metrics.antiSpoof.score * 0.88);
-          _stepDone(sIdx);
-          setTimeout(_advanceStep, 600);
-        } else {
-          _instr(stepDef.instruction);
-        }
-      }
+    function renderLoop() {
+      if (destroyed) return;
+      if (overlay.width !== overlay.clientWidth || overlay.height !== overlay.clientHeight) { overlay.width = overlay.clientWidth || 640; overlay.height = overlay.clientHeight || 512; }
+      drawOverlay(overlay, overlayMetrics);
+      raf = requestAnimationFrame(renderLoop);
     }
 
-    function _renderFrame() {
-      if (state === 'idle' || state === 'complete') return;
-      const sIdx = state === 'waiting_face' ? 0 : parseInt(state.replace('step_', ''), 10);
-      const stepDef = MOVEMENT_STEPS[sIdx] || MOVEMENT_STEPS[MOVEMENT_STEPS.length-1];
-      const totalProg = capturedSteps.length / MOVEMENT_STEPS.length;
-      const stepProg  = state === 'waiting_face' ? 0 : Math.min(1, (Date.now() - stepStartTs) / MOVE_TIMEOUT_MS);
-
-      // Sync overlay canvas size to CSS size
-      const canW = overlayCanvas.offsetWidth  || VIDEO_W;
-      const canH = overlayCanvas.offsetHeight || VIDEO_H;
-      if (overlayCanvas.width !== canW || overlayCanvas.height !== canH) {
-        overlayCanvas.width = canW; overlayCanvas.height = canH;
-      }
-
-      OverlayRenderer.draw(
-        overlayCanvas, lastMetrics, sIdx, stepDef,
-        totalProg, stepProg,
-        state === 'waiting_face' ? 'scanning' : 'scanning',
-        stepDef.arrowAnim,
-      );
-      renderLoop = requestAnimationFrame(_renderFrame);
-    }
-
-    // ── Start / Stop / Restart / Cancel ───────────────────────────────────
-    async function _startCamera() {
-      _setCtrlBtn('_fce_btn_start', '⏳ Opening camera…', true);
-      _instr('Opening camera…');
+    async function start() {
+      if (destroyed) return;
+      hidePanel();
+      state = 'loading';
+      $('_fce_start').style.display = 'none';
+      setInstr('Loading face recognition models…');
+      setProg('');
       try {
-        stream = await CameraManager.open({
-          videoEl:    video,
-          facingMode: cfg.facingMode || 'user',
-          deviceId:   cfg.deviceId,
-          rtspUrl:    cfg.rtspUrl,
-        });
-        _hideMsg();
-        state       = 'waiting_face';
-        stepStartTs = Date.now();
-        faceFoundTs = null;
-        faceLostTs  = null;
-        currentStep = 0;
-        capturedEmbeddings = [];
-        capturedSteps      = [];
-        livenessScores     = [];
-        movDet.reset();
-        _dot(0, 'active');
-        _instr(MOVEMENT_STEPS[0].instruction);
-        _prog(`Step 1 of ${MOVEMENT_STEPS.length} · Scan Progress: 0%`);
-        _setCtrlBtn('_fce_btn_start', '⏸ Scanning…', true, 'linear-gradient(135deg,#475569,#334155)');
-        clearInterval(tickTimer);
-        cancelAnimationFrame(renderLoop);
-        tickTimer = setInterval(_tick, TICK_MS);
-        _renderFrame();
-        if (onProgress) onProgress(0, MOVEMENT_STEPS.length, MOVEMENT_STEPS[0]);
-      } catch (err) {
-        const msg = err.name === 'NotAllowedError'     ? 'Camera permission denied. Please allow access in browser settings and retry.' :
-                    err.name === 'NotFoundError'        ? 'No camera found. Connect a camera and try again.' :
-                    err.name === 'NotReadableError'     ? 'Camera is in use by another application. Close it and retry.' :
-                    err.name === 'OverconstrainedError' ? 'Camera resolution not supported. Try a different camera.' :
-                                                          'Camera error: ' + err.message;
-        _showMsg('🚫', 'Camera Error', msg, [
-          { label: '↺ Retry', style: 'background:#6366f1;color:#fff;', onClick: () => { _hideMsg(); _startCamera(); }},
-          { label: 'Cancel', style: 'background:#1e293b;color:#64748b;', onClick: _cancelSession },
-        ]);
-        _setCtrlBtn('_fce_btn_start', '▶ Start Scan', false, 'linear-gradient(135deg,#6366f1,#8b5cf6)');
-        state = 'error';
-        if (onError) onError(err);
+        await Promise.all([ensureModels(), CameraManager.open({ videoEl: video, facingMode, deviceId })]);
+      } catch (e) {
+        const err = e && e.code ? e : { code: 'model_load_failed', message: 'Could not load the face recognition engine' + (e && e.message ? ' (' + e.message + ')' : '') + '. Check your connection and retry.' };
+        // Expected device conditions (no camera / user denied) are warnings; real engine failures are errors.
+        const expected = err.code === 'no_camera' || err.code === 'permission_denied' || err.code === 'in_use' || err.code === 'unavailable' || err.code === 'insecure_context';
+        (expected ? console.warn : console.error)('[FaceAccessCameraEngine] start failed:', err.code, err.message);
+        return fail(err.code, err.message, { title: err.code === 'permission_denied' ? 'Camera blocked' : 'Cannot start' });
       }
+      if (destroyed) return;
+      setLive('Engine: ready', '#86efac');
+      resetScan();
+      state = 'detecting';
+      firstDetectAt = Date.now();
+      setInstr('Position your face inside the oval');
+      raf = requestAnimationFrame(renderLoop);
+      tick = setInterval(onTick, TICK_MS);
     }
 
-    function _restartScan() {
-      _hideMsg();
-      clearInterval(tickTimer);
-      cancelAnimationFrame(renderLoop);
-      if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
-      // Reset all state
-      state              = 'idle';
-      currentStep        = 0;
-      capturedEmbeddings = [];
-      capturedSteps      = [];
-      livenessScores     = [];
-      faceFoundTs        = null;
-      faceLostTs         = null;
-      _stepConfirmTs     = null;
-      movDet.reset();
-      MOVEMENT_STEPS.forEach((_, i) => _dot(i, ''));
-      _instr('');
-      _prog('');
-      _setCtrlBtn('_fce_btn_start', '▶ Start Scan', false, 'linear-gradient(135deg,#6366f1,#8b5cf6)');
-      const rBtn = document.getElementById('_fce_btn_restart');
-      if (rBtn) rBtn.style.display = 'block';
-      // Clear overlay
-      const ctx2 = overlayCanvas.getContext('2d');
-      if (ctx2) ctx2.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+    function resetScan() {
+      stepIdx = 0; stepStart = 0; holdStart = 0; basePose = null; captured = []; movementsDetected = 0; faceEverFound = false;
+      lastSeen = 0; lastDet = null; lastQ = { quality: 0 }; steadyTicks = 0;
+      overlayMetrics = { detected: false, quality: 0, progress: 0, state: 'scanning', arrow: null, landmarks: null, srcW: VIDEO_W, srcH: VIDEO_H };
+      dotEls.forEach((_, i) => setDot(i, 'idle'));
+      setQual(null); setProg('');
     }
 
-    function _cancelSession() {
-      _restartScan();
-      if (cfg.onSkip) cfg.onSkip();
-      else if (onError) onError(new Error('cancelled'));
+    function restart() { stopLoops(); hidePanel(); resetScan(); if (video.srcObject) { state = 'detecting'; firstDetectAt = Date.now(); setInstr('Position your face inside the oval'); raf = requestAnimationFrame(renderLoop); tick = setInterval(onTick, TICK_MS); } else start(); }
+    function cancel() { destroy(); if (onError) { try { onError({ code: 'cancelled', message: 'Scan cancelled' }); } catch (_) {} } }
+    function destroy() { destroyed = true; stopLoops(); CameraManager.stop(video); state = 'idle'; }
+
+    async function onTick() {
+      if (busy || destroyed || state === 'error' || state === 'success' || video.readyState < 2) return;
+      busy = true;
+      try {
+        const fa = global.faceapi;
+        const tInfer = Date.now();
+        const dets = await fa.detectAllFaces(video, detectorOptions(inferMs)).withFaceLandmarks();
+        inferMs = inferMs * 0.6 + (Date.now() - tInfer) * 0.4;
+        const nowT = Date.now();
+        overlayMetrics.srcW = video.videoWidth || VIDEO_W; overlayMetrics.srcH = video.videoHeight || VIDEO_H;
+
+        if (dets.length > 1) {
+          overlayMetrics.detected = false; overlayMetrics.landmarks = null;
+          setInstr('Multiple faces detected — only one person in frame please');
+          busy = false; return;
+        }
+        const det = dets[0];
+        if (!det) {
+          overlayMetrics.detected = false; overlayMetrics.landmarks = null; setQual(null);
+          if (!faceEverFound) {
+            if (nowT - firstDetectAt > FACE_DETECT_MS) return fail('no_face', 'No face was detected. Make sure your face is well lit and centered in the oval.', { title: 'No face detected' });
+          } else if (lastSeen && nowT - lastSeen > lostWindowMs()) {
+            if (state === 'scanning') return fail('face_lost', 'Your face left the frame. Please keep your face inside the oval during the scan.', { title: 'Face lost' });
+          }
+          busy = false; return;
+        }
+
+        lastDet = det; lastSeen = nowT;
+        const q = qualityScore(det, video, qCanvas, qCtx);
+        lastQ = q; setQual(q.quality);
+        const pose = poseFromLandmarks(det.landmarks);
+        overlayMetrics.detected = true; overlayMetrics.quality = q.quality; overlayMetrics.landmarks = det.landmarks.positions;
+
+        if (!faceEverFound) { faceEverFound = true; if (onFaceFound) { try { onFaceFound(); } catch (_) {} } }
+
+        if (state === 'detecting') {
+          if (q.faceFrac < MIN_FACE_FRAC) { setInstr('Move closer to the camera'); busy = false; return; }
+          if (q.brightness < 50) { setInstr('Too dark — find better lighting'); busy = false; return; }
+          state = 'scanning'; stepIdx = 0; stepStart = nowT; holdStart = nowT; setDot(0, 'active');
+          setInstr(MOVEMENT_STEPS[0].instruction);
+          if (onProgress) { try { onProgress(0, MOVEMENT_STEPS.length, MOVEMENT_STEPS[0]); } catch (_) {} }
+        }
+
+        if (state !== 'scanning') { busy = false; return; }
+        const step = MOVEMENT_STEPS[stepIdx];
+        overlayMetrics.arrow = step.arrowAnim;
+        setProg(`Step ${stepIdx + 1} of ${MOVEMENT_STEPS.length} · ${Math.round((stepIdx / MOVEMENT_STEPS.length) * 100)}%`);
+
+        if (step.id === 'center') {
+          // must hold still & steady for holdMs; accumulate baseline pose
+          if (q.faceFrac < MIN_FACE_FRAC || q.quality < 35) { holdStart = nowT; setInstr(q.faceFrac < MIN_FACE_FRAC ? 'Move closer to the camera' : 'Hold still — improve lighting'); busy = false; return; }
+          if (!basePose) basePose = { yaw: pose.yaw, pitch: pose.pitch, n: 1 };
+          else { basePose.yaw = (basePose.yaw * basePose.n + pose.yaw) / (basePose.n + 1); basePose.pitch = (basePose.pitch * basePose.n + pose.pitch) / (basePose.n + 1); basePose.n++; }
+          // Steadiness: compare against the running baseline; tolerance widens slightly on slow devices
+          // where frames are further apart. A single jittery frame downgrades the count rather than resetting it.
+          const tol = inferMs > 600 ? 1.6 : 1.0;
+          const steady = Math.abs(pose.yaw - basePose.yaw) <= 0.06 * tol && Math.abs(pose.pitch - basePose.pitch) <= 0.05 * tol;
+          if (steady) steadyTicks++; else { steadyTicks = Math.max(0, steadyTicks - 1); if (steadyTicks === 0) holdStart = nowT; setInstr('Hold still…'); }
+          const held = nowT - holdStart;
+          const holdDone = held >= step.holdMs && steadyTicks >= Math.min(MIN_HOLD_TICKS, Math.ceil(step.holdMs / (inferMs + TICK_MS)));
+          overlayMetrics.progress = clamp(Math.max(held / step.holdMs, steadyTicks / MIN_HOLD_TICKS), 0, 1) / MOVEMENT_STEPS.length;
+          if (holdDone) {
+            const d = await computeDescriptor(); if (!d) { holdStart = nowT; busy = false; return; }
+            captured.push({ step: 'center', descriptor: d, quality: q.quality, pose: { yaw: pose.yaw, pitch: pose.pitch } });
+            advance(nowT, true);
+          }
+        } else {
+          const dy = pose.yaw - basePose.yaw, dp = pose.pitch - basePose.pitch;
+          let moved = false;
+          if (step.id === 'left')  moved = dy >  YAW_THRESHOLD;
+          if (step.id === 'right') moved = dy < -YAW_THRESHOLD;
+          if (step.id === 'up')    moved = dp < -PITCH_THRESHOLD;
+          if (step.id === 'down')  moved = dp >  PITCH_THRESHOLD;
+          const elapsed = nowT - stepStart;
+          const windowMs = moveWindowMs();
+          overlayMetrics.progress = (stepIdx + clamp(elapsed / windowMs, 0, 0.95)) / MOVEMENT_STEPS.length;
+          if (moved) {
+            movementsDetected++;
+            const d = await computeDescriptor();
+            if (d) captured.push({ step: step.id, descriptor: d, quality: q.quality, pose: { yaw: pose.yaw, pitch: pose.pitch } });
+            advance(nowT, true);
+          } else if (elapsed > windowMs) {
+            advance(nowT, false);
+          }
+        }
+      } catch (e) {
+        console.warn('[FaceAccessCameraEngine] tick error', e);
+      } finally { busy = false; }
     }
 
-    // ── Wire up control buttons ────────────────────────────────────────────
-    setTimeout(() => {
-      const btnStart   = document.getElementById('_fce_btn_start');
-      const btnRestart = document.getElementById('_fce_btn_restart');
-      const btnCancel  = document.getElementById('_fce_btn_cancel');
-      if (btnStart)   btnStart.onclick   = () => { if (state === 'idle') _startCamera(); };
-      if (btnRestart) btnRestart.onclick = _restartScan;
-      if (btnCancel)  btnCancel.onclick  = _cancelSession;
-      if (autoStart) _startCamera();
-    }, 50);
+    async function computeDescriptor() {
+      try {
+        const fa = global.faceapi;
+        const r = await fa.detectSingleFace(video, detectorOptions(inferMs)).withFaceLandmarks().withFaceDescriptor();
+        return r ? Array.from(r.descriptor) : null;
+      } catch (_) { return null; }
+    }
 
-    // ── Public session API ─────────────────────────────────────────────────
+    function advance(nowT, ok) {
+      setDot(stepIdx, ok ? 'done' : 'idle');
+      if (ok) { setInstr('✓ Done!'); }
+      stepIdx++;
+      if (stepIdx >= MOVEMENT_STEPS.length) return finish();
+      stepStart = nowT; holdStart = nowT;
+      setDot(stepIdx, 'active');
+      const s = MOVEMENT_STEPS[stepIdx];
+      setTimeout(() => { if (state === 'scanning') setInstr(s.instruction); }, ok ? 450 : 0);
+      if (onProgress) { try { onProgress(stepIdx, MOVEMENT_STEPS.length, s); } catch (_) {} }
+    }
+
+    function finish() {
+      stopLoops();
+      overlayMetrics.arrow = null; overlayMetrics.progress = 1;
+      const centerCaps = captured.filter(c => c.step === 'center');
+      if (!centerCaps.length) return fail('no_descriptor', 'We could not compute a face signature. Please retry with better lighting.', { title: 'Scan incomplete' });
+      if (movementsDetected < MIN_MOVEMENTS) {
+        return fail('liveness_failed', `Liveness check failed (${movementsDetected} of 4 head movements detected). Follow the on-screen arrows and move your head clearly.`, { title: 'Liveness check failed' });
+      }
+      // Reject inconsistent captures (e.g. person swapped mid-scan)
+      const center = centerCaps[0].descriptor;
+      const consistent = captured.filter(c => euclidean(c.descriptor, center) < 0.6);
+      const descriptors = consistent.map(c => c.descriptor);
+      const primary = meanDescriptor(descriptors);
+      const avgQ = Math.round(consistent.reduce((s, c) => s + c.quality, 0) / consistent.length);
+      const livenessScore = [0.15, 0.4, 0.72, 0.86, 0.95][movementsDetected] || 0.95;
+      const antiSpoof = clamp(0.55 + 0.1 * movementsDetected + (consistent.length === captured.length ? 0.05 : -0.15), 0, 0.99);
+
+      state = 'success'; overlayMetrics.state = 'success';
+      drawOverlay(overlay, overlayMetrics);
+      setInstr(mode === 'enroll' ? '✓ Face captured' : '✓ Verifying…');
+      setProg('Step 5 of 5 · 100%');
+      setLive('Engine: ' + ENGINE_NAME, '#86efac');
+      CameraManager.stop(video);
+
+      const result = {
+        descriptor: primary,
+        descriptors,
+        embedding: primary,                       // backwards-compatible alias
+        livenessScore: Number(livenessScore.toFixed(2)),
+        antiSpoofScore: Number(antiSpoof.toFixed(2)),
+        quality: avgQ, averageQuality: avgQ,
+        steps: MOVEMENT_STEPS.length,
+        capturedAngles: consistent.length,
+        capturedSteps: consistent.map(c => c.step),
+        movementsDetected,
+        engine: ENGINE_NAME, version: VERSION,
+      };
+      if (onComplete) { try { onComplete(result); } catch (e) { console.error(e); } }
+    }
+
+    // Wire buttons
+    $('_fce_start').onclick   = start;
+    $('_fce_restart').onclick = restart;
+    $('_fce_cancel').onclick  = cancel;
+    ensureModels().then(() => setLive('Engine: ready' + (_backend && _backend !== 'webgl' ? ' (CPU)' : ''), '#86efac')).catch((e) => { console.error('[FaceAccessCameraEngine] model load failed:', e); setLive('Engine: failed to load', '#fca5a5'); });
+    if (autoStart) setTimeout(start, 50);
+
     return {
-      start:  _startCamera,
-      restart: _restartScan,
-      stop() {
-        clearInterval(tickTimer);
-        cancelAnimationFrame(renderLoop);
-        CameraManager.stop(video);
-        state = 'idle';
-      },
-      getStream()  { return stream;      },
-      getState()   { return state;       },
-      getMetrics() { return lastMetrics; },
+      start, restart, stop: destroy, destroy,
+      getState: () => state,
+      getStream: () => video.srcObject,
+      getMetrics: () => ({ detected: overlayMetrics.detected, quality: lastQ.quality, step: stepIdx, captured: captured.length, movementsDetected, inferMs: Math.round(inferMs), backend: _backend }),
     };
   }
 
-  // ─── Public factory functions ─────────────────────────────────────────────────
-  function createEnrollmentSession(cfg) {
-    return createSession(cfg, 'enroll');
+  // ─── Standalone helpers ──────────────────────────────────────────────────────
+  async function detectFace(videoOrImg) {
+    await ensureModels();
+    const r = await global.faceapi.detectSingleFace(videoOrImg, detectorOptions()).withFaceLandmarks();
+    return r ? { detected: true, box: r.detection.box, score: r.detection.score, landmarks: r.landmarks.positions, pose: poseFromLandmarks(r.landmarks) } : { detected: false };
+  }
+  async function computeDescriptor(videoOrImg) {
+    await ensureModels();
+    const r = await global.faceapi.detectSingleFace(videoOrImg, detectorOptions()).withFaceLandmarks().withFaceDescriptor();
+    return r ? Array.from(r.descriptor) : null;
   }
 
-  function createVerificationSession(cfg) {
-    return createSession(cfg, 'verify');
-  }
-
-  // ─── Simple camera preview (no overlay) ─────────────────────────────────────
-  async function openCamera(opts) {
-    const { videoEl } = opts;
-    if (!videoEl) throw new Error('[FaceAccessCameraEngine] videoEl required');
-    return CameraManager.open(opts);
-  }
-
-  function stopCamera(videoEl) { CameraManager.stop(videoEl); }
-
-  // ─── Standalone frame analysis / embedding ───────────────────────────────────
-  function analyzeFrame(video, canvas, ctx) { return FrameAnalyzer.analyze(video, canvas, ctx); }
-  function getEmbedding(video, canvas, ctx)  { return generateEmbedding(video, canvas, ctx);    }
-  function drawOverlay(canvas, metrics, opts) {
-    OverlayRenderer.draw(canvas, metrics,
-      opts?.step || 0, opts?.stepDef || null,
-      opts?.progress || 0, opts?.stepProgress || 0,
-      opts?.state || 'scanning', opts?.arrowAnim || null);
-  }
-
-  // ─── Public API ───────────────────────────────────────────────────────────────
   const FaceAccessCameraEngine = {
-    VERSION,
-    MOVEMENT_STEPS,
-
-    // High-level sessions
-    createEnrollmentSession,
-    createVerificationSession,
-
-    // Camera management
-    openCamera,
-    stopCamera,
-    CameraManager,
-
-    // Frame processing
-    analyzeFrame,
-    getEmbedding,
-    drawOverlay,
-    FrameAnalyzer,
-    OverlayRenderer,
-
-    // Math utilities
-    cosineSim,
-    l2norm,
+    VERSION, ENGINE_NAME, MOVEMENT_STEPS,
+    createEnrollmentSession:   (cfg) => createSession(cfg, 'enroll'),
+    createVerificationSession: (cfg) => createSession(cfg, 'verify'),
+    openCamera: (opts) => CameraManager.open(opts),
+    stopCamera: (videoEl) => CameraManager.stop(videoEl),
+    listCameras: () => CameraManager.listCameras(),
+    ready: ensureModels,
+    isReady: () => _modelsReady,
+    getBackend: () => _backend,
+    onReady: (fn) => { if (_modelsReady) fn(); else _readyListeners.push(fn); },
+    detectFace, computeDescriptor,
+    getEmbedding: computeDescriptor,           // async in v3
+    analyzeFrame: detectFace,                  // async in v3
+    euclidean, drawOverlay,
   };
 
   global.FaceAccessCameraEngine = FaceAccessCameraEngine;
-  console.log(`[FaceAccessCameraEngine v${VERSION}] Loaded — stable tracking, animated prompts, full button control`);
-
-}(window));
+  console.log(`[FaceAccessCameraEngine] v${VERSION} — ${ENGINE_NAME}`);
+})(typeof window !== 'undefined' ? window : this);

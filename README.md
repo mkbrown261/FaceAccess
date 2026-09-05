@@ -1,315 +1,212 @@
-# FaceAccess — AI-Enhanced Facial Recognition Access Control System v4.2
+# FaceAccess Business — Facial Recognition Access Control
 
-## Project Overview
-A complete facial recognition-based access control system with a **multi-model biometric pipeline** (ArcFace + InsightFace + FaceNet), AI Trust Engine v4, predictive behavioral analysis, real-time anomaly detection, a **dedicated internal Developer Testing Lab**, and a full **legal compliance framework** covering privacy, biometrics, SMS, and AI transparency.
+Multi-tenant access-control console for businesses. Each customer gets an isolated
+**organization** with its own people, doors, permissions, access logs, team accounts and
+recognition settings. Face matching runs on real 128-dimensional face descriptors — no
+demo data, no fake fallbacks.
 
-**Production:** [https://faceaccess.pages.dev](https://faceaccess.pages.dev)  
-**Home Dashboard:** [https://faceaccess.pages.dev/home/dashboard](https://faceaccess.pages.dev/home/dashboard)  
-**Mobile App:** [https://faceaccess.pages.dev/home/mobile](https://faceaccess.pages.dev/home/mobile)  
-**🔬 Dev Lab:** [https://faceaccess.pages.dev/dev-lab](https://faceaccess.pages.dev/dev-lab)
+- **Stack:** Cloudflare Pages + Hono (TypeScript) + D1 (SQLite) · vanilla JS frontend
+- **Face engine (browser):** [`@vladmandic/face-api`](https://github.com/vladmandic/face-api) 1.7.15, self-hosted.
+  TinyFaceDetector → 68-point landmarks → dlib ResNet-34 face-recognition net (128-d descriptor).
+  Liveness = landmark-based head-pose challenge (5 prompts, ≥ 2 of 4 movements required).
+- **Matching (server):** Euclidean distance against every enrolled descriptor in the org.
+  `≤ high` → granted · `high < d ≤ medium` → pending approval · `> medium` → denied.
+  A second-best candidate within `margin` downgrades the result to pending approval.
 
-### 📋 Legal Pages
-| Page | URL | Status |
+> Not in scope of this release: the consumer "Home" surfaces (`/home/*`) and the Dev Lab
+> (`/dev-lab`). They remain in the repo but are not part of the business product and are
+> not covered by the test suites.
+
+---
+
+## What's in the box
+
+| Area | Details |
+|---|---|
+| **Tenancy** | `organizations` table; `org_id` on every business table; every query is org-scoped; cross-org access returns 404 |
+| **Team accounts** | Roles `admin` / `operator` / `viewer`. First registrant is admin. Invite by link (7-day token); admins can change roles, suspend members, revoke invites |
+| **People** | Employees, managers, admins, contractors, visitors. Camera enrollment captures multiple descriptors per person; duplicate-face detection across the org; one-click biometric erasure |
+| **Doors & permissions** | Role → door schedules (time window, weekdays, 2FA flag) plus per-person overrides with expiry. Deny-by-default |
+| **Recognition** | `POST /api/business/recognize` with a descriptor → granted / denied / pending_2fa. Liveness score enforced when enabled |
+| **Approvals** | Medium-confidence matches queue for an operator decision; auto-expire after the configured timeout |
+| **Logs & analytics** | Full access log with CSV export, summary/hourly/daily analytics, attendance, admin-only audit trail |
+| **Settings (per org)** | Distance thresholds, margin, liveness on/off, approval timeout, retention windows, timezone, notification email |
+| **Auth** | PBKDF2-SHA256 (100k iters), bearer session tokens, suspended orgs/members rejected at login and per request |
+
+---
+
+## Quick start (local)
+
+```bash
+npm install
+npm run build                 # vite → dist/_worker.js
+npm run db:reset              # wipe local D1 and apply migrations 0001–0008 (creates an EMPTY database)
+npm start                     # pm2: wrangler pages dev dist --port 3000
+open http://localhost:3000    # click "Create your organization"
+```
+
+There are no seed accounts. The first thing you do is register an organization; that account
+becomes its admin.
+
+### Tests
+
+```bash
+npm run test:e2e                 # 98 API checks: auth, roles, enrollment, recognition, approvals, isolation
+npm run test:ui                  # Playwright: real UI registration, model loading, every page, invite flow
+npm run test:camera              # Playwright + virtual webcam: enrol → liveness → recognise → imposter (see below)
+npm run test:faces               # Real photos: descriptor distances vs. thresholds + live /recognize probes
+```
+
+Set `BASE=https://faceaccess.pages.dev` (or any deployment) to run every suite against production instead of `localhost:3000`.
+
+`scripts/e2e.sh` needs `curl` and `python3`. The Playwright scripts need `pip install playwright && playwright install chromium`.
+
+**Real-face validation (`scripts/face_matrix.py`).** Runs the exact vendored face-api build + models the app
+serves, against 6 real group photos (22 faces, 231 pairs, from the face-api demo set):
+
+| Measurement | Result |
+|---|---|
+| Pairs of guaranteed-different people (same photo) | 31 |
+| Closest different-people distance | 0.468 |
+| Different people that would be **auto-granted** (≤ 0.45) | **0** |
+| Different people that would fall in the approval band (0.45 – 0.60) | 2 |
+| Same person across photos (heavy makeup / face paint) | 0.564, 0.607 |
+
+This is why the default medium threshold is 0.60 (face-api's own same-person cutoff): at 0.55 both
+same-person pairs were rejected outright. Strangers never cross 0.45, so auto-grant stays strict.
+
+`scripts/real_face_e2e.py` then enrols 6 of those real descriptors into a fresh org and pushes the other 16
+through the live `POST /recognize` endpoint: **0 strangers granted**, 11 rejected, 3 routed to admin approval,
+and the 2 same-person probes were refused as `ambiguous_match` because a stranger sat within the 0.05 margin
+of the true match (the system fails closed, as intended). Single-photo enrolment is the worst case — the app's
+camera flow captures multiple samples, which tightens genuine distances considerably.
+See "Known limitations" — the photos are harder than live multi-sample enrollment, and this is not a NIST-style FRVT.
+
+**Camera flow (`scripts/camera_flow.py`).** The suites above bypass the camera; this one does not. It runs the
+real enrolment modal and the Face ID Test Console in headless Chromium with `getUserMedia` replaced by a
+canvas stream showing a real face, and behaves like a cooperative person: it reads the on-screen instruction
+("turn LEFT", "look UP", …) and switches the displayed head pose to match. Pose frames are synthesised from the
+sample photos by `scripts/make_poses.py` (run automatically when missing). It asserts: 5 samples enrolled and
+persisted, liveness passed, the enrolled person is **granted** (distance ≈ 3e-06), a second person at the same
+door is **not granted** (lands in the 0.45–0.60 approval band as `pending_2fa`), and zero JS/console errors.
+Result against https://faceaccess.pages.dev: PASS.
+
+The engine picks the TensorFlow.js backend at runtime (WebGL, falling back to CPU when WebGL is unavailable —
+the `wasm` backend is not shipped and is removed from the registry), and scales detector input size and
+liveness time windows to the measured inference time, so the Face ID flow completes on slow or GPU-less devices too.
+
+---
+
+## Deploy to Cloudflare
+
+**Live production:** https://faceaccess.pages.dev
+(Cloudflare Pages project `faceaccess` + D1 `faceaccess-production`; migrations 0001–0008 applied; database empty — no seed data).
+All four test suites were run against this URL after deploy (98/98 API, UI smoke PASS, camera flow PASS,
+real-face 0 false accepts) and the throwaway test organisations were then deleted from the production database.
+
+```bash
+export CLOUDFLARE_API_TOKEN=...                     # Pages:Edit + D1:Edit on the account
+npm run db:migrate:prod                             # apply any new migrations to faceaccess-production
+npm run build && npx wrangler pages deploy dist --project-name faceaccess --branch main
+```
+
+To stand up a separate instance on your own account:
+
+```bash
+npx wrangler d1 create faceaccess-production        # once; put the id in wrangler.jsonc
+npm run db:migrate:prod                             # apply migrations to the remote D1
+npm run deploy                                      # build + wrangler pages deploy
+```
+
+Static assets under `public/static/` (including the 13 MB of face-api model weights in
+`public/static/models/` and the vendored `face-api.js`) are published with the Pages build.
+
+---
+
+## API surface (business)
+
+All routes below require `Authorization: Bearer <token>` and resolve the caller's org from the session.
+
+```
+POST /api/auth/business/register   {first_name,last_name,email,password,consent_terms:true,
+                                    org_name,org_size?,industry?  |  invite_token}
+POST /api/auth/business/login      {email,password}
+GET  /api/auth/business/me
+POST /api/auth/business/logout
+PUT  /api/auth/business/password
+GET  /api/auth/business/invite/:token          (public preview)
+
+GET  /api/business/org · PUT /org (admin)
+GET  /api/business/team · POST /team/invite (admin) · DELETE /team/invite/:id (admin) · PUT /team/:id (admin)
+GET/POST /api/business/users · GET/PUT/DELETE /users/:id (operator+)
+POST /api/business/users/:id/face   {descriptor | descriptors[], quality, liveness_score}   → 409 DUPLICATE_FACE
+DELETE /api/business/users/:id/face
+GET/POST /api/business/doors · PUT/DELETE /doors/:id
+GET  /api/business/permissions · POST /permissions · DELETE /permissions/:id
+POST /api/business/permissions/user · DELETE /permissions/user/:id
+POST /api/business/recognize        {door_id, descriptor[128], liveness_score, image_quality?, device_info?}
+GET  /api/business/verify/pending · GET /verify/:id · POST /verify/:id/respond {action:approve|deny} (operator+)
+GET  /api/business/logs?limit&offset&result&door_id&user_id&from&to · GET /logs/export (CSV)
+GET  /api/business/analytics/summary · GET /analytics/attendance
+GET/POST /api/business/cameras · PUT/DELETE /cameras/:id
+GET  /api/business/settings · PUT /settings (admin)
+GET  /api/business/audit (admin)
+```
+
+Errors are JSON `{ error, code? }`. `401 AUTH_REQUIRED`, `403` for role violations, `404` for
+anything outside the caller's org.
+
+### Settings keys and valid ranges
+
+| Key | Range / values | Default |
 |---|---|---|
-| Privacy Policy | [/legal/privacy](https://faceaccess.pages.dev/legal/privacy) | ✅ Live |
-| Terms of Use | [/legal/terms](https://faceaccess.pages.dev/legal/terms) | ✅ Live |
-| SMS Consent Agreement | [/legal/sms-consent](https://faceaccess.pages.dev/legal/sms-consent) | ✅ Live |
-| Biometric Data Retention Policy | [/legal/biometric-retention](https://faceaccess.pages.dev/legal/biometric-retention) | ✅ Live |
-| AI & Facial Recognition Disclosure | [/legal/ai-disclosure](https://faceaccess.pages.dev/legal/ai-disclosure) | ✅ Live |
-| Enterprise Security Compliance | [/legal/enterprise-security](https://faceaccess.pages.dev/legal/enterprise-security) | ✅ Live |
+| `face_match_threshold_high` | 0.30 – 0.60 | 0.45 |
+| `face_match_threshold_medium` | 0.40 – 0.70 | 0.60 |
+| `face_match_margin` | 0 – 0.20 | 0.05 |
+| `liveness_enabled` | `true` / `false` | `true` |
+| `two_fa_timeout_seconds` | 30 – 600 | 120 |
+| `retention_days_logs` | 30 – 3650 | 365 |
+| `retention_days_biometric` | 30 – 1095 | 365 |
+| `company_name`, `timezone`, `notification_email` | strings | — |
+
+Decision logic in `/api/business/recognize`: distance ≤ high **and** runner-up gap ≥ margin → granted;
+high < distance ≤ medium → `pending_2fa` (admin approval); otherwise `no_match` / `ambiguous`.
 
 ---
 
-## ✅ Completed Features
+## Data model (business)
 
-### ⚖️ Legal Compliance Framework (v1.0 — NEW)
-Full legal policy ecosystem covering BIPA, CCPA, TCPA, and GDPR requirements.
-
-**6 Legal Pages (all live at `/legal/*`):**
-- **Privacy Policy** — Biometric data handling, SMS communications, data rights, contact information
-- **Terms of Use** — Service agreement, biometric consent, SMS consent, acceptable use, limitation of liability
-- **SMS Consent Agreement** — Twilio-compliant TCPA consent language, STOP/HELP keywords, opt-out instructions, message types
-- **Biometric Data Retention Policy** — BIPA-compliant written retention schedule, 3-year max, 30-day deletion SLA, IL/TX/WA/CA compliance
-- **AI & Facial Recognition Disclosure** — Algorithm transparency, 128-dim embeddings, anti-spoof threshold (0.72), accuracy limitations, demographic fairness
-- **Enterprise Security Compliance** — Cloudflare edge security, AES-256 encryption, RBAC, rate limiting, SOC2/ISO27001 vendor compliance
-
-**Consent Checkboxes at Every Signup Entry Point:**
-All 4 registration flows now include dual consent checkboxes:
-1. ✅ **Required:** Terms of Use + Privacy Policy + Biometric data consent
-2. ☐ **Optional:** SMS text message consent (TCPA-compliant)
-
-Registration flows updated:
-- **Business Registration** (`bizDoRegister`) — validates `biz-reg-consent-terms` required
-- **Home Registration** (`homeDoRegister`) — validates `home-reg-consent-terms` required
-- **Mobile Registration** (`mobDoRegister`) — validates `mob-reg-consent-terms` required
-- **Home Onboarding Step 0** (`saveAccount`) — validates `ob-consent-terms` required
-- `sms_consent` flag passed to all backend registration APIs
-
-
-### 🔬 Developer Testing Lab (v1.0 — NEW at `/dev-lab`)
-Internal sandbox environment for validating biometric pipeline accuracy, enrollment quality, and trust engine logic — fully isolated from production data.
-
-**Six integrated panels:**
-
-1. **Face Enrollment Panel**
-   - USB webcam / laptop camera / optional RTSP stream connection
-   - Start/stop/switch camera controls with real-time feed
-   - Live quality metrics: brightness, sharpness, anti-spoof score
-   - 7-angle progress dots (center, left, right, up, down, left_up, right_up)
-   - One-click capture per angle or **Auto-Enroll** (captures all 7 angles automatically)
-   - Embedding generation via frame pixel analysis (128-dim L2-normalized vector)
-   - Clear embeddings per profile
-
-2. **Authentication Test Panel**
-   - Three test modes: **Live Camera**, **Demo (simulated)**, **Manual**
-   - Simulated lock selector (Lab-Door-01/02, Lab-Entrance, Server-Room)
-   - BLE proximity + Wi-Fi match toggles
-   - Full pipeline simulation: cosine similarity → multi-model scoring → trust calculation
-   - Debug mode toggle for raw pipeline values
-
-3. **Lock Simulation**
-   - Animated **Access Granted — Door Unlocked** (green unlock + pulse glow)
-   - **Access Denied** shake animation (red pulse)
-   - Pending approval state indicator
-
-4. **Confidence Visualization Panel**
-   - Three doughnut rings: Identity Confidence, Liveness, Trust Score
-   - 8-metric score bars: ArcFace, InsightFace, FaceNet, Combined, Final, Liveness, Anti-Spoof, Proximity
-   - Full breakdown table with visual bars per metric
-   - Confidence history line chart (last 20 tests)
-   - Pipeline trace: stage badges (edge → arcface → insightface → fusion → trust) + latency
-
-5. **Security Log Panel**
-   - Real-time table: timestamp, result badge, matched user, similarity, combined confidence, trust tier/score, latency, lock, test mode
-   - Stats bar: total, granted, denied, avg confidence, avg latency
-   - Filter by result (granted/denied/pending)
-   - Clear all logs
-
-6. **Dev Controls Panel**
-   - Reset lab (clear embeddings + logs, keep profiles)
-   - Delete all test profiles
-   - Debug mode (raw model values in debug console)
-   - Pipeline config display (all thresholds)
-   - Debug console (monospace live output)
-   - Lab statistics dashboard
-
-**Dev Lab API endpoints (10 routes under `/api/devlab/`):**
 ```
-GET/POST     /api/devlab/profiles         — CRUD test profiles (name, email, role, device ID)
-GET          /api/devlab/profiles/:id     — Single profile
-DELETE       /api/devlab/profiles/:id     — Delete profile + embeddings
-POST         /api/devlab/enroll/:id       — Store face embedding (64-512 floats)
-GET          /api/devlab/enroll/:id       — List embeddings for profile
-DELETE       /api/devlab/enroll/:id       — Clear all embeddings for profile
-POST         /api/devlab/authenticate     — Full auth pipeline simulation
-GET/DELETE   /api/devlab/logs             — Security log (filter by decision)
-GET          /api/devlab/stats            — Aggregate lab statistics
-DELETE       /api/devlab/reset            — Full lab reset
+organizations ──< business_accounts (org role: admin/operator/viewer)
+             ──< org_invitations
+             ──< users (face_embedding = mean of enrolled 128-d descriptors, face_sample_count)
+             ──< doors ──< role_permissions / user_door_permissions
+             ──< access_logs, pending_verifications, cameras, settings(org_id,key), audit_log
 ```
 
-**DB tables:** `devlab_profiles`, `devlab_embeddings`, `devlab_test_log`, `devlab_sessions`
-
-### Multi-Model Biometric Pipeline (v4.0 — Latest)
-- **Tiered Recognition Pipeline**: Face detection → Alignment → ArcFace primary → Cosine check → If borderline → InsightFace secondary → FaceNet tertiary
-- **ArcFace ResNet100** — 512-dim embeddings, primary model (weight 50%), angular margin softmax, highest discriminability
-- **InsightFace MobileNetV3** — 256-dim embeddings, secondary model (weight 30%), fast inference for borderline cases
-- **FaceNet Inception** — 128-dim embeddings, tertiary model (weight 20%), invoked only when first two disagree
-- **Score Fusion Formula**: `combined = ArcFace×0.50 + InsightFace×0.30 + FaceNet×0.20`
-- **Borderline Detection** — Scores 60-90% trigger secondary verification automatically
-- **Model Agreement Score** — Measures consistency between all active models; low agreement flags suspicious cases
-- **Edge AI Preprocessing** — Face alignment, landmark detection, anti-spoof pre-check run on-device before cloud verification
-- **Continuous Learning Engine** — EMA-based template adaptation after successful authentications (α=0.05 update per success)
-- **Full Audit Logging** — Every authentication decision logged with all model scores, latency, and decision path
-
-### AI Trust Engine v4
-- **Multi-Model Trust Formula**: `trust = face_avg×0.35 + behavioral×0.35 + predictive×0.20 − penalty×0.10`
-- **Per-Model Tracking** — `arcface_avg`, `insightface_avg` stored per user in trust profiles
-- **Trust Score History** — Time-series of trust score changes for trend visualization
-- **Tiers**: `trusted` (≥85%) instant unlock; `standard` (≥60%); `watchlist` (≥40%) extra verification; `blocked` (<40%)
-- **EMA Adaptation** — α=0.15 for stable trust evolution
-- **Behavioral Model** — Continuous learning of typical arrival times, doors, device proximity patterns
-- **Behavioral Drift Detection** — Compares recent vs 7-day prior pattern distributions; flags significant shifts
-
-### Biometric Audit Log (Compliance)
-Every authentication decision records:
-- Decision: `granted` | `denied` | `pending` | `error`
-- All model scores: `arcface_score`, `insightface_score`, `facenet_score`, `combined_confidence`
-- `anti_spoof_score`, `liveness_score`, `edge_confidence`, `quality_score`
-- Pipeline trace: `stage_reached` (e.g., `edge→arcface→insightface→fusion`)
-- `pipeline_latency_ms`, `model_agreement`, `is_borderline`
-- Trust context: `trust_score`, `trust_tier`, `behavioral_typical`, `anomaly_score`
-- Device signals: `ble_detected`, `wifi_matched`, `proximity_score`
-
-### AI Intelligence Dashboard (v3.0+)
-- **Multi-Model Pipeline Status Panel** — Visual stage flow with per-model accuracy, avg latency, model agreement
-- **Pipeline Performance Metrics** — 7-day total verifications, borderline cases, latency distribution
-- **Trust Engine Formula Display** — Real-time weighted formula visualization
-- **Trust Score Cards** — Trusted / Standard / Watchlist / Anomalies count
-- **User Trust Profile Modal** — Multi-model biometric stats per user (ArcFace, InsightFace, FaceNet averages)
-- **Behavioral Heatmap** — 24×7 access frequency visualization
-- **Arrival Predictions** — Next predicted arrival per user
-- **AI Recommendations** — Auto-generated: revoke blocked, upgrade watchlist, renew guest passes
-- **Anomaly Feed** — Real-time anomaly events with resolve/acknowledge actions
-
-### Core Face Recognition
-- Liveness detection (eye-open ratio, motion history, challenge-response)
-- Anti-spoofing: contrast variance, Sobel texture, highlight ratio, screen artifact detection
-- Cosine similarity matching against AES-256 encrypted embeddings
-- Confidence tiers: High ≥85% (auto-grant), Medium 65–84% (triggers 2FA), Low <65% (denied)
-- Phone proximity verification (BLE + WiFi)
-- Multi-angle enrollment: 7 angles, 3 liveness challenges
-
-### FaceAccess Home
-- Multi-lock smart home security (August, Schlage, Yale, Nuki, Generic)
-- Real-time face recognition at door via FaceID Engine v2.0
-- Guest pass management with time windows and day restrictions
-- Remote approval: push notification → mobile approve/deny
-- Device registration + BLE proximity fingerprinting
-
-### Security & Privacy
-- AES-256 GCM encrypted biometric embeddings (Web Crypto API)
-- GDPR-compliant biometric erasure (`DELETE /api/home/users/:id/face`)
-- Server-side rate limiting: 10 attempts/min per lock
-- Client-side rate limiting: 5 attempts/min with 60s lockout
-- Hard rejection: anti-spoof score < 0.35, liveness < 0.50
-- No raw photos stored; only 512-dim normalized vectors
+Migrations live in `migrations/`; `0008_multitenant_orgs.sql` introduces organizations and
+purges any pre-existing single-tenant data.
 
 ---
 
-## API Reference
+## Repository layout
 
-### Multi-Model Biometric (v4.0)
 ```
-POST /api/home/recognize
-  Body: { lock_id, arcface_score, insightface_score, facenet_score,
-          combined_confidence, anti_spoof_score, liveness_score,
-          edge_confidence, model_agreement, pipeline_latency_ms,
-          stage_reached, is_borderline, ble_detected, wifi_matched,
-          verification_version: "4.0" }
-
-GET  /api/ai/pipeline/stats/:home_id   — 7-day pipeline performance metrics
-GET  /api/ai/audit/:home_id            — Biometric audit log (compliance)
-GET  /api/ai/audit/user/:user_id       — Per-user audit + model stats
-POST /api/ai/multimodel/enroll/:user_id — Store multi-model embeddings
-GET  /api/ai/multimodel/embeddings/:user_id — Enrollment metadata
-GET  /api/ai/behavioral/model/:user_id — Behavioral model + drift analysis
-GET  /api/ai/trust/history/:user_id   — Trust score trend history
+src/index.tsx                    Hono app, HTML shells, home/dev-lab routes (legacy surfaces)
+src/routes/business-auth.ts      registration, login, invites, sessions
+src/routes/business-api.ts       all org-scoped business endpoints
+src/lib/shared.ts                hashing, sessions, validation helpers
+public/static/app.js             business console UI
+public/static/facecamera-engine.js   camera + face-api pipeline, liveness, descriptor capture
+public/static/auth.js            token storage / auth helpers
+public/static/vendor/face-api.js, public/static/models/   self-hosted model + weights
+scripts/e2e.sh, scripts/ui_smoke.py   test suites
 ```
 
-### AI Trust & Anomaly (v3.0)
-```
-GET  /api/ai/dashboard/:home_id        — Aggregated AI dashboard data
-GET  /api/ai/trust/:home_id            — All trust profiles
-GET  /api/ai/trust/user/:user_id       — Single user trust + hour distribution
-POST /api/ai/trust/recalculate/:user_id — Force recalculate from history
-GET  /api/ai/anomalies/:home_id        — Anomaly events
-PUT  /api/ai/anomalies/:id/acknowledge
-PUT  /api/ai/anomalies/:id/resolve
-GET  /api/ai/predictions/:home_id      — Active predictive sessions
-POST /api/ai/predictions/generate/:home_id
-GET  /api/ai/recommendations/:home_id
-GET  /api/ai/behavioral/:user_id       — Full behavioral analysis
-```
+## Known limitations
 
----
-
-## Data Architecture
-
-### Storage: Cloudflare D1 (SQLite)
-
-**Core tables:**
-- `homes`, `home_users`, `home_devices`, `smart_locks`, `home_cameras`
-- `guest_passes`, `home_events`, `home_verifications`, `home_automations`
-
-**AI tables (v3.0):**
-- `user_trust_profiles` — Dynamic trust scores with EMA
-- `behavioral_patterns` — Raw time-series access events (w/ multi-model scores)
-- `anomaly_events` — Detected anomalies with severity and trust delta
-- `predictive_sessions` — Predicted arrival windows
-- `ai_recommendations` — Auto-generated access management suggestions
-
-**Multi-model tables (v4.0):**
-- `biometric_audit_log` — Full compliance audit record for every authentication
-- `multimodel_embeddings` — Per-model embedding storage (ArcFace, InsightFace, FaceNet)
-- `behavioral_models` — Continuous learning state with drift detection
-- `trust_score_history` — Time-series of trust score changes
-
-### Multi-Model Pipeline Algorithms
-
-**Score Fusion:**
-```
-combined = arcface × 0.50 + insightface × 0.30 + facenet × 0.20
-adjusted = combined × (anti_spoof_adjustment) × (0.90 + edge_confidence × 0.10)
-```
-
-**Trust Score:**
-```
-trust = face_avg × 0.35 + behavioral × 0.35 + predictive × 0.20 - penalty × 0.10
-EMA:  new = prev × 0.85 + current × 0.15  (α = 0.15)
-```
-
-**Anomaly Types:**
-| Type | Severity | Trust Delta |
-|------|----------|-------------|
-| spoof_attempt | critical | −25% |
-| repeated_failures | high | −15% |
-| unusual_time | high | −12% |
-| off_schedule | medium | −5% |
-| behavioral_drift | low | −3% |
-
-**Borderline Handling:**
-- If ArcFace score 0.60–0.90 → automatically invoke InsightFace
-- If ArcFace & InsightFace disagree by >10% → invoke FaceNet
-- Model agreement = 1 - std_dev(all_scores) × 4
-
----
-
-## User Guide
-
-### Admin Dashboard
-1. Visit https://faceaccess.pages.dev/home/dashboard
-2. **AI Intelligence tab** → Multi-Model Pipeline Status, Trust Scores, Anomaly Feed
-3. Click on a user's trust profile to see per-model (ArcFace/InsightFace/FaceNet) biometric stats
-4. **Face Recognition tab** → Start camera → Click "Verify Identity" → See pipeline stages in result panel
-5. **Anomaly Detection tab** → Review and resolve security alerts
-
-### Mobile App
-1. Visit https://faceaccess.pages.dev/home/mobile
-2. Profile tab shows trust score gauge with security tier
-3. Home tab shows pending door approvals with confidence breakdown
-4. Approve/deny with biometric confirmation
-
-### API Integration (v4.0)
-```json
-POST /api/home/recognize
-{
-  "lock_id": "lock-xxxx",
-  "arcface_score": 0.91,
-  "insightface_score": 0.88,
-  "facenet_score": 0.87,
-  "combined_confidence": 0.895,
-  "anti_spoof_score": 0.88,
-  "liveness_score": 0.94,
-  "edge_confidence": 0.87,
-  "model_agreement": 0.96,
-  "pipeline_latency_ms": 342,
-  "stage_reached": "edge→arcface→insightface→fusion",
-  "is_borderline": false,
-  "ble_detected": true,
-  "verification_version": "4.0"
-}
-```
-
----
-
-## Deployment
-
-- **Platform**: Cloudflare Pages + D1 Database
-- **Status**: ✅ Active
-- **Engine Version**: v4.0
-- **Tech Stack**: Hono + TypeScript + TailwindCSS + Cloudflare D1
-- **Last Updated**: 2026-03-13
-
-### New Files (v4.0)
-- `public/static/arcface-engine.js` — Multi-model biometric pipeline (ArcFace, InsightFace, FaceNet, Edge AI, ContinuousLearning, AuditLogger)
-- `migrations/0004_multimodel_schema.sql` — biometric_audit_log, multimodel_embeddings, behavioral_models, trust_score_history + ALTER TABLE statements
+- Invitation emails are not sent; admins copy the invite link from the Team page.
+- Retention windows are stored and displayed but not yet enforced by a scheduled job.
+- Liveness is a head-movement challenge, not a certified presentation-attack detector.
+- Billing/trial limits are stored per organisation but not enforced; no door-relay/webhook integration yet.
+- The legacy Home and Dev Lab pages still reference older engine scripts and are untested.
